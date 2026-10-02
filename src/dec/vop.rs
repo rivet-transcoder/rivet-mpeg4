@@ -464,29 +464,35 @@ impl VopDec<'_> {
         }
         if self.vol.data_partitioned && self.hdr.vop_type != VopType::B {
             self.dp_packet(r, mb)
-        } else {
-            self.mb(r, mb)?;
+        } else if self.mb(r, mb)? {
             Ok(mb + 1)
+        } else {
+            Ok(mb)
         }
     }
 
     /// One macroblock, not data partitioned.
-    fn mb(&mut self, r: &mut BitReader, mb: usize) -> Result<()> {
+    /// Returns false when what was read was macroblock stuffing.
+    fn mb(&mut self, r: &mut BitReader, mb: usize) -> Result<bool> {
         let (mbx, mby) = self.mb_xy(mb);
         if self.hdr.vop_type == VopType::B {
             if mbx == 0 {
                 self.pmv = [[0, 0]; 2];
             }
-            return self.mb_b(r, mbx, mby);
+            self.mb_b(r, mbx, mby)?;
+            return Ok(true);
         }
-        let h = self.mb_header(r, mbx, mby, false)?;
-        self.mb_texture(r, mbx, mby, &h)
+        let Some(h) = self.mb_header(r, mbx, mby, false)? else { return Ok(false) };
+        self.mb_texture(r, mbx, mby, &h)?;
+        Ok(true)
     }
 
     /// The header of an I-, P- or S-VOP macroblock (`partition`: the first
     /// partition of a data-partitioned VOP, where only the syntax up to the
-    /// vectors is read; the rest comes from [`Self::dp_second`]).
-    fn mb_header(&mut self, r: &mut BitReader, mbx: usize, mby: usize, partition: bool) -> Result<MbHdr> {
+    /// vectors is read; the rest comes from the second partition). `None`:
+    /// a stuffing code was read instead, and the caller looks again for a
+    /// marker before the macroblock.
+    fn mb_header(&mut self, r: &mut BitReader, mbx: usize, mby: usize, partition: bool) -> Result<Option<MbHdr>> {
         let mb = mby * self.st.mbw + mbx;
         let p = self.hdr.vop_type != VopType::I;
         self.st.slice[mb] = self.slice;
@@ -499,17 +505,17 @@ impl VopDec<'_> {
                     self.st.kind[mb] = MbKind::Inter;
                     self.st.qp[mb] = self.qp as u8;
                     self.st.set_mb_mv(mbx, mby, v);
-                    return Ok(MbHdr { kind: MbKind::Inter, qp: self.qp, gmc: true, mvs: [v; 4], ..Default::default() });
+                    return Ok(Some(MbHdr { kind: MbKind::Inter, qp: self.qp, gmc: true, mvs: [v; 4], ..Default::default() }));
                 }
                 self.st.kind[mb] = MbKind::Skipped;
                 self.st.qp[mb] = self.qp as u8;
                 self.st.set_mb_mv(mbx, mby, [0, 0]);
-                return Ok(MbHdr { kind: MbKind::Skipped, qp: self.qp, ..Default::default() });
+                return Ok(Some(MbHdr { kind: MbKind::Skipped, qp: self.qp, ..Default::default() }));
             }
             let v = if p { vlc::mcbpc_p() } else { vlc::mcbpc_i() }.decode(r)?;
             let mb_type = (v >> 2) as u8;
             if mb_type == MB_STUFFING {
-                continue;
+                return Ok(None);
             }
             let intra = mb_type >= 3;
             if self.sh && mb_type == 2 {
@@ -557,7 +563,7 @@ impl VopDec<'_> {
                 self.st.set_mb_mv(mbx, mby, mv);
                 h.mvs = [mv; 4];
             }
-            return Ok(h);
+            return Ok(Some(h));
         }
     }
 
@@ -595,7 +601,21 @@ impl VopDec<'_> {
                 return Err(invalid("a video packet's first partition runs past the last macroblock"));
             }
             let (mbx, mby) = self.mb_xy(mb);
-            let h = self.mb_header(r, mbx, mby, true)?;
+            let at = r.pos();
+            let h = match self.mb_header(r, mbx, mby, true) {
+                Ok(Some(h)) => h,
+                Ok(None) => continue,
+                Err(e) => {
+                    if std::env::var_os("MPEG4_DEBUG").is_some() {
+                        let mut t = r.clone();
+                        t.set_pos(at);
+                        eprintln!("dp partition 1: mb {mb} (first {first}) at bit {at}: next {:032b} {:032b}", t.peek(32), t.peek_at(32, 32));
+                        let types: Vec<String> = hdrs.iter().map(|(_, h)| match h.kind { MbKind::Skipped => "s".into(), MbKind::Intra => format!("I{}", h.mb_type), MbKind::Inter => format!("{}{}", h.mb_type, if h.four {"v"} else {""}) }).collect();
+                        eprintln!("   types {}", types.join(" "));
+                    }
+                    return Err(e);
+                }
+            };
             hdrs.push((mb, h));
             mb += 1;
         }
@@ -616,7 +636,7 @@ impl VopDec<'_> {
             let cbpy = vlc::cbpy().decode(r)? as u8;
             h.cbp |= (if intra { cbpy } else { 15 - cbpy }) << 2;
             self.dquant_and_dc_mode(r, h)?;
-            self.st.qp[*mb] = self.qp as u8;
+            self.st.qp[*mb] = h.qp as u8;
             if intra && h.use_dc_vlc {
                 h.dc = Some(read_dcs(r)?);
             }
