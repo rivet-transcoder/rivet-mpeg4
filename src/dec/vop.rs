@@ -1,0 +1,916 @@
+//! VOP data: video packets, the macroblock layer of I-, P- and B-VOPs
+//! (6.2.6 / 6.3.6), data partitioning, the short video header's GOB layer,
+//! and reconstruction (clause 7.4 texture, 7.6 motion compensation).
+
+use crate::bits::BitReader;
+use crate::error::{Error, Result, invalid, unsupported};
+use crate::frame::VopType;
+use crate::headers::{VolHeader, VopHeader};
+use crate::idct::idct;
+use crate::mbstate::{Dir, MbKind, MbState, ac_pred_value, round_div};
+use crate::mc::{self, average, chroma_mv_1, chroma_mv_4, luma_to_halfpel};
+use crate::picture::Pic;
+use crate::quant::Quant;
+use crate::tables::{ALT_HORIZONTAL, ALT_VERTICAL, MB_STUFFING, ZIGZAG, dc_scaler};
+use crate::vlc;
+
+use super::texture::{read_coeffs, read_dc_diff};
+
+/// What a B-VOP needs of its backward reference: how each macroblock was
+/// coded and its vectors (direct mode, 7.6.9.5; skipping, 6.3.6.2).
+#[derive(Clone)]
+pub(crate) struct Motion {
+    pub mbw: usize,
+    pub kind: Vec<MbKind>,
+    pub mv: Vec<[i16; 2]>,
+}
+
+impl Motion {
+    /// The motion of an I-VOP: everything intra.
+    pub fn intra(mbw: usize, mbh: usize) -> Motion {
+        Motion { mbw, kind: vec![MbKind::Intra; mbw * mbh], mv: vec![[0, 0]; 4 * mbw * mbh] }
+    }
+}
+
+/// A macroblock's prediction, before the residual.
+pub(crate) struct MbPix {
+    pub y: [u8; 256],
+    pub cb: [u8; 64],
+    pub cr: [u8; 64],
+}
+
+impl MbPix {
+    pub fn new() -> MbPix {
+        MbPix { y: [0; 256], cb: [0; 64], cr: [0; 64] }
+    }
+
+    fn average(&mut self, o: &MbPix) {
+        average(&mut self.y, &o.y);
+        average(&mut self.cb, &o.cb);
+        average(&mut self.cr, &o.cr);
+    }
+}
+
+/// Motion-compensated prediction of macroblock `(mbx, mby)` from `src`:
+/// one vector (`mvs[0]`, a 16x16 luminance block) or four (8x8 each), in
+/// half or quarter samples; the chrominance vector derived per 7.6.2.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn predict_mb(
+    src: &Pic,
+    mbx: usize,
+    mby: usize,
+    mvs: &[[i32; 2]; 4],
+    four: bool,
+    rounding: bool,
+    qpel: bool,
+    out: &mut MbPix,
+) {
+    let (x, y) = (mbx as i32 * 16, mby as i32 * 16);
+    let luma = src.plane(0);
+    if !four {
+        let [mx, my] = mvs[0];
+        if qpel {
+            mc::qpel(luma, x, y, mx, my, 16, rounding, &mut out.y, 16);
+        } else {
+            mc::halfpel(luma, x, y, mx, my, 16, 16, rounding, &mut out.y, 16);
+        }
+    } else {
+        for (k, &[mx, my]) in mvs.iter().enumerate() {
+            let (bx, by) = ((k & 1) as i32 * 8, (k >> 1) as i32 * 8);
+            let o = &mut out.y[(by as usize) * 16 + bx as usize..];
+            if qpel {
+                mc::qpel(luma, x + bx, y + by, mx, my, 8, rounding, o, 16);
+            } else {
+                mc::halfpel(luma, x + bx, y + by, mx, my, 8, 8, rounding, o, 16);
+            }
+        }
+    }
+    let (cx, cy) = if four {
+        let sx: i32 = mvs.iter().map(|v| luma_to_halfpel(v[0], qpel)).sum();
+        let sy: i32 = mvs.iter().map(|v| luma_to_halfpel(v[1], qpel)).sum();
+        (chroma_mv_4(sx), chroma_mv_4(sy))
+    } else {
+        (chroma_mv_1(luma_to_halfpel(mvs[0][0], qpel)), chroma_mv_1(luma_to_halfpel(mvs[0][1], qpel)))
+    };
+    let (px, py) = (mbx as i32 * 8, mby as i32 * 8);
+    mc::halfpel(src.plane(1), px, py, cx, cy, 8, 8, rounding, &mut out.cb, 8);
+    mc::halfpel(src.plane(2), px, py, cx, cy, 8, 8, rounding, &mut out.cr, 8);
+}
+
+/// Copies a prediction into the picture.
+pub(crate) fn write_mb(cur: &mut Pic, mbx: usize, mby: usize, px: &MbPix) {
+    let ys = cur.ystride();
+    let cs = cur.cstride();
+    for r in 0..16 {
+        let o = (mby * 16 + r) * ys + mbx * 16;
+        cur.y[o..o + 16].copy_from_slice(&px.y[r * 16..r * 16 + 16]);
+    }
+    for r in 0..8 {
+        let o = (mby * 8 + r) * cs + mbx * 8;
+        cur.cb[o..o + 8].copy_from_slice(&px.cb[r * 8..r * 8 + 8]);
+        cur.cr[o..o + 8].copy_from_slice(&px.cr[r * 8..r * 8 + 8]);
+    }
+}
+
+/// The plane, stride and top-left offset of block `k` of a macroblock.
+#[inline]
+pub(crate) fn block_pos(cur: &mut Pic, mbx: usize, mby: usize, k: usize) -> (&mut [u8], usize, usize) {
+    match k {
+        0..=3 => {
+            let s = cur.ystride();
+            let o = (mby * 16 + (k >> 1) * 8) * s + mbx * 16 + (k & 1) * 8;
+            (&mut cur.y, s, o)
+        }
+        4 => {
+            let s = cur.cstride();
+            (&mut cur.cb, s, mby * 8 * s + mbx * 8)
+        }
+        _ => {
+            let s = cur.cstride();
+            (&mut cur.cr, s, mby * 8 * s + mbx * 8)
+        }
+    }
+}
+
+/// Writes an intra block, clipped to 0..=255.
+pub(crate) fn put_block(cur: &mut Pic, mbx: usize, mby: usize, k: usize, blk: &[i16; 64]) {
+    let (p, s, o) = block_pos(cur, mbx, mby, k);
+    for r in 0..8 {
+        for c in 0..8 {
+            p[o + r * s + c] = blk[r * 8 + c].clamp(0, 255) as u8;
+        }
+    }
+}
+
+/// Adds a residual block to the prediction already in the picture.
+pub(crate) fn add_block(cur: &mut Pic, mbx: usize, mby: usize, k: usize, blk: &[i16; 64]) {
+    let (p, s, o) = block_pos(cur, mbx, mby, k);
+    for r in 0..8 {
+        for c in 0..8 {
+            let d = &mut p[o + r * s + c];
+            *d = (*d as i32 + blk[r * 8 + c] as i32).clamp(0, 255) as u8;
+        }
+    }
+}
+
+/// `intra_dc_vlc_thr` (Table 6-21): whether the intra DC has its own VLC
+/// at this running quantiser.
+#[inline]
+pub(crate) fn use_intra_dc_vlc(thr: u32, running_qp: u32) -> bool {
+    thr == 0 || (thr < 7 && running_qp < 11 + 2 * thr)
+}
+
+/// `dquant` (Table 6-22).
+const DQUANT: [i32; 4] = [-1, -2, 1, 2];
+
+/// Wraps a decoded vector component into the range `vop_fcode` allows
+/// (7.6.3).
+#[inline]
+pub(crate) fn wrap_mv(v: i32, fcode: u32) -> i32 {
+    let f = 1i32 << (fcode - 1);
+    let (low, high, range) = (-32 * f, 32 * f - 1, 64 * f);
+    if v < low {
+        v + range
+    } else if v > high {
+        v - range
+    } else {
+        v
+    }
+}
+
+/// A motion vector difference component: `motion_code` and, when
+/// `fcode > 1`, `motion_residual`.
+pub(crate) fn read_mvd(r: &mut BitReader, fcode: u32) -> Result<i32> {
+    let m = vlc::mvd().decode(r)? as i32;
+    if m == 0 {
+        return Ok(0);
+    }
+    let neg = r.read_bit()?;
+    let rs = fcode - 1;
+    let v = if rs == 0 { m } else { ((m - 1) << rs) + r.read(rs)? as i32 + 1 };
+    Ok(if neg { -v } else { v })
+}
+
+fn read_mv(r: &mut BitReader, pred: [i32; 2], fcode: u32) -> Result<[i32; 2]> {
+    let x = wrap_mv(pred[0] + read_mvd(r, fcode)?, fcode);
+    let y = wrap_mv(pred[1] + read_mvd(r, fcode)?, fcode);
+    Ok([x, y])
+}
+
+/// A macroblock's syntax, parsed ahead of its texture.
+#[derive(Clone, Copy, Default)]
+struct MbHdr {
+    kind: MbKind,
+    mb_type: u8,
+    cbp: u8,
+    ac_pred: bool,
+    qp: u32,
+    four: bool,
+    mvs: [[i32; 2]; 4],
+    use_dc_vlc: bool,
+    /// DC differentials read in an earlier partition (data partitioning).
+    dc: Option<[i32; 6]>,
+}
+
+/// B-VOP macroblock types (Table 6-26).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BType {
+    Direct,
+    Interpolate,
+    Backward,
+    Forward,
+}
+
+const DC_MARKER: u32 = 0b110_1011_0000_0000_0001;
+const MOTION_MARKER: u32 = 0b1_1111_0000_0000_0001;
+
+/// Decodes the data of one VOP into `cur`.
+pub(crate) struct VopDec<'a> {
+    pub vol: &'a VolHeader,
+    pub hdr: &'a VopHeader,
+    pub quant: &'a Quant,
+    /// The short video header (H.263 baseline syntax).
+    pub sh: bool,
+    pub cur: &'a mut Pic,
+    /// P: the reference. B: the past reference.
+    pub fwd: Option<&'a Pic>,
+    /// B: the future reference.
+    pub bwd: Option<&'a Pic>,
+    /// B: the future reference's motion.
+    pub col: Option<&'a Motion>,
+    pub st: &'a mut MbState,
+    pub slice_counter: &'a mut u32,
+    /// B: temporal distances (7.6.9.5), in ticks.
+    pub trb: i32,
+    pub trd: i32,
+    pub slice: u32,
+    pub qp: u32,
+    pub first_coded: bool,
+    pub pmv: [[i32; 2]; 2],
+    /// Set when part of the VOP was concealed; the first error is kept.
+    pub error: Option<Error>,
+}
+
+impl VopDec<'_> {
+    fn total(&self) -> usize {
+        self.st.mbw * self.st.mbh
+    }
+
+    fn new_packet(&mut self, qp: u32) {
+        *self.slice_counter = self.slice_counter.wrapping_add(1).max(1);
+        self.slice = *self.slice_counter;
+        self.qp = qp;
+        self.first_coded = true;
+        self.pmv = [[0, 0]; 2];
+    }
+
+    fn mb_xy(&self, mb: usize) -> (usize, usize) {
+        (mb % self.st.mbw, mb / self.st.mbw)
+    }
+
+    /// Replaces macroblocks `from..to` with the co-located ones of the
+    /// reference (or leaves them grey with none), after an error.
+    fn conceal(&mut self, from: usize, to: usize) {
+        let src = self.fwd.or(self.bwd);
+        let mut px = MbPix::new();
+        for mb in from..to.min(self.total()) {
+            let (mbx, mby) = self.mb_xy(mb);
+            self.st.slice[mb] = 0;
+            self.st.kind[mb] = MbKind::Skipped;
+            self.st.set_mb_mv(mbx, mby, [0, 0]);
+            if let Some(src) = src {
+                predict_mb(src, mbx, mby, &[[0, 0]; 4], false, false, false, &mut px);
+                write_mb(self.cur, mbx, mby, &px);
+            }
+        }
+    }
+
+    fn record(&mut self, e: Error) {
+        if self.error.is_none() {
+            self.error = Some(e);
+        }
+    }
+
+    fn resync_enabled(&self) -> bool {
+        !self.sh && !self.vol.resync_marker_disable
+    }
+
+    /// The resync marker's length for this VOP (6.3.5.2).
+    fn resync_len(&self) -> usize {
+        match self.hdr.vop_type {
+            VopType::I => 17,
+            VopType::B => 16 + self.hdr.fcode_forward.max(self.hdr.fcode_backward) as usize,
+            _ => 16 + self.hdr.fcode_forward as usize,
+        }
+    }
+
+    /// When stuffing then a resync marker follow, the marker's position.
+    fn at_resync(&self, r: &BitReader) -> Option<usize> {
+        let p = r.stuffing_end()?;
+        let mut t = r.clone();
+        t.set_pos(p);
+        is_marker(&t, self.resync_len()).then_some(p)
+    }
+
+    /// `video_packet_header()` from the resync marker on: the number of
+    /// the packet's first macroblock.
+    fn packet_header(&mut self, r: &mut BitReader) -> Result<usize> {
+        r.skip(self.resync_len())?;
+        let total = self.total();
+        let bits = usize::BITS - (total - 1).leading_zeros();
+        let mb = r.read(bits.max(1))? as usize;
+        let qp = r.read(5)?;
+        if qp == 0 {
+            return Err(invalid("quant_scale is zero"));
+        }
+        if r.read_bit()? {
+            // header_extension_code: a copy of the VOP header's fields.
+            while r.read_bit()? {}
+            r.lenient_marker()?;
+            r.read(self.vol.time_increment_bits)?;
+            r.lenient_marker()?;
+            r.read(2)?; // vop_coding_type
+            r.read(3)?; // intra_dc_vlc_thr
+            if self.hdr.vop_type == VopType::S && self.vol.sprite_warping_points > 0 {
+                crate::headers::parse_sprite_trajectory(r, self.vol.sprite_warping_points)?;
+            }
+            if self.hdr.vop_type != VopType::I {
+                r.read(3)?;
+            }
+            if self.hdr.vop_type == VopType::B {
+                r.read(3)?;
+            }
+        }
+        if mb >= total {
+            return Err(invalid(format!("video packet starts at macroblock {mb} of {total}")));
+        }
+        self.new_packet(qp);
+        Ok(mb)
+    }
+
+    /// Searches forward, byte by byte, for the next resync marker, leaving
+    /// the reader on it.
+    fn find_resync(&self, r: &mut BitReader) -> bool {
+        let len = self.resync_len();
+        r.align();
+        while r.left() >= len + 8 {
+            if is_marker(r, len) {
+                return true;
+            }
+            r.set_pos(r.pos() + 8);
+        }
+        false
+    }
+
+    /// Decodes the whole VOP. Damage is concealed, not returned: the
+    /// macroblocks from the failure to the next video packet that can be
+    /// found are copied from the reference, and the error is kept in
+    /// `self.error`.
+    pub fn run(&mut self, r: &mut BitReader) {
+        let total = self.total();
+        self.new_packet(self.hdr.quant);
+        if self.sh {
+            return self.run_short(r);
+        }
+        let mut mb = 0;
+        // Whether the reader sits on a resync marker found after an error.
+        let mut on_marker = false;
+        while mb < total {
+            let step = self.step(r, mb, on_marker);
+            on_marker = false;
+            match step {
+                Ok(n) => mb = n,
+                Err(e) => {
+                    self.record(e);
+                    loop {
+                        if !(self.resync_enabled() && self.find_resync(r)) {
+                            self.conceal(mb, total);
+                            return;
+                        }
+                        match self.peek_packet_mb(r) {
+                            Some(n) if n > mb && n < total => {
+                                self.conceal(mb, n);
+                                mb = n;
+                                on_marker = true;
+                                break;
+                            }
+                            _ => r.set_pos(r.pos() + 8),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The `macroblock_number` of the video packet header at the reader.
+    fn peek_packet_mb(&self, r: &BitReader) -> Option<usize> {
+        let bits = (usize::BITS - (self.total() - 1).leading_zeros()).max(1);
+        let len = self.resync_len();
+        (r.left() >= len + bits as usize).then(|| r.peek_at(len, bits) as usize)
+    }
+
+    /// A video packet header if one is due, then one macroblock (or, data
+    /// partitioned, one packet): returns the next macroblock number.
+    fn step(&mut self, r: &mut BitReader, mut mb: usize, on_marker: bool) -> Result<usize> {
+        if self.resync_enabled() {
+            let marker = if on_marker {
+                Some(r.pos())
+            } else if mb > 0 {
+                self.at_resync(r)
+            } else {
+                None
+            };
+            if let Some(p) = marker {
+                r.set_pos(p);
+                let next = self.packet_header(r)?;
+                if next < mb {
+                    return Err(invalid("video packets out of order"));
+                }
+                if next > mb {
+                    self.record(invalid("macroblocks missing between video packets"));
+                    self.conceal(mb, next);
+                }
+                mb = next;
+            }
+        }
+        if self.vol.data_partitioned && self.hdr.vop_type != VopType::B {
+            self.dp_packet(r, mb)
+        } else {
+            self.mb(r, mb)?;
+            Ok(mb + 1)
+        }
+    }
+
+    /// One macroblock, not data partitioned.
+    fn mb(&mut self, r: &mut BitReader, mb: usize) -> Result<()> {
+        let (mbx, mby) = self.mb_xy(mb);
+        if self.hdr.vop_type == VopType::B {
+            if mbx == 0 {
+                self.pmv = [[0, 0]; 2];
+            }
+            return self.mb_b(r, mbx, mby);
+        }
+        let h = self.mb_header(r, mbx, mby, false)?;
+        self.mb_texture(r, mbx, mby, &h)
+    }
+
+    /// The header of an I-, P- or S-VOP macroblock (`partition`: the first
+    /// partition of a data-partitioned VOP, where only the syntax up to the
+    /// vectors is read; the rest comes from [`Self::dp_second`]).
+    fn mb_header(&mut self, r: &mut BitReader, mbx: usize, mby: usize, partition: bool) -> Result<MbHdr> {
+        let mb = mby * self.st.mbw + mbx;
+        let p = self.hdr.vop_type != VopType::I;
+        self.st.slice[mb] = self.slice;
+        loop {
+            if p && r.read_bit()? {
+                // not_coded
+                self.st.kind[mb] = MbKind::Skipped;
+                self.st.qp[mb] = self.qp as u8;
+                self.st.set_mb_mv(mbx, mby, [0, 0]);
+                return Ok(MbHdr { kind: MbKind::Skipped, qp: self.qp, ..Default::default() });
+            }
+            let v = if p { vlc::mcbpc_p() } else { vlc::mcbpc_i() }.decode(r)?;
+            let mb_type = (v >> 2) as u8;
+            if mb_type == MB_STUFFING {
+                continue;
+            }
+            let intra = mb_type >= 3;
+            if self.sh && mb_type == 2 {
+                return Err(invalid("INTER4V in a short-header picture"));
+            }
+            if self.hdr.vop_type == VopType::S && !intra && r.read_bit()? {
+                return Err(unsupported("global motion compensation (mcsel)"));
+            }
+            let mut h = MbHdr {
+                kind: if intra { MbKind::Intra } else { MbKind::Inter },
+                mb_type,
+                cbp: (v & 3) as u8,
+                four: mb_type == 2,
+                ..Default::default()
+            };
+            self.st.kind[mb] = h.kind;
+            let i_dp = partition && !p;
+            if !partition || i_dp {
+                if !partition {
+                    h.ac_pred = intra && !self.sh && r.read_bit()?;
+                    let cbpy = vlc::cbpy().decode(r)? as u8;
+                    h.cbp |= (if intra { cbpy } else { 15 - cbpy }) << 2;
+                }
+                self.dquant_and_dc_mode(r, &mut h)?;
+                if i_dp && h.use_dc_vlc {
+                    h.dc = Some(read_dcs(r)?);
+                }
+            }
+            self.st.qp[mb] = self.qp as u8;
+            if intra {
+                self.st.set_mb_mv(mbx, mby, [0, 0]);
+            } else if h.four {
+                for k in 0..4 {
+                    let pred = self.st.mv_pred(mbx, mby, k, self.slice);
+                    let mv = read_mv(r, pred, self.hdr.fcode_forward)?;
+                    self.st.set_mv(mbx, mby, k, mv);
+                    h.mvs[k] = mv;
+                }
+            } else {
+                let pred = self.st.mv_pred(mbx, mby, 0, self.slice);
+                let mv = read_mv(r, pred, self.hdr.fcode_forward)?;
+                self.st.set_mb_mv(mbx, mby, mv);
+                h.mvs = [mv; 4];
+            }
+            return Ok(h);
+        }
+    }
+
+    /// `dquant` when the type has one, then whether the intra DC uses its
+    /// own VLC at the running quantiser.
+    fn dquant_and_dc_mode(&mut self, r: &mut BitReader, h: &mut MbHdr) -> Result<()> {
+        let old = self.qp;
+        if h.mb_type == 1 || h.mb_type == 4 {
+            self.qp = (self.qp as i32 + DQUANT[r.read(2)? as usize]).clamp(1, 31) as u32;
+        }
+        let running = if self.first_coded { self.qp } else { old };
+        self.first_coded = false;
+        h.qp = self.qp;
+        h.use_dc_vlc = !self.sh && use_intra_dc_vlc(self.hdr.intra_dc_vlc_thr, running);
+        Ok(())
+    }
+
+    /// A data-partitioned video packet from macroblock `first`: returns
+    /// the macroblock after its last.
+    fn dp_packet(&mut self, r: &mut BitReader, first: usize) -> Result<usize> {
+        let total = self.total();
+        let i_vop = self.hdr.vop_type == VopType::I;
+        let mut hdrs: Vec<(usize, MbHdr)> = Vec::new();
+        let mut mb = first;
+        loop {
+            if i_vop && r.peek(19) == DC_MARKER {
+                r.skip(19)?;
+                break;
+            }
+            if !i_vop && r.peek(17) == MOTION_MARKER {
+                r.skip(17)?;
+                break;
+            }
+            if mb >= total {
+                return Err(invalid("a video packet's first partition runs past the last macroblock"));
+            }
+            let (mbx, mby) = self.mb_xy(mb);
+            let h = self.mb_header(r, mbx, mby, true)?;
+            hdrs.push((mb, h));
+            mb += 1;
+        }
+        // Second partition.
+        for (mb, h) in hdrs.iter_mut() {
+            if i_vop {
+                h.ac_pred = r.read_bit()?;
+                h.cbp |= (vlc::cbpy().decode(r)? as u8) << 2;
+                continue;
+            }
+            if h.kind == MbKind::Skipped {
+                continue;
+            }
+            let intra = h.kind == MbKind::Intra;
+            if intra {
+                h.ac_pred = r.read_bit()?;
+            }
+            let cbpy = vlc::cbpy().decode(r)? as u8;
+            h.cbp |= (if intra { cbpy } else { 15 - cbpy }) << 2;
+            self.dquant_and_dc_mode(r, h)?;
+            self.st.qp[*mb] = self.qp as u8;
+            if intra && h.use_dc_vlc {
+                h.dc = Some(read_dcs(r)?);
+            }
+        }
+        // Third partition.
+        for (mb, h) in &hdrs {
+            let (mbx, mby) = self.mb_xy(*mb);
+            self.mb_texture(r, mbx, mby, h)?;
+        }
+        Ok(mb)
+    }
+
+    /// Texture and reconstruction of an I-, P- or S-VOP macroblock.
+    fn mb_texture(&mut self, r: &mut BitReader, mbx: usize, mby: usize, h: &MbHdr) -> Result<()> {
+        match h.kind {
+            MbKind::Skipped => {
+                let src = self.fwd.ok_or_else(|| invalid("a P-VOP without a reference"))?;
+                let mut px = MbPix::new();
+                predict_mb(src, mbx, mby, &[[0, 0]; 4], false, false, false, &mut px);
+                write_mb(self.cur, mbx, mby, &px);
+                Ok(())
+            }
+            MbKind::Intra => {
+                for k in 0..6 {
+                    self.intra_block(r, mbx, mby, k, h)?;
+                }
+                Ok(())
+            }
+            MbKind::Inter => {
+                let src = self.fwd.ok_or_else(|| invalid("a P-VOP without a reference"))?;
+                let mut px = MbPix::new();
+                predict_mb(src, mbx, mby, &h.mvs, h.four, self.hdr.rounding, self.vol.quarter_sample, &mut px);
+                write_mb(self.cur, mbx, mby, &px);
+                self.residual(r, mbx, mby, h.cbp, h.qp)
+            }
+        }
+    }
+
+    /// The coded inter blocks of a macroblock, added to its prediction.
+    fn residual(&mut self, r: &mut BitReader, mbx: usize, mby: usize, cbp: u8, qp: u32) -> Result<()> {
+        for k in 0..6 {
+            if cbp >> (5 - k) & 1 == 0 {
+                continue;
+            }
+            let mut blk = [0i16; 64];
+            read_coeffs(r, &mut blk, &ZIGZAG, 0, false, self.sh)?;
+            self.quant.inter(&mut blk, qp);
+            idct(&mut blk);
+            add_block(self.cur, mbx, mby, k, &blk);
+        }
+        Ok(())
+    }
+
+    /// One intra block: DC, AC, prediction, dequantisation, IDCT.
+    fn intra_block(&mut self, r: &mut BitReader, mbx: usize, mby: usize, k: usize, h: &MbHdr) -> Result<()> {
+        let luma = k < 4;
+        let coded = h.cbp >> (5 - k) & 1 != 0;
+        let mut blk = [0i16; 64];
+        if self.sh {
+            let dc = r.read(8)?;
+            if dc == 0 || dc == 128 {
+                return Err(invalid(format!("INTRADC {dc}")));
+            }
+            blk[0] = if dc == 255 { 128 } else { dc as i16 };
+            if coded {
+                read_coeffs(r, &mut blk, &ZIGZAG, 1, false, true)?;
+            }
+            self.quant.intra(&mut blk, h.qp, 8);
+        } else {
+            let mb = mby * self.st.mbw + mbx;
+            let pred = self.st.intra_pred(mbx, mby, k, self.slice);
+            let scan = match (h.ac_pred, pred.dir) {
+                (false, _) => &ZIGZAG,
+                (true, Dir::Up) => &ALT_HORIZONTAL,
+                (true, Dir::Left) => &ALT_VERTICAL,
+            };
+            let scaler = dc_scaler(h.qp, luma);
+            let dc_diff = if h.use_dc_vlc {
+                match h.dc {
+                    Some(d) => d[k],
+                    None => read_dc_diff(r, luma)?,
+                }
+            } else {
+                0
+            };
+            if coded {
+                read_coeffs(r, &mut blk, scan, if h.use_dc_vlc { 1 } else { 0 }, true, false)?;
+            }
+            let dc_level =
+                if h.use_dc_vlc { dc_diff } else { blk[0] as i32 } + round_div(pred.dc, scaler as i32);
+            blk[0] = dc_level.clamp(-2048, 2047) as i16;
+            if h.ac_pred
+                && let Some((v, qpn)) = pred.ac
+            {
+                for i in 1..8 {
+                    let idx = if pred.dir == Dir::Up { i } else { i * 8 };
+                    let p = ac_pred_value(v[i - 1], qpn, h.qp);
+                    blk[idx] = (blk[idx] as i32 + p).clamp(-2048, 2047) as i16;
+                }
+            }
+            let dc_f = (blk[0] as i32 * scaler as i32).clamp(-2048, 2047);
+            self.st.store_intra(mb, k, dc_f, &blk);
+            self.quant.intra(&mut blk, h.qp, scaler);
+        }
+        idct(&mut blk);
+        put_block(self.cur, mbx, mby, k, &blk);
+        Ok(())
+    }
+
+    /// One B-VOP macroblock.
+    fn mb_b(&mut self, r: &mut BitReader, mbx: usize, mby: usize) -> Result<()> {
+        let mb = mby * self.st.mbw + mbx;
+        let fwd = self.fwd.ok_or_else(|| invalid("a B-VOP without a past reference"))?;
+        let bwd = self.bwd.ok_or_else(|| invalid("a B-VOP without a future reference"))?;
+        let col = self.col.ok_or_else(|| invalid("a B-VOP without a future reference"))?;
+        self.st.slice[mb] = self.slice;
+        let mut px = MbPix::new();
+        if col.kind[mb] == MbKind::Skipped {
+            // The co-located macroblock was not coded: neither is this
+            // one, which is the past reference's, unmoved.
+            predict_mb(fwd, mbx, mby, &[[0, 0]; 4], false, false, false, &mut px);
+            write_mb(self.cur, mbx, mby, &px);
+            return Ok(());
+        }
+        let qpel = self.vol.quarter_sample;
+        let modb_one = r.read_bit()?;
+        let (t, cbp) = if modb_one {
+            (BType::Direct, 0)
+        } else {
+            let has_cbp = !r.read_bit()?;
+            let t = if r.read_bit()? {
+                BType::Direct
+            } else if r.read_bit()? {
+                BType::Interpolate
+            } else if r.read_bit()? {
+                BType::Backward
+            } else if r.read_bit()? {
+                BType::Forward
+            } else {
+                return Err(invalid("B-VOP mb_type 0000"));
+            };
+            let cbp = if has_cbp { r.read(6)? as u8 } else { 0 };
+            if t != BType::Direct && cbp != 0 && r.read_bit()? {
+                // dbquant: 10 is -2, 11 is +2.
+                let d = if r.read_bit()? { 2 } else { -2 };
+                self.qp = (self.qp as i32 + d).clamp(1, 31) as u32;
+            }
+            (t, cbp)
+        };
+        if t == BType::Direct {
+            // MVDB: absent (zero) when modb is 1, else coded with f_code 1.
+            let mvd = if modb_one { [0, 0] } else { [read_mvd(r, 1)?, read_mvd(r, 1)?] };
+            let (mvf, mvb) = direct_vectors(col, mbx, mby, mvd, self.trb, self.trd);
+            predict_mb(fwd, mbx, mby, &mvf, true, false, qpel, &mut px);
+            let mut pb = MbPix::new();
+            predict_mb(bwd, mbx, mby, &mvb, true, false, qpel, &mut pb);
+            px.average(&pb);
+        } else {
+            let mut mvf = [0, 0];
+            let mut mvb = [0, 0];
+            if t != BType::Backward {
+                mvf = read_mv(r, self.pmv[0], self.hdr.fcode_forward)?;
+                self.pmv[0] = mvf;
+            }
+            if t != BType::Forward {
+                mvb = read_mv(r, self.pmv[1], self.hdr.fcode_backward)?;
+                self.pmv[1] = mvb;
+            }
+            match t {
+                BType::Forward => predict_mb(fwd, mbx, mby, &[mvf; 4], false, false, qpel, &mut px),
+                BType::Backward => predict_mb(bwd, mbx, mby, &[mvb; 4], false, false, qpel, &mut px),
+                _ => {
+                    predict_mb(fwd, mbx, mby, &[mvf; 4], false, false, qpel, &mut px);
+                    let mut pb = MbPix::new();
+                    predict_mb(bwd, mbx, mby, &[mvb; 4], false, false, qpel, &mut pb);
+                    px.average(&pb);
+                }
+            }
+        }
+        write_mb(self.cur, mbx, mby, &px);
+        self.residual(r, mbx, mby, cbp, self.qp)
+    }
+
+    /// The GOB layer of a short-header picture (6.2.7.1; H.263 5.2): GOBs
+    /// of one macroblock row up to CIF, two for 4CIF, four for 16CIF, each
+    /// optionally opened by a GOB header that resets the quantiser and
+    /// bounds motion vector prediction like a video packet.
+    fn run_short(&mut self, r: &mut BitReader) {
+        let total = self.total();
+        let rows = match self.cur.h {
+            0..=288 => 1,
+            289..=576 => 2,
+            _ => 4,
+        };
+        let per_gob = self.st.mbw * rows;
+        let gobs = total.div_ceil(per_gob);
+        let mut g = 0;
+        while g < gobs {
+            if g > 0
+                && let Some((pos, gn)) = gob_header_at(r)
+            {
+                r.set_pos(pos);
+                match self.gob_header(r) {
+                    Ok(()) if gn as usize == g => {}
+                    Ok(()) if (gn as usize) > g && (gn as usize) < gobs => {
+                        self.record(invalid("GOBs missing"));
+                        self.conceal(g * per_gob, gn as usize * per_gob);
+                        g = gn as usize;
+                    }
+                    Ok(()) | Err(_) => {
+                        self.record(invalid(format!("GOB number {gn} where {g} was due")));
+                        self.conceal(g * per_gob, total);
+                        return;
+                    }
+                }
+            }
+            let mut failed = false;
+            for mb in g * per_gob..((g + 1) * per_gob).min(total) {
+                if let Err(e) = self.mb(r, mb) {
+                    self.record(e);
+                    failed = true;
+                    // Resume at the next GOB header, if there is one.
+                    let mut next = None;
+                    r.align();
+                    while r.left() >= 24 {
+                        if r.peek(17) == 1 {
+                            let gn = r.peek_at(17, 5) as usize;
+                            if gn > g && gn < gobs {
+                                next = Some(gn);
+                                break;
+                            }
+                        }
+                        r.set_pos(r.pos() + 8);
+                    }
+                    match next {
+                        Some(gn) => {
+                            self.conceal(mb, gn * per_gob);
+                            if self.gob_header(r).is_err() {
+                                self.conceal(gn * per_gob, total);
+                                return;
+                            }
+                            g = gn;
+                        }
+                        None => {
+                            self.conceal(mb, total);
+                            return;
+                        }
+                    }
+                    break;
+                }
+            }
+            if !failed {
+                g += 1;
+            }
+        }
+    }
+
+    /// GBSC, GN, GFID, GQUANT.
+    fn gob_header(&mut self, r: &mut BitReader) -> Result<()> {
+        r.skip(17)?;
+        r.read(5)?; // GN
+        r.read(2)?; // GFID
+        let q = r.read(5)?;
+        if q == 0 {
+            return Err(invalid("GQUANT is zero"));
+        }
+        self.new_packet(q);
+        Ok(())
+    }
+}
+
+/// Where a GOB start code begins, if one follows (after optional zero
+/// stuffing to a byte boundary), and its GOB number.
+fn gob_header_at(r: &BitReader) -> Option<(usize, u32)> {
+    if r.peek(17) == 1 {
+        return Some((r.pos(), r.peek_at(17, 5)));
+    }
+    let k = (8 - (r.pos() & 7)) & 7;
+    if k > 0 && r.peek(k as u32) == 0 && r.peek_at(k, 17) == 1 {
+        return Some((r.pos() + k, r.peek_at(k + 17, 5)));
+    }
+    None
+}
+
+/// The vectors of a direct-mode macroblock (7.6.9.5), per 8x8 block:
+/// `MVF = TRB * MV / TRD + MVD`, and `MVB = (TRB - TRD) * MV / TRD` when
+/// `MVD` is zero, else `MVF - MV`, where `MV` is the co-located block's
+/// vector in the future reference (zero when that macroblock is intra).
+pub(crate) fn direct_vectors(
+    col: &Motion,
+    mbx: usize,
+    mby: usize,
+    mvd: [i32; 2],
+    trb: i32,
+    trd: i32,
+) -> ([[i32; 2]; 4], [[i32; 2]; 4]) {
+    let mb = mby * col.mbw + mbx;
+    let intra = col.kind[mb] == MbKind::Intra;
+    let mut f = [[0; 2]; 4];
+    let mut b = [[0; 2]; 4];
+    for k in 0..4 {
+        let m = if intra {
+            [0, 0]
+        } else {
+            let v = col.mv[(2 * mby + (k >> 1)) * 2 * col.mbw + 2 * mbx + (k & 1)];
+            [v[0] as i32, v[1] as i32]
+        };
+        for j in 0..2 {
+            let scaled = if trd != 0 { trb * m[j] / trd } else { 0 };
+            f[k][j] = scaled + mvd[j];
+            b[k][j] = if mvd[j] == 0 {
+                if trd != 0 { (trb - trd) * m[j] / trd } else { 0 }
+            } else {
+                f[k][j] - m[j]
+            };
+        }
+    }
+    (f, b)
+}
+
+/// Whether `r` is at `len` bits of resync marker: `len - 1` zeros, a one.
+fn is_marker(r: &BitReader, len: usize) -> bool {
+    r.left() >= len && {
+        let hi = r.peek(16);
+        let rest = len - 16;
+        hi == 0 && r.peek_at(16, rest as u32) == 1
+    }
+}
+
+/// The six DC differentials of an intra macroblock (data partitioning).
+fn read_dcs(r: &mut BitReader) -> Result<[i32; 6]> {
+    let mut d = [0; 6];
+    for (k, v) in d.iter_mut().enumerate() {
+        *v = read_dc_diff(r, k < 4)?;
+    }
+    Ok(d)
+}
