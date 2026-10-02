@@ -346,6 +346,8 @@ impl Encoder {
             fcode_backward: 1,
             warping: Vec::new(),
             warping_divx500: false,
+            top_field_first: false,
+            alternate_vertical_scan: false,
         };
         self.prev_ref_sec = self.last_ref_sec;
         self.last_ref_sec = sec;
@@ -359,7 +361,12 @@ impl Encoder {
         let motion = if intra {
             Motion::intra(self.st.mbw, self.st.mbh)
         } else {
-            Motion { mbw: self.st.mbw, kind: self.st.kind.clone(), mv: self.st.mv.clone() }
+            Motion {
+                mbw: self.st.mbw,
+                kind: self.st.kind.clone(),
+                mv: self.st.mv.clone(),
+                field: vec![false; self.st.mbw * self.st.mbh],
+            }
         };
         self.keep(&recon, index, hdr.vop_type);
         self.past = self.future.take();
@@ -459,6 +466,8 @@ impl Encoder {
             fcode_backward: self.fcode,
             warping: Vec::new(),
             warping_divx500: false,
+            top_field_first: false,
+            alternate_vertical_scan: false,
         };
         let start = w.len_bits();
         headers::write_vop_header(w, self.time_bits, &hdr);
@@ -607,7 +616,7 @@ impl Encoder {
             let mut rec = *lv;
             self.quant.inter(&mut rec, qp);
             idct(&mut rec);
-            add_block(recon, mbx, mby, k, &rec);
+            add_block(recon, mbx, mby, k, &rec, false);
         }
     }
 
@@ -687,7 +696,7 @@ impl Encoder {
             let mut rec = *lv;
             self.quant.intra(&mut rec, qp, dc_scaler(qp, k < 4));
             idct(&mut rec);
-            put_block(recon, mbx, mby, k, &rec);
+            put_block(recon, mbx, mby, k, &rec, false);
         }
     }
 
@@ -781,7 +790,7 @@ impl Encoder {
             let mut rec = *lv;
             self.quant.inter(&mut rec, qp);
             idct(&mut rec);
-            add_block(recon, mbx, mby, k, &rec);
+            add_block(recon, mbx, mby, k, &rec, false);
         }
     }
 

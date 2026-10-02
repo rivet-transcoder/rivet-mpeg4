@@ -102,14 +102,14 @@ fn tap8(p: &[u8], n: usize, i: usize, rc: i32) -> u8 {
     ((v + 16 - rc) >> 5).clamp(0, 255) as u8
 }
 
-/// Quarter-sample luminance prediction (7.6.2.1) of a `bs` x `bs` block
-/// (16 for one vector per macroblock, 8 for four) displaced by
-/// `(mvx, mvy)` quarter samples.
+/// Quarter-sample luminance prediction (7.6.2.1) of a `bw` x `bh` block
+/// (16x16 for one vector per macroblock, 8x8 for four, 16x8 for a field)
+/// displaced by `(mvx, mvy)` quarter samples.
 ///
 /// The half-sample values come from the 8-tap filter over the block's
-/// `(bs + 1)`-square window of integer samples (horizontal first; the
-/// centre position filters the horizontal half samples vertically); the
-/// quarter-sample values are the bilinear average of the nearest
+/// `(bw + 1)` x `(bh + 1)` window of integer samples (horizontal first;
+/// the centre position filters the horizontal half samples vertically);
+/// the quarter-sample values are the bilinear average of the nearest
 /// integer / half samples, with `rounding_control`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qpel(
@@ -118,7 +118,8 @@ pub(crate) fn qpel(
     y: i32,
     mvx: i32,
     mvy: i32,
-    bs: usize,
+    bw: usize,
+    bh: usize,
     rounding: bool,
     out: &mut [u8],
     out_stride: usize,
@@ -126,57 +127,57 @@ pub(crate) fn qpel(
     let (fx, fy) = ((mvx & 3) as usize, (mvy & 3) as usize);
     let ix = x + (mvx >> 2);
     let iy = y + (mvy >> 2);
-    let n = bs + 1;
+    let (nw, nh) = (bw + 1, bh + 1);
     let mut full = [0u8; 17 * 17];
-    fetch(src, ix, iy, n, n, &mut full);
+    fetch(src, ix, iy, nw, nh, &mut full);
     if fx == 0 && fy == 0 {
-        for r in 0..bs {
-            out[r * out_stride..r * out_stride + bs].copy_from_slice(&full[r * n..r * n + bs]);
+        for r in 0..bh {
+            out[r * out_stride..r * out_stride + bw].copy_from_slice(&full[r * nw..r * nw + bw]);
         }
         return;
     }
     let rc = rounding as i32;
-    // The half-sample grid, (2bs + 1) square: even/even integer samples,
-    // odd columns horizontal half samples, odd rows vertical ones.
-    let g = 2 * bs + 1;
+    // The half-sample grid, (2bw + 1) x (2bh + 1): even/even integer
+    // samples, odd columns horizontal half samples, odd rows vertical ones.
+    let g = 2 * bw + 1;
     let mut grid = [0u8; 33 * 33];
     let mut col = [0u8; 17];
     // Horizontal half samples of every window row.
     let mut hrows = [0u8; 17 * 16];
-    for r in 0..n {
-        let row = &full[r * n..r * n + n];
-        for c in 0..bs {
-            hrows[r * bs + c] = tap8(row, bs, c, rc);
+    for r in 0..nh {
+        let row = &full[r * nw..r * nw + nw];
+        for c in 0..bw {
+            hrows[r * bw + c] = tap8(row, bw, c, rc);
         }
-        for c in 0..n {
+        for c in 0..nw {
             grid[2 * r * g + 2 * c] = row[c];
         }
-        for c in 0..bs {
-            grid[2 * r * g + 2 * c + 1] = hrows[r * bs + c];
+        for c in 0..bw {
+            grid[2 * r * g + 2 * c + 1] = hrows[r * bw + c];
         }
     }
     // Vertical half samples of every window column.
-    for c in 0..n {
-        for r in 0..n {
-            col[r] = full[r * n + c];
+    for c in 0..nw {
+        for r in 0..nh {
+            col[r] = full[r * nw + c];
         }
-        for r in 0..bs {
-            grid[(2 * r + 1) * g + 2 * c] = tap8(&col, bs, r, rc);
+        for r in 0..bh {
+            grid[(2 * r + 1) * g + 2 * c] = tap8(&col, bh, r, rc);
         }
     }
     // Centre half samples: the horizontal ones, filtered vertically.
-    for c in 0..bs {
-        for r in 0..n {
-            col[r] = hrows[r * bs + c];
+    for c in 0..bw {
+        for r in 0..nh {
+            col[r] = hrows[r * bw + c];
         }
-        for r in 0..bs {
-            grid[(2 * r + 1) * g + 2 * c + 1] = tap8(&col, bs, r, rc);
+        for r in 0..bh {
+            grid[(2 * r + 1) * g + 2 * c + 1] = tap8(&col, bh, r, rc);
         }
     }
     let rc = rc as u32;
-    for r in 0..bs {
+    for r in 0..bh {
         let gy = 2 * r + fy / 2;
-        for c in 0..bs {
+        for c in 0..bw {
             let gx = 2 * c + fx / 2;
             let a = grid[gy * g + gx] as u32;
             let v = match (fx & 1, fy & 1) {
@@ -278,13 +279,13 @@ mod tests {
         let mut o = [0u8; 256];
         for mx in 0..4 {
             for my in 0..4 {
-                qpel(src, 8, 8, mx, my, 16, false, &mut o, 16);
+                qpel(src, 8, 8, mx, my, 16, 16, false, &mut o, 16);
                 assert!(o.iter().all(|&v| v == 77), "{mx},{my}");
             }
         }
         let (p, w) = plane();
         let src: Src = (&p, w, w as i32, w as i32);
-        qpel(src, 8, 8, 8, -4, 8, false, &mut o, 8);
+        qpel(src, 8, 8, 8, -4, 8, 8, false, &mut o, 8);
         assert_eq!(o[0], p[7 * w + 10]);
     }
 }

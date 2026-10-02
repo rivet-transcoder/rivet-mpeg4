@@ -65,6 +65,8 @@ pub(crate) struct MbState {
     pub pred: Vec<[BlockPred; 6]>,
     /// Motion vector of every 8x8 luminance block, `2 mbw` by `2 mbh`.
     pub mv: Vec<[i16; 2]>,
+    /// Interlaced: whether each macroblock was field predicted.
+    pub field: Vec<bool>,
 }
 
 /// Rounding integer division of 7.4.3 (`//`): to the nearest integer,
@@ -84,6 +86,7 @@ impl MbState {
             qp: vec![1; mbw * mbh],
             pred: vec![[BlockPred::default(); 6]; mbw * mbh],
             mv: vec![[0, 0]; 4 * mbw * mbh],
+            field: vec![false; mbw * mbh],
         }
     }
 

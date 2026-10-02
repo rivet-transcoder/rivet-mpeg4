@@ -197,8 +197,8 @@ impl VolHeader {
 
     /// Refuses the tools this crate does not implement, naming them.
     pub(crate) fn check_supported(&self) -> Result<()> {
-        if self.interlaced {
-            return Err(unsupported("interlaced coding"));
+        if self.interlaced && self.data_partitioned {
+            return Err(unsupported("interlaced coding with data partitioning"));
         }
         if !self.obmc_disable {
             return Err(unsupported("overlapped block motion compensation"));
@@ -496,6 +496,10 @@ pub(crate) struct VopHeader {
     pub warping: Vec<(i32, i32)>,
     /// The trajectory had DivX 5.00's layout (one marker per point).
     pub warping_divx500: bool,
+    /// Interlaced: `top_field_first`.
+    pub top_field_first: bool,
+    /// Interlaced: `alternate_vertical_scan_flag`.
+    pub alternate_vertical_scan: bool,
 }
 
 fn vop_type_of(v: u32) -> VopType {
@@ -584,6 +588,8 @@ pub(crate) fn parse_vop_with(r: &mut BitReader, vol: &VolHeader, time_bits: u32,
         fcode_backward: 1,
         warping: Vec::new(),
         warping_divx500: false,
+        top_field_first: false,
+        alternate_vertical_scan: false,
     };
     if !h.coded {
         return Ok(h);
@@ -601,6 +607,10 @@ pub(crate) fn parse_vop_with(r: &mut BitReader, vol: &VolHeader, time_bits: u32,
         r.skip(c.vop_bits(vop_type))?;
     }
     h.intra_dc_vlc_thr = r.read(3)?;
+    if vol.interlaced {
+        h.top_field_first = r.read_bit()?;
+        h.alternate_vertical_scan = r.read_bit()?;
+    }
     if vop_type == VopType::S && vol.sprite_warping_points > 0 {
         (h.warping, h.warping_divx500) = parse_sprite_trajectory(r, vol.sprite_warping_points)?;
     }

@@ -121,6 +121,9 @@ pub struct Decoder {
     time_bits: Option<u32>,
     /// The DivX version a user data string named (500 for DivX 5.00).
     divx_version: Option<u32>,
+    /// Interlaced streams whose P-VOPs carry `dct_type` in every coded
+    /// macroblock (see `VopDec::dct_type_always`).
+    dct_type_always: bool,
 }
 
 /// Counts a [`Decoder`] keeps, for monitoring a stream's health.
@@ -174,6 +177,7 @@ impl Decoder {
             stats: DecoderStats::default(),
             time_bits: None,
             divx_version: None,
+            dct_type_always: false,
         }
     }
 
@@ -313,10 +317,6 @@ impl Decoder {
 
     fn set_vol(&mut self, vol: VolHeader) -> Result<()> {
         vol.check_supported()?;
-        if vol.sprite == SpriteMode::Gmc {
-            // S-VOPs are refused when met; the VOL itself is fine, since
-            // an encoder may enable GMC and never use it.
-        }
         let resize = self.vol.as_ref().is_none_or(|v| v.width != vol.width || v.height != vol.height);
         if resize {
             self.st = Some(MbState::new(vol.mb_width(), vol.mb_height()));
@@ -326,6 +326,7 @@ impl Decoder {
             self.spare = None;
         }
         self.time_bits = None;
+        self.dct_type_always = false;
         self.quant = Quant { mpeg: vol.mpeg_quant, intra_matrix: vol.intra_matrix, inter_matrix: vol.inter_matrix };
         self.vol = Some(vol);
         Ok(())
@@ -443,7 +444,12 @@ impl Decoder {
         let mbh = f.pic.mbh;
         let r = RefPic {
             pic: f.pic.clone(),
-            motion: Motion { mbw, kind: vec![MbKind::Skipped; mbw * mbh], mv: vec![[0, 0]; 4 * mbw * mbh] },
+            motion: Motion {
+                mbw,
+                kind: vec![MbKind::Skipped; mbw * mbh],
+                mv: vec![[0, 0]; 4 * mbw * mbh],
+                field: vec![false; mbw * mbh],
+            },
             time,
             vop_type: h.vop_type,
             decode_index: index,
@@ -489,9 +495,7 @@ impl Decoder {
         };
         let divx500 = h.warping_divx500 || self.divx_version == Some(500);
         let gmc = (h.vop_type == VopType::S).then(|| crate::gmc::Gmc::new(vol, &h.warping, divx500));
-        if gmc.is_some() && std::env::var_os("MPEG4_DEBUG").is_some() {
-            eprintln!("S-VOP {index}: points {} accuracy {} warping {:?} q{} f{} rnd {}", vol.sprite_warping_points, vol.sprite_warping_accuracy, h.warping, h.quant, h.fcode_forward, h.rounding);
-        }
+        let start = r.pos();
         let mut d = VopDec {
             vol,
             hdr: h,
@@ -512,8 +516,25 @@ impl Decoder {
             pmv: [[0, 0]; 2],
             error: None,
             tail_ok: false,
+            dct_type_always: self.dct_type_always,
         };
         d.run(r);
+        if d.error.is_some() && vol.interlaced && !self.dct_type_always {
+            // Early Xvid codes dct_type in every coded macroblock of a P-VOP,
+            // even those without coded blocks: try the VOP again that way,
+            // and keep that reading for the stream if it decodes.
+            r.set_pos(start);
+            d.error = None;
+            d.dct_type_always = true;
+            d.slice = 0;
+            d.qp = h.quant;
+            d.first_coded = true;
+            d.pmv = [[0, 0]; 2];
+            d.run(r);
+            if d.error.is_none() && d.tail_ok {
+                self.dct_type_always = true;
+            }
+        }
         let error = d.error.take();
         let concealed = error.is_some();
         self.stats.vops += 1;
@@ -536,7 +557,7 @@ impl Decoder {
         let motion = if h.vop_type == VopType::I {
             Motion::intra(st.mbw, st.mbh)
         } else {
-            Motion { mbw: st.mbw, kind: st.kind.clone(), mv: st.mv.clone() }
+            Motion { mbw: st.mbw, kind: st.kind.clone(), mv: st.mv.clone(), field: st.field.clone() }
         };
         self.push_ref(RefPic { pic: cur, motion, time, vop_type: h.vop_type, decode_index: index, concealed });
         Ok(())
@@ -607,6 +628,8 @@ impl Decoder {
             fcode_backward: 1,
             warping: Vec::new(),
             warping_divx500: false,
+            top_field_first: false,
+            alternate_vertical_scan: false,
         };
         let index = self.decode_index;
         self.decode_index += 1;

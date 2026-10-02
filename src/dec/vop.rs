@@ -3,7 +3,7 @@
 //! and reconstruction (clause 7.4 texture, 7.6 motion compensation).
 
 use crate::bits::BitReader;
-use crate::error::{Error, Result, invalid};
+use crate::error::{Error, Result, invalid, unsupported};
 use crate::frame::VopType;
 use crate::headers::{VolHeader, VopHeader};
 use crate::idct::idct;
@@ -23,12 +23,14 @@ pub(crate) struct Motion {
     pub mbw: usize,
     pub kind: Vec<MbKind>,
     pub mv: Vec<[i16; 2]>,
+    /// Interlaced: field-predicted macroblocks.
+    pub field: Vec<bool>,
 }
 
 impl Motion {
     /// The motion of an I-VOP: everything intra.
     pub fn intra(mbw: usize, mbh: usize) -> Motion {
-        Motion { mbw, kind: vec![MbKind::Intra; mbw * mbh], mv: vec![[0, 0]; 4 * mbw * mbh] }
+        Motion { mbw, kind: vec![MbKind::Intra; mbw * mbh], mv: vec![[0, 0]; 4 * mbw * mbh], field: vec![false; mbw * mbh] }
     }
 }
 
@@ -70,7 +72,7 @@ pub(crate) fn predict_mb(
     if !four {
         let [mx, my] = mvs[0];
         if qpel {
-            mc::qpel(luma, x, y, mx, my, 16, rounding, &mut out.y, 16);
+            mc::qpel(luma, x, y, mx, my, 16, 16, rounding, &mut out.y, 16);
         } else {
             mc::halfpel(luma, x, y, mx, my, 16, 16, rounding, &mut out.y, 16);
         }
@@ -79,7 +81,7 @@ pub(crate) fn predict_mb(
             let (bx, by) = ((k & 1) as i32 * 8, (k >> 1) as i32 * 8);
             let o = &mut out.y[(by as usize) * 16 + bx as usize..];
             if qpel {
-                mc::qpel(luma, x + bx, y + by, mx, my, 8, rounding, o, 16);
+                mc::qpel(luma, x + bx, y + by, mx, my, 8, 8, rounding, o, 16);
             } else {
                 mc::halfpel(luma, x + bx, y + by, mx, my, 8, 8, rounding, o, 16);
             }
@@ -97,6 +99,44 @@ pub(crate) fn predict_mb(
     mc::halfpel(src.ref_plane(2), px, py, cx, cy, 8, 8, rounding, &mut out.cr, 8);
 }
 
+/// Field-based motion-compensated prediction of macroblock `(mbx, mby)`
+/// (7.6.2, interlaced): each field of the macroblock (16x8 luminance, 8x4
+/// chrominance) from the field of `src` that `refs` selects (false top,
+/// true bottom) with its own vector, whose vertical component counts field
+/// lines.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn predict_fields(
+    src: &Pic,
+    mbx: usize,
+    mby: usize,
+    mvs: &[[i32; 2]; 2],
+    refs: [bool; 2],
+    rounding: bool,
+    qpel: bool,
+    out: &mut MbPix,
+) {
+    for f in 0..2 {
+        let parity = refs[f] as usize;
+        let [mx, my] = mvs[f];
+        let (p, stride, w, h) = src.ref_plane(0);
+        let field: mc::Src = (&p[parity * stride..], 2 * stride, w, h / 2);
+        let (x, y) = (mbx as i32 * 16, mby as i32 * 8);
+        let o = &mut out.y[f * 16..];
+        if qpel {
+            mc::qpel(field, x, y, mx, my, 16, 8, rounding, o, 32);
+        } else {
+            mc::halfpel(field, x, y, mx, my, 16, 8, rounding, o, 32);
+        }
+        let cx = chroma_mv_1(luma_to_halfpel(mx, qpel));
+        let cy = chroma_mv_1(luma_to_halfpel(my, qpel));
+        for (plane, dst) in [(1, &mut out.cb), (2, &mut out.cr)] {
+            let (p, stride, w, h) = src.ref_plane(plane);
+            let field: mc::Src = (&p[parity * stride..], 2 * stride, w, h / 2);
+            mc::halfpel(field, mbx as i32 * 8, mby as i32 * 4, cx, cy, 8, 4, rounding, &mut dst[f * 8..], 16);
+        }
+    }
+}
+
 /// Copies a prediction into the picture.
 pub(crate) fn write_mb(cur: &mut Pic, mbx: usize, mby: usize, px: &MbPix) {
     let ys = cur.ystride();
@@ -112,10 +152,17 @@ pub(crate) fn write_mb(cur: &mut Pic, mbx: usize, mby: usize, px: &MbPix) {
     }
 }
 
-/// The plane, stride and top-left offset of block `k` of a macroblock.
+/// The plane, stride and top-left offset of block `k` of a macroblock;
+/// with `field_dct`, luminance blocks 0 and 1 are the top field's lines
+/// and 2 and 3 the bottom field's (6.3.6.5, `dct_type`).
 #[inline]
-pub(crate) fn block_pos(cur: &mut Pic, mbx: usize, mby: usize, k: usize) -> (&mut [u8], usize, usize) {
+pub(crate) fn block_pos(cur: &mut Pic, mbx: usize, mby: usize, k: usize, field_dct: bool) -> (&mut [u8], usize, usize) {
     match k {
+        0..=3 if field_dct => {
+            let s = cur.ystride();
+            let o = (mby * 16 + (k >> 1)) * s + mbx * 16 + (k & 1) * 8;
+            (&mut cur.y, 2 * s, o)
+        }
         0..=3 => {
             let s = cur.ystride();
             let o = (mby * 16 + (k >> 1) * 8) * s + mbx * 16 + (k & 1) * 8;
@@ -133,8 +180,8 @@ pub(crate) fn block_pos(cur: &mut Pic, mbx: usize, mby: usize, k: usize) -> (&mu
 }
 
 /// Writes an intra block, clipped to 0..=255.
-pub(crate) fn put_block(cur: &mut Pic, mbx: usize, mby: usize, k: usize, blk: &[i16; 64]) {
-    let (p, s, o) = block_pos(cur, mbx, mby, k);
+pub(crate) fn put_block(cur: &mut Pic, mbx: usize, mby: usize, k: usize, blk: &[i16; 64], field_dct: bool) {
+    let (p, s, o) = block_pos(cur, mbx, mby, k, field_dct);
     for r in 0..8 {
         for c in 0..8 {
             p[o + r * s + c] = blk[r * 8 + c].clamp(0, 255) as u8;
@@ -143,8 +190,8 @@ pub(crate) fn put_block(cur: &mut Pic, mbx: usize, mby: usize, k: usize, blk: &[
 }
 
 /// Adds a residual block to the prediction already in the picture.
-pub(crate) fn add_block(cur: &mut Pic, mbx: usize, mby: usize, k: usize, blk: &[i16; 64]) {
-    let (p, s, o) = block_pos(cur, mbx, mby, k);
+pub(crate) fn add_block(cur: &mut Pic, mbx: usize, mby: usize, k: usize, blk: &[i16; 64], field_dct: bool) {
+    let (p, s, o) = block_pos(cur, mbx, mby, k, field_dct);
     for r in 0..8 {
         for c in 0..8 {
             let d = &mut p[o + r * s + c];
@@ -213,6 +260,13 @@ struct MbHdr {
     /// Predicted by global motion compensation (`mcsel`, or not coded in
     /// an S-VOP).
     gmc: bool,
+    /// Interlaced: `dct_type` (field DCT).
+    field_dct: bool,
+    /// Interlaced: `field_prediction`, the reference field of each of the
+    /// macroblock's fields (true: bottom) and their vectors.
+    field_pred: bool,
+    field_ref: [bool; 2],
+    field_mvs: [[i32; 2]; 2],
 }
 
 /// B-VOP macroblock types (Table 6-26).
@@ -257,6 +311,9 @@ pub(crate) struct VopDec<'a> {
     /// Whether the macroblock data ended exactly where the VOP's stuffing
     /// begins (set by [`Self::run`] when nothing was concealed).
     pub tail_ok: bool,
+    /// Interlaced: read `dct_type` for every coded P/S-VOP macroblock, not
+    /// only for intra ones and those with coded blocks (early Xvid).
+    pub dct_type_always: bool,
 }
 
 impl VopDec<'_> {
@@ -294,9 +351,6 @@ impl VopDec<'_> {
     }
 
     fn record(&mut self, e: Error) {
-        if std::env::var_os("MPEG4_DEBUG").is_some() {
-            eprintln!("{:?}-VOP q{}: {e}", self.hdr.vop_type, self.hdr.quant);
-        }
         if self.error.is_none() {
             self.error = Some(e);
         }
@@ -381,17 +435,6 @@ impl VopDec<'_> {
         self.run_inner(r);
         if self.error.is_none() {
             self.tail_ok = tail_ok(r, self.sh);
-            if !self.tail_ok && std::env::var_os("MPEG4_DEBUG").is_some() {
-                eprintln!(
-                    "misaligned {:?} q{} at bit {} of {} (left {}), next bytes {:02x?}",
-                    self.hdr.vop_type,
-                    self.hdr.quant,
-                    r.pos(),
-                    r.len_bits(),
-                    r.left(),
-                    &r.peek(32).to_be_bytes()
-                );
-            }
         }
     }
 
@@ -503,12 +546,14 @@ impl VopDec<'_> {
                     // In an S-VOP, a GMC macroblock without texture.
                     let v = g.mb_vector(mbx, mby);
                     self.st.kind[mb] = MbKind::Inter;
+                    self.st.field[mb] = false;
                     self.st.qp[mb] = self.qp as u8;
                     self.st.set_mb_mv(mbx, mby, v);
                     return Ok(Some(MbHdr { kind: MbKind::Inter, qp: self.qp, gmc: true, mvs: [v; 4], ..Default::default() }));
                 }
                 self.st.kind[mb] = MbKind::Skipped;
                 self.st.qp[mb] = self.qp as u8;
+                self.st.field[mb] = false;
                 self.st.set_mb_mv(mbx, mby, [0, 0]);
                 return Ok(Some(MbHdr { kind: MbKind::Skipped, qp: self.qp, ..Default::default() }));
             }
@@ -543,6 +588,19 @@ impl VopDec<'_> {
                     h.dc = Some(read_dcs(r)?);
                 }
             }
+            if self.vol.interlaced {
+                // interlaced_information()
+                if intra || h.cbp != 0 || self.dct_type_always {
+                    h.field_dct = r.read_bit()?;
+                }
+                if !intra && mb_type < 2 && !mcsel {
+                    h.field_pred = r.read_bit()?;
+                    if h.field_pred {
+                        h.field_ref = [r.read_bit()?, r.read_bit()?];
+                    }
+                }
+            }
+            self.st.field[mb] = h.field_pred;
             self.st.qp[mb] = self.qp as u8;
             if intra {
                 self.st.set_mb_mv(mbx, mby, [0, 0]);
@@ -550,6 +608,12 @@ impl VopDec<'_> {
                 let v = g.mb_vector(mbx, mby);
                 self.st.set_mb_mv(mbx, mby, v);
                 h.mvs = [v; 4];
+            } else if h.field_pred {
+                let pred = self.st.mv_pred(mbx, mby, 0, self.slice);
+                let (mvs, frame) = read_field_mvs(r, pred, self.hdr.fcode_forward)?;
+                h.field_mvs = mvs;
+                self.st.set_mb_mv(mbx, mby, frame);
+                h.mvs = [frame; 4];
             } else if h.four {
                 for k in 0..4 {
                     let pred = self.st.mv_pred(mbx, mby, k, self.slice);
@@ -601,21 +665,7 @@ impl VopDec<'_> {
                 return Err(invalid("a video packet's first partition runs past the last macroblock"));
             }
             let (mbx, mby) = self.mb_xy(mb);
-            let at = r.pos();
-            let h = match self.mb_header(r, mbx, mby, true) {
-                Ok(Some(h)) => h,
-                Ok(None) => continue,
-                Err(e) => {
-                    if std::env::var_os("MPEG4_DEBUG").is_some() {
-                        let mut t = r.clone();
-                        t.set_pos(at);
-                        eprintln!("dp partition 1: mb {mb} (first {first}) at bit {at}: next {:032b} {:032b}", t.peek(32), t.peek_at(32, 32));
-                        let types: Vec<String> = hdrs.iter().map(|(_, h)| match h.kind { MbKind::Skipped => "s".into(), MbKind::Intra => format!("I{}", h.mb_type), MbKind::Inter => format!("{}{}", h.mb_type, if h.four {"v"} else {""}) }).collect();
-                        eprintln!("   types {}", types.join(" "));
-                    }
-                    return Err(e);
-                }
-            };
+            let Some(h) = self.mb_header(r, mbx, mby, true)? else { continue };
             hdrs.push((mb, h));
             mb += 1;
         }
@@ -670,6 +720,16 @@ impl VopDec<'_> {
                 let mut px = MbPix::new();
                 match self.gmc.filter(|_| h.gmc) {
                     Some(g) => g.predict_mb(src, mbx, mby, self.hdr.rounding, &mut px),
+                    None if h.field_pred => predict_fields(
+                        src,
+                        mbx,
+                        mby,
+                        &h.field_mvs,
+                        h.field_ref,
+                        self.hdr.rounding,
+                        self.vol.quarter_sample,
+                        &mut px,
+                    ),
                     None => predict_mb(
                         src,
                         mbx,
@@ -682,22 +742,24 @@ impl VopDec<'_> {
                     ),
                 }
                 write_mb(self.cur, mbx, mby, &px);
-                self.residual(r, mbx, mby, h.cbp, h.qp)
+                self.residual(r, mbx, mby, h.cbp, h.qp, h.field_dct)
             }
         }
     }
 
     /// The coded inter blocks of a macroblock, added to its prediction.
-    fn residual(&mut self, r: &mut BitReader, mbx: usize, mby: usize, cbp: u8, qp: u32) -> Result<()> {
+    fn residual(&mut self, r: &mut BitReader, mbx: usize, mby: usize, cbp: u8, qp: u32, field_dct: bool) -> Result<()> {
+        // alternate_vertical_scan_flag puts every block on that scan.
+        let scan = if self.hdr.alternate_vertical_scan { &ALT_VERTICAL } else { &ZIGZAG };
         for k in 0..6 {
             if cbp >> (5 - k) & 1 == 0 {
                 continue;
             }
             let mut blk = [0i16; 64];
-            read_coeffs(r, &mut blk, &ZIGZAG, 0, false, self.sh)?;
+            read_coeffs(r, &mut blk, scan, 0, false, self.sh)?;
             self.quant.inter(&mut blk, qp);
             idct(&mut blk);
-            add_block(self.cur, mbx, mby, k, &blk);
+            add_block(self.cur, mbx, mby, k, &blk, field_dct);
         }
         Ok(())
     }
@@ -721,6 +783,7 @@ impl VopDec<'_> {
             let mb = mby * self.st.mbw + mbx;
             let pred = self.st.intra_pred(mbx, mby, k, self.slice);
             let scan = match (h.ac_pred, pred.dir) {
+                _ if self.hdr.alternate_vertical_scan => &ALT_VERTICAL,
                 (false, _) => &ZIGZAG,
                 (true, Dir::Up) => &ALT_HORIZONTAL,
                 (true, Dir::Left) => &ALT_VERTICAL,
@@ -754,7 +817,7 @@ impl VopDec<'_> {
             self.quant.intra(&mut blk, h.qp, scaler);
         }
         idct(&mut blk);
-        put_block(self.cur, mbx, mby, k, &blk);
+        put_block(self.cur, mbx, mby, k, &blk, h.field_dct);
         Ok(())
     }
 
@@ -798,7 +861,30 @@ impl VopDec<'_> {
             }
             (t, cbp)
         };
+        // interlaced_information() of a B-VOP macroblock.
+        let mut field_dct = false;
+        let mut field_pred = false;
+        let mut refs = [[false; 2]; 2];
+        if self.vol.interlaced && !modb_one {
+            if cbp != 0 {
+                field_dct = r.read_bit()?;
+            }
+            if t != BType::Direct {
+                field_pred = r.read_bit()?;
+                if field_pred {
+                    if t != BType::Backward {
+                        refs[0] = [r.read_bit()?, r.read_bit()?];
+                    }
+                    if t != BType::Forward {
+                        refs[1] = [r.read_bit()?, r.read_bit()?];
+                    }
+                }
+            }
+        }
         if t == BType::Direct {
+            if col.field[mb] {
+                return Err(unsupported("field direct mode (a B-VOP macroblock over a field-predicted one)"));
+            }
             // MVDB: absent (zero) when modb is 1, else coded with f_code 1.
             let mvd = if modb_one { [0, 0] } else { [read_mvd(r, 1)?, read_mvd(r, 1)?] };
             let (mvf, mvb) = direct_vectors(col, mbx, mby, mvd, self.trb, self.trd);
@@ -806,6 +892,30 @@ impl VopDec<'_> {
             let mut pb = MbPix::new();
             predict_mb(bwd, mbx, mby, &mvb, true, false, qpel, &mut pb);
             px.average(&pb);
+        } else if field_pred {
+            let mut mvs = [[[0, 0]; 2]; 2];
+            for (d, refd) in [(0, fwd), (1, bwd)] {
+                let used = if d == 0 { t != BType::Backward } else { t != BType::Forward };
+                if !used {
+                    continue;
+                }
+                let fcode = if d == 0 { self.hdr.fcode_forward } else { self.hdr.fcode_backward };
+                let (m, frame) = read_field_mvs(r, self.pmv[d], fcode)?;
+                mvs[d] = m;
+                self.pmv[d] = frame;
+                let _ = refd;
+            }
+            let mut pb = MbPix::new();
+            if t != BType::Backward {
+                predict_fields(fwd, mbx, mby, &mvs[0], refs[0], false, qpel, &mut px);
+            }
+            if t != BType::Forward {
+                let dst = if t == BType::Backward { &mut px } else { &mut pb };
+                predict_fields(bwd, mbx, mby, &mvs[1], refs[1], false, qpel, dst);
+            }
+            if t == BType::Interpolate {
+                px.average(&pb);
+            }
         } else {
             let mut mvf = [0, 0];
             let mut mvb = [0, 0];
@@ -829,7 +939,7 @@ impl VopDec<'_> {
             }
         }
         write_mb(self.cur, mbx, mby, &px);
-        self.residual(r, mbx, mby, cbp, self.qp)
+        self.residual(r, mbx, mby, cbp, self.qp, field_dct)
     }
 
     /// The GOB layer of a short-header picture (6.2.7.1; H.263 5.2): GOBs
@@ -868,9 +978,6 @@ impl VopDec<'_> {
             let mut failed = false;
             for mb in g * per_gob..((g + 1) * per_gob).min(total) {
                 if let Err(e) = self.mb(r, mb) {
-                    if std::env::var_os("MPEG4_DEBUG").is_some() {
-                        eprintln!("short header: GOB {g} macroblock {mb}: {e} at bit {}", r.pos());
-                    }
                     self.record(e);
                     failed = true;
                     // Resume at the next GOB header, if there is one.
@@ -1005,6 +1112,25 @@ fn tail_ok(r: &BitReader, sh: bool) -> bool {
         t.set_pos(t.pos() + 8);
     }
     true
+}
+
+/// The two field vectors of a field-predicted macroblock (top field's,
+/// then bottom field's), each predicted from `pred` with its vertical
+/// component halved (field lines), and the frame vector the macroblock
+/// stands for in later prediction: the horizontal components averaged, the
+/// vertical ones summed (two field lines are one frame line).
+pub(crate) fn read_field_mvs(r: &mut BitReader, pred: [i32; 2], fcode: u32) -> Result<([[i32; 2]; 2], [i32; 2])> {
+    let fp = [pred[0], pred[1] >> 1];
+    let top = read_mv(r, fp, fcode)?;
+    let bot = read_mv(r, fp, fcode)?;
+    Ok(([top, bot], field_to_frame(top, bot)))
+}
+
+/// The frame vector of a field-predicted macroblock.
+#[inline]
+pub(crate) fn field_to_frame(top: [i32; 2], bot: [i32; 2]) -> [i32; 2] {
+    let sx = top[0] + bot[0];
+    [(sx >> 1) | (sx & 1), top[1] + bot[1]]
 }
 
 /// Whether `r` is at `len` bits of resync marker: `len - 1` zeros, a one.
