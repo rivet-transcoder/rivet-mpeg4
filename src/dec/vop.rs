@@ -1440,6 +1440,26 @@ mod tests {
         assert!(!use_intra_dc_vlc(6, 23));
     }
 
+    /// Direct mode (7.6.9.5) by hand: co-located vector 4, TRB 1, TRD 3:
+    /// MVF = 1 * 4 / 3 = 1, MVB = (1 - 3) * 4 / 3 = -2 (truncating); with
+    /// MVD 2, MVF = 3 and MVB = MVF - MV = -1.
+    #[test]
+    fn direct_mode_vectors() {
+        let mut col = Motion::intra(1, 1);
+        col.kind[0] = MbKind::Inter;
+        col.mv = vec![[4, -4]; 4];
+        let (f, b) = direct_vectors(&col, 0, 0, [0, 0], 1, 3);
+        assert_eq!(f, [[1, -1]; 4]);
+        assert_eq!(b, [[-2, 2]; 4]);
+        let (f, b) = direct_vectors(&col, 0, 0, [2, 0], 1, 3);
+        assert_eq!(f, [[3, -1]; 4]);
+        assert_eq!(b, [[-1, 2]; 4]);
+        // An intra co-located macroblock contributes nothing.
+        col.kind[0] = MbKind::Intra;
+        let (f, b) = direct_vectors(&col, 0, 0, [1, 1], 1, 3);
+        assert_eq!((f, b), ([[1, 1]; 4], [[1, 1]; 4]));
+    }
+
     #[test]
     fn vector_wrapping() {
         // f_code 1: [-32, 31] half samples.

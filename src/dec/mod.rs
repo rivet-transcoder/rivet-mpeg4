@@ -763,6 +763,95 @@ mod tests {
         w.put(5, 8); // GQUANT
     }
 
+    /// A not-coded VOP (`vop_coded` 0) of the given type at `time`, with a
+    /// one-tick-per-second VOL (1-bit increments).
+    fn not_coded_vop(p: bool, modulo: u32) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        let h = VopHeader {
+            vop_type: if p { VopType::P } else { VopType::B },
+            modulo_time_base: modulo,
+            time_increment: 0,
+            coded: false,
+            rounding: false,
+            intra_dc_vlc_thr: 0,
+            quant: 0,
+            fcode_forward: 1,
+            fcode_backward: 1,
+            warping: Vec::new(),
+            warping_divx500: false,
+            top_field_first: false,
+            alternate_vertical_scan: false,
+        };
+        headers::write_vop_header(&mut w, 1, &h);
+        w.stuff();
+        w.into_bytes()
+    }
+
+    fn encoder(b_frames: u32) -> crate::Encoder {
+        let mut cfg = crate::EncoderConfig::new(32, 32, 1);
+        cfg.b_frames = b_frames;
+        crate::Encoder::new(cfg).unwrap()
+    }
+
+    fn frame(t: u32) -> Frame {
+        let mut f = Frame::new(32, 32);
+        for (i, v) in f.plane_mut(0).iter_mut().enumerate() {
+            *v = ((i as u32 * 3 + t * 17) % 200) as u8;
+        }
+        f
+    }
+
+    /// A packed bitstream: each P-VOP shares an access unit with the B-VOP
+    /// before it, and a not-coded placeholder follows. One frame per access
+    /// unit comes out, in display order, and the placeholders are dropped.
+    #[test]
+    fn packed_bitstream_placeholders() {
+        let mut enc = encoder(1);
+        let mut aus = Vec::new();
+        for t in 0..7 {
+            let au = enc.encode(&frame(t)).unwrap();
+            if !au.is_empty() {
+                aus.push(au);
+            }
+        }
+        assert!(enc.finish().unwrap().is_empty());
+        // [I] [P B] [P B] [P B]: give each packed unit its placeholder.
+        let mut stream = Vec::new();
+        for au in aus {
+            let packed = split_units(&au).iter().filter(|u| u.0 == sc::VOP).count() == 2;
+            stream.push(au);
+            if packed {
+                stream.push(not_coded_vop(true, 0));
+            }
+        }
+        assert_eq!(stream.len(), 7);
+        let mut d = Decoder::new();
+        let mut frames = Vec::new();
+        for au in &stream {
+            frames.extend(d.decode(au).unwrap());
+        }
+        frames.extend(d.flush());
+        assert_eq!(frames.len(), 7);
+        assert_eq!(d.stats().dropped_vops, 3);
+        let times: Vec<i64> = frames.iter().map(|f| f.timestamp).collect();
+        assert_eq!(times, [0, 1, 2, 3, 4, 5, 6]);
+    }
+
+    /// Outside a packed stream a not-coded P-VOP repeats the reference, as
+    /// a frame of its own time.
+    #[test]
+    fn not_coded_vop_repeats() {
+        let mut enc = encoder(0);
+        let mut d = Decoder::new();
+        let mut frames = d.decode(&enc.encode(&frame(0)).unwrap()).unwrap();
+        frames.extend(d.decode(&not_coded_vop(true, 1)).unwrap());
+        frames.extend(d.flush());
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].data, frames[1].data);
+        assert_eq!((frames[0].timestamp, frames[1].timestamp), (0, 1));
+        assert_eq!(d.stats().dropped_vops, 0);
+    }
+
     /// Sub-QCIF (8x6 macroblocks, one GOB per row): an intra picture whose
     /// macroblocks are flat (INTRADC only), then a P picture of skipped
     /// macroblocks but one moved a sample to the right.
