@@ -39,6 +39,12 @@ pub(crate) fn split_units(data: &[u8]) -> Vec<(u8, &[u8])> {
     out
 }
 
+/// `short_video_start_marker`: 22 bits, `0000 0000 0000 0000 1000 00`.
+#[cfg(test)]
+const SHORT_VIDEO_START_MARKER: u32 = 0x20;
+/// `short_video_end_marker`: 22 bits, `0000 0000 0000 0000 1111 11`.
+pub(crate) const SHORT_VIDEO_END_MARKER: u32 = 0x3f;
+
 /// Positions of short video header pictures (`short_video_start_marker`,
 /// 22 bits `0000 0000 0000 0000 1000 00`, byte aligned).
 fn split_short(data: &[u8]) -> Vec<&[u8]> {
@@ -189,7 +195,9 @@ impl Decoder {
         let mut d = Decoder::new();
         d.configure(dsi)?;
         if d.vol.is_none() {
-            return Err(invalid("decoder specific info without a video object layer header"));
+            return Err(invalid(
+                "decoder specific info without a video object layer header",
+            ));
         }
         Ok(d)
     }
@@ -289,7 +297,11 @@ impl Decoder {
                 }
                 sc::USER_DATA => self.user_data(body),
                 sc::VOL_FIRST..=sc::VOL_LAST => {
-                    let vol = headers::parse_vol(&mut BitReader::new(body), self.vo, self.profile_and_level)?;
+                    let vol = headers::parse_vol(
+                        &mut BitReader::new(body),
+                        self.vo,
+                        self.profile_and_level,
+                    )?;
                     self.set_vol(vol)?;
                 }
                 sc::GOV => {
@@ -307,8 +319,14 @@ impl Decoder {
         // with a trailing 'p' when the stream packs B-VOPs with the
         // following P-VOP.
         if body.starts_with(b"DivX") {
-            let digits: Vec<u8> = body[4..].iter().copied().take_while(u8::is_ascii_digit).collect();
-            self.divx_version = std::str::from_utf8(&digits).ok().and_then(|s| s.parse().ok());
+            let digits: Vec<u8> = body[4..]
+                .iter()
+                .copied()
+                .take_while(u8::is_ascii_digit)
+                .collect();
+            self.divx_version = std::str::from_utf8(&digits)
+                .ok()
+                .and_then(|s| s.parse().ok());
             let end = body.iter().rposition(|&b| b != 0).map_or(0, |p| p + 1);
             if end > 4 && body[end - 1] == b'p' {
                 self.packed = true;
@@ -318,7 +336,10 @@ impl Decoder {
 
     fn set_vol(&mut self, vol: VolHeader) -> Result<()> {
         vol.check_supported()?;
-        let resize = self.vol.as_ref().is_none_or(|v| v.width != vol.width || v.height != vol.height);
+        let resize = self
+            .vol
+            .as_ref()
+            .is_none_or(|v| v.width != vol.width || v.height != vol.height);
         if resize {
             self.st = Some(MbState::new(vol.mb_width(), vol.mb_height()));
             self.past = None;
@@ -328,7 +349,11 @@ impl Decoder {
         }
         self.time_bits = None;
         self.dct_type_always = false;
-        self.quant = Quant { mpeg: vol.mpeg_quant, intra_matrix: vol.intra_matrix, inter_matrix: vol.inter_matrix };
+        self.quant = Quant {
+            mpeg: vol.mpeg_quant,
+            intra_matrix: vol.intra_matrix,
+            inter_matrix: vol.inter_matrix,
+        };
         self.vol = Some(vol);
         Ok(())
     }
@@ -386,7 +411,10 @@ impl Decoder {
     }
 
     fn vop(&mut self, body: &[u8]) -> Result<()> {
-        let vol = self.vol.clone().ok_or_else(|| invalid("a VOP before any video object layer header"))?;
+        let vol = self
+            .vol
+            .clone()
+            .ok_or_else(|| invalid("a VOP before any video object layer header"))?;
         let mut r = BitReader::new(body);
         let h = self.parse_vop(&mut r, &vol)?;
         let time = self.vop_time(&h, vol.time_resolution);
@@ -486,7 +514,10 @@ impl Decoder {
             (Some(p), Some(f)) if is_b => ((time - p.time) as i32, (f.time - p.time) as i32),
             _ => (0, 0),
         };
-        let st = self.st.as_mut().ok_or_else(|| invalid("no macroblock state"))?;
+        let st = self
+            .st
+            .as_mut()
+            .ok_or_else(|| invalid("no macroblock state"))?;
         let (fwd, bwd, col) = if is_b {
             let p = self.past.as_ref().unwrap();
             let f = self.future.as_ref().unwrap();
@@ -495,7 +526,8 @@ impl Decoder {
             (self.future.as_ref().map(|f| &f.pic), None, None)
         };
         let divx500 = h.warping_divx500 || self.divx_version == Some(500);
-        let gmc = (h.vop_type == VopType::S).then(|| crate::gmc::Gmc::new(vol, &h.warping, divx500));
+        let gmc =
+            (h.vop_type == VopType::S).then(|| crate::gmc::Gmc::new(vol, &h.warping, divx500));
         let start = r.pos();
         let mut d = VopDec {
             vol,
@@ -558,9 +590,21 @@ impl Decoder {
         let motion = if h.vop_type == VopType::I {
             Motion::intra(st.mbw, st.mbh)
         } else {
-            Motion { mbw: st.mbw, kind: st.kind.clone(), mv: st.mv.clone(), field: st.field.clone() }
+            Motion {
+                mbw: st.mbw,
+                kind: st.kind.clone(),
+                mv: st.mv.clone(),
+                field: st.field.clone(),
+            }
         };
-        self.push_ref(RefPic { pic: cur, motion, time, vop_type: h.vop_type, decode_index: index, concealed });
+        self.push_ref(RefPic {
+            pic: cur,
+            motion,
+            time,
+            vop_type: h.vop_type,
+            decode_index: index,
+            concealed,
+        });
         Ok(())
     }
 
@@ -589,12 +633,18 @@ impl Decoder {
             3 => (352, 288),
             4 => (704, 576),
             5 => (1408, 1152),
-            7 => return Err(unsupported("H.263 extended picture type (PLUSPTYPE, H.263 version 2)")),
+            7 => {
+                return Err(unsupported(
+                    "H.263 extended picture type (PLUSPTYPE, H.263 version 2)",
+                ));
+            }
             f => return Err(invalid(format!("source_format {f}"))),
         };
         let p = r.read_bit()?;
         if r.read(4)? != 0 {
-            return Err(unsupported("H.263 optional modes (UMV, SAC, AP or PB-frames)"));
+            return Err(unsupported(
+                "H.263 optional modes (UMV, SAC, AP or PB-frames)",
+            ));
         }
         let quant = r.read(5)?;
         if quant == 0 {
@@ -606,7 +656,11 @@ impl Decoder {
         while r.read_bit()? {
             r.read(8)?; // PSUPP
         }
-        if self.vol.as_ref().is_none_or(|v| v.width != w || v.height != h) {
+        if self
+            .vol
+            .as_ref()
+            .is_none_or(|v| v.width != w || v.height != h)
+        {
             let vol = VolHeader::short_header(w, h);
             self.set_vol(vol)?;
         }
@@ -687,7 +741,7 @@ mod tests {
     /// A short-header picture header: PSC, TR, PTYPE (sub-QCIF), PQUANT,
     /// CPM, PEI.
     fn picture_header(w: &mut BitWriter, tr: u32, p: bool) {
-        w.put(22, 0b0000_0000_0000_0000_1000_00);
+        w.put(22, SHORT_VIDEO_START_MARKER);
         w.put(8, tr);
         w.put(1, 1); // marker
         w.put(4, 0); // zero, split screen, document camera, freeze release
@@ -724,7 +778,11 @@ mod tests {
                 w.put(1, 1); // MCBPC: intra, no chroma blocks coded
                 w.put(4, 0b0011); // CBPY: none
                 for k in 0..6 {
-                    let dc = if k < 4 { 16 + (gob * 8 + x) * 3 + k } else { 128 };
+                    let dc = if k < 4 {
+                        16 + (gob * 8 + x) * 3 + k
+                    } else {
+                        128
+                    };
                     // INTRADC 128 is coded as 255 (1000 0000 is reserved).
                     w.put(8, if dc == 128 { 255 } else { dc });
                 }
@@ -746,7 +804,7 @@ mod tests {
             }
         }
         w.align_zero();
-        w.put(22, 0b0000_0000_0000_0000_1111_11); // EOS
+        w.put(22, SHORT_VIDEO_END_MARKER);
         let bytes = w.into_bytes();
         let mut d = Decoder::new();
         let mut frames = d.decode(&bytes).unwrap();

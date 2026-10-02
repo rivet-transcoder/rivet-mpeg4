@@ -48,8 +48,17 @@ pub fn synth(w: u32, h: u32, t: u32) -> Frame {
 pub fn psnr_plane(a: &Frame, b: &Frame, i: usize) -> f64 {
     let (pa, pb) = (a.plane(i), b.plane(i));
     assert_eq!(pa.len(), pb.len());
-    let mse = pa.iter().zip(pb).map(|(&x, &y)| (x as f64 - y as f64).powi(2)).sum::<f64>() / pa.len() as f64;
-    if mse == 0.0 { 99.0 } else { 10.0 * (255.0f64 * 255.0 / mse).log10() }
+    let mse = pa
+        .iter()
+        .zip(pb)
+        .map(|(&x, &y)| (x as f64 - y as f64).powi(2))
+        .sum::<f64>()
+        / pa.len() as f64;
+    if mse == 0.0 {
+        99.0
+    } else {
+        10.0 * (255.0f64 * 255.0 / mse).log10()
+    }
 }
 
 /// Luma PSNR.

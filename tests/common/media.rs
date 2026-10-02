@@ -22,7 +22,10 @@ pub fn avi(data: &[u8]) -> Option<Sample> {
     if data.len() < 12 || &data[..4] != b"RIFF" || &data[8..12] != b"AVI " {
         return None;
     }
-    let mut s = Sample { dsi: Vec::new(), units: Vec::new() };
+    let mut s = Sample {
+        dsi: Vec::new(),
+        units: Vec::new(),
+    };
     let mut video_stream: Option<u32> = None;
     let mut stream_no = 0u32;
     let mut last_was_vids = false;
@@ -79,15 +82,17 @@ pub fn avi(data: &[u8]) -> Option<Sample> {
 pub fn raw(data: &[u8]) -> Sample {
     // Short header when the first start pattern is a picture start code.
     let short = (0..data.len().saturating_sub(2))
-        .find(|&i| data[i] == 0 && data[i + 1] == 0 && (data[i + 2] == 1 || data[i + 2] & 0xfc == 0x80))
+        .find(|&i| {
+            data[i] == 0 && data[i + 1] == 0 && (data[i + 2] == 1 || data[i + 2] & 0xfc == 0x80)
+        })
         .is_some_and(|i| data[i + 2] != 1);
     let mut cuts = Vec::new();
     let mut i = 0;
     while i + 3 < data.len() {
         if data[i] == 0 && data[i + 1] == 0 {
-            if short && data[i + 2] & 0xfc == 0x80 {
-                cuts.push(i);
-            } else if !short && data[i + 2] == 1 && data[i + 3] == 0xb6 {
+            let picture = short && data[i + 2] & 0xfc == 0x80;
+            let vop = !short && data[i + 2] == 1 && data[i + 3] == 0xb6;
+            if picture || vop {
                 cuts.push(i);
             }
         }
@@ -120,7 +125,10 @@ pub fn raw(data: &[u8]) -> Sample {
         units.push(data[start..end].to_vec());
         start = end;
     }
-    Sample { dsi: Vec::new(), units }
+    Sample {
+        dsi: Vec::new(),
+        units,
+    }
 }
 
 /// A file's access units, by its contents.
@@ -133,7 +141,11 @@ fn crc32(data: &[u8]) -> u32 {
     for &b in data {
         c ^= b as u32;
         for _ in 0..8 {
-            c = if c & 1 != 0 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 };
+            c = if c & 1 != 0 {
+                0xedb8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
         }
     }
     !c

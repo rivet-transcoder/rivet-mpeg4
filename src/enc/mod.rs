@@ -97,10 +97,10 @@ impl EncoderConfig {
 fn profile_level(mbs: usize, advanced: bool) -> u8 {
     if advanced {
         match mbs {
-            0..=99 => 0xf1,   // ASP L1, QCIF
+            0..=99 => 0xf1,    // ASP L1, QCIF
             100..=396 => 0xf3, // L3, CIF
             397..=792 => 0xf4, // L4, 352x576
-            _ => 0xf5,        // L5, 720x576 (and beyond)
+            _ => 0xf5,         // L5, 720x576 (and beyond)
         }
     } else {
         match mbs {
@@ -179,7 +179,10 @@ impl Encoder {
     /// of range.
     pub fn new(cfg: EncoderConfig) -> Result<Encoder> {
         if cfg.width == 0 || cfg.height == 0 || cfg.width > 8191 || cfg.height > 8191 {
-            return Err(config(format!("frame size {}x{} (1..=8191 each way)", cfg.width, cfg.height)));
+            return Err(config(format!(
+                "frame size {}x{} (1..=8191 each way)",
+                cfg.width, cfg.height
+            )));
         }
         if cfg.time_base == 0 || cfg.time_base > 65535 {
             return Err(config(format!("time base {} (1..=65535)", cfg.time_base)));
@@ -188,10 +191,16 @@ impl Encoder {
             return Err(config("frame duration 0"));
         }
         if !(1..=1023).contains(&cfg.search_range) {
-            return Err(config(format!("search range {} (1..=1023)", cfg.search_range)));
+            return Err(config(format!(
+                "search range {} (1..=1023)",
+                cfg.search_range
+            )));
         }
         if cfg.b_frames > 8 {
-            return Err(config(format!("{} consecutive B-VOPs (0..=8)", cfg.b_frames)));
+            return Err(config(format!(
+                "{} consecutive B-VOPs (0..=8)",
+                cfg.b_frames
+            )));
         }
         match cfg.rate {
             RateControl::ConstantQuant(q) if !(1..=31).contains(&q) => {
@@ -203,7 +212,9 @@ impl Encoder {
         // The smallest f_code whose range [-32 f, 32 f - 1] half samples
         // holds every vector the search can return.
         let need = 2 * cfg.search_range as i32 + 1;
-        let fcode = (1..=7u32).find(|&f| 32 * (1 << (f - 1)) - 1 >= need).unwrap_or(7);
+        let fcode = (1..=7u32)
+            .find(|&f| 32 * (1 << (f - 1)) > need)
+            .unwrap_or(7);
         let mbw = cfg.width.div_ceil(16) as usize;
         let mbh = cfg.height.div_ceil(16) as usize;
         let advanced = cfg.b_frames > 0;
@@ -220,7 +231,11 @@ impl Encoder {
             RateControl::Bitrate(bps) => {
                 let target = bps as f64 * cfg.frame_duration as f64 / cfg.time_base as f64;
                 let bpp = target / (cfg.width as f64 * cfg.height as f64);
-                Some(Rc { target, base: (1.2 / bpp.max(1e-3)).clamp(2.0, 31.0), err: 0.0 })
+                Some(Rc {
+                    target,
+                    base: (1.2 / bpp.max(1e-3)).clamp(2.0, 31.0),
+                    err: 0.0,
+                })
             }
             RateControl::ConstantQuant(_) => None,
         };
@@ -268,8 +283,10 @@ impl Encoder {
         let index = self.n;
         self.n += 1;
         let gop = self.cfg.gop_size as u64;
-        let intra = self.future.is_none() || (gop > 0 && index % gop == 0);
-        let due = self.last_ref_index.is_none_or(|l| index - l > self.cfg.b_frames as u64);
+        let intra = self.future.is_none() || (gop > 0 && index.is_multiple_of(gop));
+        let due = self
+            .last_ref_index
+            .is_none_or(|l| index - l > self.cfg.b_frames as u64);
         let mut w = BitWriter::new();
         self.put_headers(&mut w);
         if intra || due {
@@ -319,7 +336,8 @@ impl Encoder {
 
     fn keep(&mut self, pic: &Pic, index: u64, t: VopType) {
         if self.cfg.keep_reconstructions {
-            self.recons.push(pic.to_frame(self.ticks(index), self.cfg.time_base, t, index));
+            self.recons
+                .push(pic.to_frame(self.ticks(index), self.cfg.time_base, t, index));
         }
     }
 
@@ -370,7 +388,11 @@ impl Encoder {
         };
         self.keep(&recon, index, hdr.vop_type);
         self.past = self.future.take();
-        self.future = Some(Ref { pic: recon, motion, time: t });
+        self.future = Some(Ref {
+            pic: recon,
+            motion,
+            time: t,
+        });
         self.last_ref_index = Some(index);
     }
 
@@ -405,8 +427,16 @@ impl Encoder {
 
     /// Starts a new video packet at macroblock `mb` when the current one
     /// has grown past the configured size.
-    fn maybe_packet(&mut self, w: &mut BitWriter, packet_start: &mut usize, mb: usize, h: &VopHeader) -> bool {
-        let Some(limit) = self.cfg.packet_bytes else { return false };
+    fn maybe_packet(
+        &mut self,
+        w: &mut BitWriter,
+        packet_start: &mut usize,
+        mb: usize,
+        h: &VopHeader,
+    ) -> bool {
+        let Some(limit) = self.cfg.packet_bytes else {
+            return false;
+        };
         if mb == 0 || w.len_bits() - *packet_start <= limit as usize * 8 {
             return false;
         }
@@ -486,7 +516,18 @@ impl Encoder {
             if mbx == 0 {
                 pmv = [[0, 0]; 2];
             }
-            self.code_b_mb(w, src, &past, &future, &mut recon, mbx, mby, qp, (trb, trd), &mut pmv);
+            self.code_b_mb(
+                w,
+                src,
+                &past,
+                &future,
+                &mut recon,
+                mbx,
+                mby,
+                qp,
+                (trb, trd),
+                &mut pmv,
+            );
         }
         w.stuff();
         self.rate_update(w.len_bits() - start, false);
@@ -513,7 +554,16 @@ impl Encoder {
         let mut px = MbPix::new();
         if future.motion.kind[mb] == MbKind::Skipped {
             // Not coded: the decoder copies the past reference.
-            predict_mb(&past.pic, mbx, mby, &[[0, 0]; 4], false, false, false, &mut px);
+            predict_mb(
+                &past.pic,
+                mbx,
+                mby,
+                &[[0, 0]; 4],
+                false,
+                false,
+                false,
+                &mut px,
+            );
             write_mb(recon, mbx, mby, &px);
             return;
         }
@@ -521,16 +571,53 @@ impl Encoder {
             let v = future.motion.mv[(2 * mby) * 2 * self.st.mbw + 2 * mbx];
             [v[0] as i32, v[1] as i32]
         };
-        let scale = |n: i32| if trd != 0 { [col[0] * n / trd, col[1] * n / trd] } else { [0, 0] };
-        let (mvf, _) = self.search(src, &past.pic, mbx, mby, pmv[0], &[pmv[0], scale(trb)], qp, false);
-        let (mvb, _) = self.search(src, &future.pic, mbx, mby, pmv[1], &[pmv[1], scale(trb - trd)], qp, false);
+        let scale = |n: i32| {
+            if trd != 0 {
+                [col[0] * n / trd, col[1] * n / trd]
+            } else {
+                [0, 0]
+            }
+        };
+        let (mvf, _) = self.search(
+            src,
+            &past.pic,
+            mbx,
+            mby,
+            pmv[0],
+            &[pmv[0], scale(trb)],
+            qp,
+            false,
+        );
+        let (mvb, _) = self.search(
+            src,
+            &future.pic,
+            mbx,
+            mby,
+            pmv[1],
+            &[pmv[1], scale(trb - trd)],
+            qp,
+            false,
+        );
         // Compare the four modes on the luma prediction error plus a rate
         // estimate.
         let mut pf = MbPix::new();
         let mut pb = MbPix::new();
         predict_mb(&past.pic, mbx, mby, &[mvf; 4], false, false, false, &mut pf);
-        predict_mb(&future.pic, mbx, mby, &[mvb; 4], false, false, false, &mut pb);
-        let mut pi = MbPix { y: pf.y, cb: pf.cb, cr: pf.cr };
+        predict_mb(
+            &future.pic,
+            mbx,
+            mby,
+            &[mvb; 4],
+            false,
+            false,
+            false,
+            &mut pb,
+        );
+        let mut pi = MbPix {
+            y: pf.y,
+            cb: pf.cb,
+            cr: pf.cr,
+        };
         mc::average(&mut pi.y, &pb.y);
         mc::average(&mut pi.cb, &pb.cb);
         mc::average(&mut pi.cr, &pb.cr);
@@ -544,12 +631,23 @@ impl Encoder {
         mc::average(&mut pd.cr, &pdb.cr);
         let mut ys = [0u8; 256];
         luma_mb(src, mbx, mby, &mut ys);
-        let sad = |p: &[u8; 256]| -> u32 { ys.iter().zip(p).map(|(&a, &b)| (a as i32 - b as i32).unsigned_abs()).sum() };
+        let sad = |p: &[u8; 256]| -> u32 {
+            ys.iter()
+                .zip(p)
+                .map(|(&a, &b)| (a as i32 - b as i32).unsigned_abs())
+                .sum()
+        };
         let lambda = qp;
         let costs = [
             (BMode::Direct, sad(&pd.y)),
-            (BMode::Forward, sad(&pf.y) + lambda * (self.mv_bits(mvf, pmv[0]) + 4)),
-            (BMode::Backward, sad(&pb.y) + lambda * (self.mv_bits(mvb, pmv[1]) + 3)),
+            (
+                BMode::Forward,
+                sad(&pf.y) + lambda * (self.mv_bits(mvf, pmv[0]) + 4),
+            ),
+            (
+                BMode::Backward,
+                sad(&pb.y) + lambda * (self.mv_bits(mvb, pmv[1]) + 3),
+            ),
             (
                 BMode::Interpolate,
                 sad(&pi.y) + lambda * (self.mv_bits(mvf, pmv[0]) + self.mv_bits(mvb, pmv[1]) + 2),
@@ -622,7 +720,16 @@ impl Encoder {
 
     /// An intra macroblock (in an I-VOP, or `in_p` a P-VOP).
     #[allow(clippy::too_many_arguments)]
-    fn code_intra_mb(&mut self, w: &mut BitWriter, src: &Pic, recon: &mut Pic, mbx: usize, mby: usize, qp: u32, in_p: bool) {
+    fn code_intra_mb(
+        &mut self,
+        w: &mut BitWriter,
+        src: &Pic,
+        recon: &mut Pic,
+        mbx: usize,
+        mby: usize,
+        qp: u32,
+        in_p: bool,
+    ) {
         let mb = mby * self.st.mbw + mbx;
         self.st.kind[mb] = MbKind::Intra;
         self.st.set_mb_mv(mbx, mby, [0, 0]);
@@ -665,11 +772,16 @@ impl Encoder {
             let scaler = dc_scaler(qp, k < 4) as i32;
             dc_diff[k] = levels[k][0] as i32 - round_div(p.dc, scaler);
             if ac_pred {
-                scans[k] = if p.dir == Dir::Up { &ALT_HORIZONTAL } else { &ALT_VERTICAL };
+                scans[k] = if p.dir == Dir::Up {
+                    &ALT_HORIZONTAL
+                } else {
+                    &ALT_VERTICAL
+                };
                 if let Some((v, qpn)) = p.ac {
                     for i in 1..8 {
                         let idx = if p.dir == Dir::Up { i } else { i * 8 };
-                        coded[k][idx] = (levels[k][idx] as i32 - ac_pred_value(v[i - 1], qpn, qp)) as i16;
+                        coded[k][idx] =
+                            (levels[k][idx] as i32 - ac_pred_value(v[i - 1], qpn, qp)) as i16;
                     }
                 }
             }
@@ -703,7 +815,16 @@ impl Encoder {
     /// A P-VOP macroblock: motion search, then intra, skipped, one- or
     /// four-vector inter coding.
     #[allow(clippy::too_many_arguments)]
-    fn code_p_mb(&mut self, w: &mut BitWriter, src: &Pic, rf: &Pic, recon: &mut Pic, mbx: usize, mby: usize, h: &VopHeader) {
+    fn code_p_mb(
+        &mut self,
+        w: &mut BitWriter,
+        src: &Pic,
+        rf: &Pic,
+        recon: &mut Pic,
+        mbx: usize,
+        mby: usize,
+        h: &VopHeader,
+    ) {
         let qp = h.quant;
         let mb = mby * self.st.mbw + mbx;
         let pred0 = self.st.mv_pred(mbx, mby, 0, self.slice);
@@ -725,7 +846,10 @@ impl Encoder {
         let mut ys = [0u8; 256];
         luma_mb(src, mbx, mby, &mut ys);
         let mean = ys.iter().map(|&v| v as u32).sum::<u32>() / 256;
-        let dev: u32 = ys.iter().map(|&v| (v as i32 - mean as i32).unsigned_abs()).sum();
+        let dev: u32 = ys
+            .iter()
+            .map(|&v| (v as i32 - mean as i32).unsigned_abs())
+            .sum();
         if dev + 500 < sad16 {
             self.code_intra_mb(w, src, recon, mbx, mby, qp, true);
             return;
@@ -734,9 +858,9 @@ impl Encoder {
         let mut four = false;
         if self.cfg.four_mv {
             let mut sad4 = 0;
-            for k in 0..4 {
-                let (v, s) = self.search8(src, rf, mbx, mby, k, mv, h.rounding);
-                mvs[k] = v;
+            for (k, v) in mvs.iter_mut().enumerate() {
+                let (b, s) = self.search8(src, rf, mbx, mby, k, mv, h.rounding);
+                *v = b;
                 sad4 += s;
             }
             if sad4 + 16 * qp * 3 < sad16 && mvs.iter().any(|&v| v != mv) {
@@ -820,7 +944,16 @@ impl Encoder {
     /// against its prediction at `mv` (half samples), over block `k`
     /// (an 8x8 quarter) or the whole macroblock (`None`).
     #[allow(clippy::too_many_arguments)]
-    fn sad(&self, src: &Pic, rf: &Pic, mbx: usize, mby: usize, k: Option<usize>, mv: [i32; 2], rounding: bool) -> u32 {
+    fn sad(
+        &self,
+        src: &Pic,
+        rf: &Pic,
+        mbx: usize,
+        mby: usize,
+        k: Option<usize>,
+        mv: [i32; 2],
+        rounding: bool,
+    ) -> u32 {
         let (bx, by, n) = match k {
             None => (0, 0, 16),
             Some(k) => ((k & 1) * 8, (k >> 1) * 8, 8),
@@ -828,7 +961,18 @@ impl Encoder {
         let x = (mbx * 16 + bx) as i32;
         let y = (mby * 16 + by) as i32;
         let mut p = [0u8; 256];
-        mc::halfpel(rf.ref_plane(0), x, y, mv[0], mv[1], n, n, rounding, &mut p, 16);
+        mc::halfpel(
+            rf.ref_plane(0),
+            x,
+            y,
+            mv[0],
+            mv[1],
+            n,
+            n,
+            rounding,
+            &mut p,
+            16,
+        );
         let s = src.ystride();
         let mut sum = 0;
         for r in 0..n {
@@ -915,7 +1059,16 @@ impl Encoder {
 
     /// Refines one 8x8 block's vector around the macroblock's.
     #[allow(clippy::too_many_arguments)]
-    fn search8(&self, src: &Pic, rf: &Pic, mbx: usize, mby: usize, k: usize, start: [i32; 2], rounding: bool) -> ([i32; 2], u32) {
+    fn search8(
+        &self,
+        src: &Pic,
+        rf: &Pic,
+        mbx: usize,
+        mby: usize,
+        k: usize,
+        start: [i32; 2],
+        rounding: bool,
+    ) -> ([i32; 2], u32) {
         let mut best = start;
         let mut best_sad = self.sad(src, rf, mbx, mby, Some(k), start, rounding);
         for step in [2, 1] {
@@ -950,7 +1103,11 @@ fn luma_mb(src: &Pic, mbx: usize, mby: usize, out: &mut [u8; 256]) {
 /// Block `k` of a macroblock of the source, as signed samples.
 fn source_block(src: &Pic, mbx: usize, mby: usize, k: usize) -> [i16; 64] {
     let (p, s, o) = match k {
-        0..=3 => (&src.y, src.ystride(), (mby * 16 + (k >> 1) * 8) * src.ystride() + mbx * 16 + (k & 1) * 8),
+        0..=3 => (
+            &src.y,
+            src.ystride(),
+            (mby * 16 + (k >> 1) * 8) * src.ystride() + mbx * 16 + (k & 1) * 8,
+        ),
         4 => (&src.cb, src.cstride(), mby * 8 * src.cstride() + mbx * 8),
         _ => (&src.cr, src.cstride(), mby * 8 * src.cstride() + mbx * 8),
     };

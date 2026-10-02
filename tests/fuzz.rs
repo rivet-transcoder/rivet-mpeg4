@@ -47,7 +47,10 @@ fn decode_all(aus: &[Vec<u8>]) {
 /// Configuration headers, for feeding damaged VOPs to a decoder that has
 /// a configuration.
 fn config() -> Vec<u8> {
-    Encoder::new(EncoderConfig::new(48, 32, 25)).unwrap().config().to_vec()
+    Encoder::new(EncoderConfig::new(48, 32, 25))
+        .unwrap()
+        .config()
+        .to_vec()
 }
 
 proptest! {

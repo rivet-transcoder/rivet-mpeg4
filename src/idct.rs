@@ -206,7 +206,10 @@ mod tests {
             peak,
             pmse: sq.iter().map(|&s| s as f64 / n).fold(0.0, f64::max),
             omse: sq.iter().sum::<i64>() as f64 / (64.0 * n),
-            pme: err.iter().map(|&s| (s as f64 / n).abs()).fold(0.0, f64::max),
+            pme: err
+                .iter()
+                .map(|&s| (s as f64 / n).abs())
+                .fold(0.0, f64::max),
             ome: (err.iter().sum::<i64>() as f64 / (64.0 * n)).abs(),
         }
     }
@@ -217,7 +220,11 @@ mod tests {
     /// error <= 0.0015; and an all-zero block transforms to all zeros.
     #[test]
     fn ieee_1180_accuracy() {
-        let blocks = if cfg!(debug_assertions) { 2_000 } else { 10_000 };
+        let blocks = if cfg!(debug_assertions) {
+            2_000
+        } else {
+            10_000
+        };
         for (l, h) in [(256, 255), (5, 5), (300, 300)] {
             for sign in [1, -1] {
                 let s = ieee1180_run(l, h, sign, blocks);

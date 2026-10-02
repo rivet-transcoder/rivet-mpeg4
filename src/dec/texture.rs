@@ -14,7 +14,11 @@ pub(crate) fn read_dc_diff(r: &mut BitReader, luma: bool) -> Result<i32> {
         return Ok(0);
     }
     let code = r.read(size)? as i32;
-    let v = if code >> (size - 1) == 0 { code - ((1 << size) - 1) } else { code };
+    let v = if code >> (size - 1) == 0 {
+        code - ((1 << size) - 1)
+    } else {
+        code
+    };
     if size > 8 {
         r.marker("after dct_dc_differential")?;
     }
@@ -51,7 +55,9 @@ pub(crate) fn read_coeffs(
             let run = r.read(6)?;
             let level = r.read(8)? as u8 as i8 as i32;
             if level == 0 || level == -128 {
-                return Err(invalid(format!("escaped level {level} in a short-header block")));
+                return Err(invalid(format!(
+                    "escaped level {level} in a short-header block"
+                )));
             }
             (last, run, level)
         } else if !r.read_bit()? {
@@ -72,8 +78,13 @@ pub(crate) fn read_coeffs(
             }
             let (last, run, level) = unpack(v);
             let neg = r.read_bit()?;
-            let rm = rmax(intra_table, last, level).ok_or_else(|| invalid("RMAX of an uncoded level"))?;
-            (last, run + rm + 1, if neg { -(level as i32) } else { level as i32 })
+            let rm = rmax(intra_table, last, level)
+                .ok_or_else(|| invalid("RMAX of an uncoded level"))?;
+            (
+                last,
+                run + rm + 1,
+                if neg { -(level as i32) } else { level as i32 },
+            )
         } else {
             // Type 3: fixed length.
             let last = r.read_bit()?;
@@ -111,13 +122,24 @@ mod tests {
 
     /// The code of `(last, run, level)` in a table.
     fn find(t: &[(&'static str, u8, u8, u8)], last: u8, run: u8, level: u8) -> &'static str {
-        t.iter().find(|e| (e.1, e.2, e.3) == (last, run, level)).unwrap().0
+        t.iter()
+            .find(|e| (e.1, e.2, e.3) == (last, run, level))
+            .unwrap()
+            .0
     }
 
     fn decode(w: BitWriter, intra: bool, short: bool) -> [i16; 64] {
         let bytes = w.into_bytes();
         let mut b = [0i16; 64];
-        read_coeffs(&mut BitReader::new(&bytes), &mut b, &ZIGZAG, 0, intra, short).unwrap();
+        read_coeffs(
+            &mut BitReader::new(&bytes),
+            &mut b,
+            &ZIGZAG,
+            0,
+            intra,
+            short,
+        )
+        .unwrap();
         b
     }
 
@@ -194,7 +216,17 @@ mod tests {
         w.put(14, 1 << 1);
         let bytes = w.into_bytes();
         let mut b = [0i16; 64];
-        assert!(read_coeffs(&mut BitReader::new(&bytes), &mut b, &ZIGZAG, 0, false, false).is_err());
+        assert!(
+            read_coeffs(
+                &mut BitReader::new(&bytes),
+                &mut b,
+                &ZIGZAG,
+                0,
+                false,
+                false
+            )
+            .is_err()
+        );
     }
 
     /// The short video header's escape (H.263 5.4.2): last, 6-bit run,
@@ -216,7 +248,9 @@ mod tests {
             w.put(8, bad);
             let bytes = w.into_bytes();
             let mut b = [0i16; 64];
-            assert!(read_coeffs(&mut BitReader::new(&bytes), &mut b, &ZIGZAG, 0, false, true).is_err());
+            assert!(
+                read_coeffs(&mut BitReader::new(&bytes), &mut b, &ZIGZAG, 0, false, true).is_err()
+            );
         }
     }
 
@@ -229,7 +263,17 @@ mod tests {
         }
         let bytes = w.into_bytes();
         let mut b = [0i16; 64];
-        assert!(read_coeffs(&mut BitReader::new(&bytes), &mut b, &ZIGZAG, 0, false, false).is_err());
+        assert!(
+            read_coeffs(
+                &mut BitReader::new(&bytes),
+                &mut b,
+                &ZIGZAG,
+                0,
+                false,
+                false
+            )
+            .is_err()
+        );
     }
 
     /// dct_dc_differential (Table B-15 semantics): a leading 0 bit marks a
@@ -251,7 +295,11 @@ mod tests {
                 put(&mut w, bits);
             }
             let bytes = w.into_bytes();
-            assert_eq!(read_dc_diff(&mut BitReader::new(&bytes), true).unwrap(), v, "{size} {bits}");
+            assert_eq!(
+                read_dc_diff(&mut BitReader::new(&bytes), true).unwrap(),
+                v,
+                "{size} {bits}"
+            );
         }
     }
 }

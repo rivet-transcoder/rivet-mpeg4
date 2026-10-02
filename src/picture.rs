@@ -79,7 +79,13 @@ impl Pic {
     }
 
     /// Crops to a [`Frame`].
-    pub fn to_frame(&self, timestamp: i64, time_base: u32, vop_type: VopType, decode_index: u64) -> Frame {
+    pub fn to_frame(
+        &self,
+        timestamp: i64,
+        time_base: u32,
+        vop_type: VopType,
+        decode_index: u64,
+    ) -> Frame {
         let mut f = Frame::new(self.w, self.h);
         f.timestamp = timestamp;
         f.time_base = time_base;
@@ -103,7 +109,11 @@ impl Pic {
         let (cw, ch) = p.chroma_size();
         let strides = [p.ystride(), p.cstride(), p.cstride()];
         let heights = [p.mbh * 16, p.mbh * 8, p.mbh * 8];
-        let sizes = [(f.width as usize, f.height as usize), (cw as usize, ch as usize), (cw as usize, ch as usize)];
+        let sizes = [
+            (f.width as usize, f.height as usize),
+            (cw as usize, ch as usize),
+            (cw as usize, ch as usize),
+        ];
         for i in 0..3 {
             let src = f.plane(i);
             let (w, h) = sizes[i];

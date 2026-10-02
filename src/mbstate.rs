@@ -73,7 +73,11 @@ pub(crate) struct MbState {
 /// halves away from zero.
 #[inline]
 pub(crate) fn round_div(n: i32, d: i32) -> i32 {
-    if n >= 0 { (n + d / 2) / d } else { -((-n + d / 2) / d) }
+    if n >= 0 {
+        (n + d / 2) / d
+    } else {
+        -((-n + d / 2) / d)
+    }
 }
 
 impl MbState {
@@ -122,9 +126,17 @@ impl MbState {
         let dc = |p: &Option<(BlockPred, u32)>| p.map_or(1024, |p| p.0.dc as i32);
         let (fa, fb, fc) = (dc(&a), dc(&b), dc(&c));
         if (fa - fb).abs() < (fb - fc).abs() {
-            IntraPred { dc: fc, dir: Dir::Up, ac: c.map(|p| (p.0.row, p.1)) }
+            IntraPred {
+                dc: fc,
+                dir: Dir::Up,
+                ac: c.map(|p| (p.0.row, p.1)),
+            }
         } else {
-            IntraPred { dc: fa, dir: Dir::Left, ac: a.map(|p| (p.0.col, p.1)) }
+            IntraPred {
+                dc: fa,
+                dir: Dir::Left,
+                ac: a.map(|p| (p.0.col, p.1)),
+            }
         }
     }
 
@@ -156,7 +168,9 @@ impl MbState {
         for (j, &(cx, cy)) in cands.iter().enumerate() {
             let (mx, my) = (cx.div_euclid(2), cy.div_euclid(2));
             let ok = (mx == mbx as isize && my == mby as isize)
-                || (cx >= 0 && cx < 2 * self.mbw as isize && self.available(mx, my, slice).is_some());
+                || (cx >= 0
+                    && cx < 2 * self.mbw as isize
+                    && self.available(mx, my, slice).is_some());
             if ok && cy >= 0 {
                 let m = self.mv[cy as usize * 2 * self.mbw + cx as usize];
                 v[j] = [m[0] as i32, m[1] as i32];
@@ -169,7 +183,10 @@ impl MbState {
             _ => {
                 // One invalid candidate counts as zero.
                 let med = |a: i32, b: i32, c: i32| a.max(b).min(a.min(b).max(c));
-                [med(v[0][0], v[1][0], v[2][0]), med(v[0][1], v[1][1], v[2][1])]
+                [
+                    med(v[0][0], v[1][0], v[2][0]),
+                    med(v[0][1], v[1][1], v[2][1]),
+                ]
             }
         }
     }
@@ -200,7 +217,11 @@ impl MbState {
 /// first row or column, scaled from the neighbour's quantiser to `qp`.
 #[inline]
 pub(crate) fn ac_pred_value(v: i16, qp_n: u32, qp: u32) -> i32 {
-    if qp_n == qp { v as i32 } else { round_div(v as i32 * qp_n as i32, qp as i32) }
+    if qp_n == qp {
+        v as i32
+    } else {
+        round_div(v as i32 * qp_n as i32, qp as i32)
+    }
 }
 
 #[cfg(test)]

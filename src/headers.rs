@@ -62,9 +62,15 @@ pub(crate) struct Complexity {
 
 impl Complexity {
     fn parse(r: &mut BitReader) -> Result<Self> {
-        let mut c = Complexity { method: r.read(2)?, ..Default::default() };
+        let mut c = Complexity {
+            method: r.read(2)?,
+            ..Default::default()
+        };
         if c.method > 1 {
-            return Err(unsupported(format!("complexity estimation method {}", c.method)));
+            return Err(unsupported(format!(
+                "complexity estimation method {}",
+                c.method
+            )));
         }
         if !r.read_bit()? {
             // shape_complexity_estimation_disable == 0
@@ -107,16 +113,43 @@ impl Complexity {
     /// Bits of `read_vop_complexity_estimation_header()` in a VOP of this
     /// type: 8 per enabled statistic, 4 for `dcecs_vlc_bits`.
     fn vop_bits(&self, t: VopType) -> usize {
-        let shape = [self.opaque, self.transparent, self.intra_cae, self.inter_cae, self.no_update, self.upsampling];
-        let texture = [self.intra_blocks, self.not_coded_blocks, self.dct_coefs, self.dct_lines, self.vlc_symbols];
-        let motion = [self.inter_blocks, self.inter4v_blocks, self.apm, self.npm, self.forw_back_mc_q, self.halfpel2, self.halfpel4];
+        let shape = [
+            self.opaque,
+            self.transparent,
+            self.intra_cae,
+            self.inter_cae,
+            self.no_update,
+            self.upsampling,
+        ];
+        let texture = [
+            self.intra_blocks,
+            self.not_coded_blocks,
+            self.dct_coefs,
+            self.dct_lines,
+            self.vlc_symbols,
+        ];
+        let motion = [
+            self.inter_blocks,
+            self.inter4v_blocks,
+            self.apm,
+            self.npm,
+            self.forw_back_mc_q,
+            self.halfpel2,
+            self.halfpel4,
+        ];
         let n = |s: &[bool]| s.iter().filter(|&&b| b).count() * 8;
         let vlc_bits = if self.vlc_bits { 4 } else { 0 };
         match t {
             VopType::I => n(&shape) + n(&texture) + vlc_bits + n(&[self.sadct]),
-            VopType::P => n(&shape) + n(&texture) + vlc_bits + n(&motion) + n(&[self.sadct, self.quarterpel]),
+            VopType::P => {
+                n(&shape) + n(&texture) + vlc_bits + n(&motion) + n(&[self.sadct, self.quarterpel])
+            }
             VopType::B => {
-                n(&shape) + n(&texture) + vlc_bits + n(&motion) + n(&[self.interpolate_mc_q, self.sadct, self.quarterpel])
+                n(&shape)
+                    + n(&texture)
+                    + vlc_bits
+                    + n(&motion)
+                    + n(&[self.interpolate_mc_q, self.sadct, self.quarterpel])
             }
             VopType::S => n(&texture) + vlc_bits + n(&motion) + n(&[self.interpolate_mc_q]),
         }
@@ -207,7 +240,9 @@ impl VolHeader {
             return Err(unsupported("static sprites"));
         }
         if self.sprite == SpriteMode::Gmc && self.sprite_warping_points > 3 {
-            return Err(unsupported("four-point (perspective) global motion compensation"));
+            return Err(unsupported(
+                "four-point (perspective) global motion compensation",
+            ));
         }
         if self.sprite == SpriteMode::Gmc && self.sprite_brightness_change {
             return Err(unsupported("sprite brightness change"));
@@ -273,7 +308,9 @@ pub(crate) fn parse_visual_object(r: &mut BitReader) -> Result<VisualObject> {
     }
     let ty = r.read(4)?;
     if ty != 1 {
-        return Err(unsupported(format!("visual object type {ty} (only video, 1)")));
+        return Err(unsupported(format!(
+            "visual object type {ty} (only video, 1)"
+        )));
     }
     if r.read_bit()? {
         // video_signal_type
@@ -291,7 +328,11 @@ pub(crate) fn parse_vol(r: &mut BitReader, vo: VisualObject, pl: Option<u8>) -> 
     r.read(1)?; // random_accessible_vol
     let object_type = r.read(8)? as u8;
     match object_type {
-        0x0f | 0x10 => return Err(unsupported("the Studio profiles (Simple Studio and Core Studio object types)")),
+        0x0f | 0x10 => {
+            return Err(unsupported(
+                "the Studio profiles (Simple Studio and Core Studio object types)",
+            ));
+        }
         0x12 => return Err(unsupported("fine granularity scalability")),
         _ => {}
     }
@@ -314,7 +355,9 @@ pub(crate) fn parse_vol(r: &mut BitReader, vo: VisualObject, pl: Option<u8>) -> 
         // vol_control_parameters
         let chroma_format = r.read(2)?;
         if chroma_format != 1 {
-            return Err(unsupported(format!("chroma_format {chroma_format} (only 4:2:0)")));
+            return Err(unsupported(format!(
+                "chroma_format {chroma_format} (only 4:2:0)"
+            )));
         }
         low_delay = Some(r.read_bit()?);
         if r.read_bit()? {
@@ -337,7 +380,9 @@ pub(crate) fn parse_vol(r: &mut BitReader, vo: VisualObject, pl: Option<u8>) -> 
         r.read(4)?; // video_object_layer_shape_extension
     }
     if shape != 0 {
-        return Err(unsupported("arbitrary shape (video_object_layer_shape other than rectangular)"));
+        return Err(unsupported(
+            "arbitrary shape (video_object_layer_shape other than rectangular)",
+        ));
     }
     r.lenient_marker()?;
     let time_resolution = r.read(16)?;
@@ -346,7 +391,11 @@ pub(crate) fn parse_vol(r: &mut BitReader, vo: VisualObject, pl: Option<u8>) -> 
     }
     r.lenient_marker()?;
     let bits = time_increment_bits(time_resolution);
-    let fixed_vop_time_increment = if r.read_bit()? { Some(r.read(bits)?) } else { None };
+    let fixed_vop_time_increment = if r.read_bit()? {
+        Some(r.read(bits)?)
+    } else {
+        None
+    };
     r.lenient_marker()?;
     let width = r.read(13)?;
     r.lenient_marker()?;
@@ -380,7 +429,9 @@ pub(crate) fn parse_vol(r: &mut BitReader, vo: VisualObject, pl: Option<u8>) -> 
             r.read(1)?; // low_latency_sprite_enable
         }
         if sprite_warping_points > 4 {
-            return Err(invalid(format!("{sprite_warping_points} sprite warping points")));
+            return Err(invalid(format!(
+                "{sprite_warping_points} sprite warping points"
+            )));
         }
     }
     if r.read_bit()? {
@@ -405,10 +456,18 @@ pub(crate) fn parse_vol(r: &mut BitReader, vo: VisualObject, pl: Option<u8>) -> 
         }
     }
     let quarter_sample = if verid != 1 { r.read_bit()? } else { false };
-    let complexity = if r.read_bit()? { None } else { Some(Complexity::parse(r)?) };
+    let complexity = if r.read_bit()? {
+        None
+    } else {
+        Some(Complexity::parse(r)?)
+    };
     let resync_marker_disable = r.read_bit()?;
     let data_partitioned = r.read_bit()?;
-    let reversible_vlc = if data_partitioned { r.read_bit()? } else { false };
+    let reversible_vlc = if data_partitioned {
+        r.read_bit()?
+    } else {
+        false
+    };
     let mut newpred = false;
     let mut reduced_resolution = false;
     // Some early encoders (OpenDivX) declare verid 2 but write the verid 1
@@ -521,7 +580,11 @@ fn warping_mv_code(r: &mut BitReader) -> Result<i32> {
         0
     } else {
         let code = r.read(len)? as i32;
-        if code >> (len - 1) == 1 { code } else { code - ((1 << len) - 1) }
+        if code >> (len - 1) == 1 {
+            code
+        } else {
+            code - ((1 << len) - 1)
+        }
     })
 }
 
@@ -531,7 +594,10 @@ fn warping_mv_code(r: &mut BitReader) -> Result<i32> {
 /// DivX 5.00 (build 413) writes one marker per point, after `dv`: when
 /// the standard layout meets a zero where a marker belongs, the trajectory
 /// is read again that way, and the second value returned is true.
-pub(crate) fn parse_sprite_trajectory(r: &mut BitReader, points: u32) -> Result<(Vec<(i32, i32)>, bool)> {
+pub(crate) fn parse_sprite_trajectory(
+    r: &mut BitReader,
+    points: u32,
+) -> Result<(Vec<(i32, i32)>, bool)> {
     let start = r.pos();
     let standard = (0..points)
         .map(|_| {
@@ -562,7 +628,12 @@ pub(crate) fn parse_sprite_trajectory(r: &mut BitReader, points: u32) -> Result<
 /// marker bit after the increment must be there (the decoder tries other
 /// lengths when it is not: some encoders code the increment with more bits
 /// than their VOL's resolution needs).
-pub(crate) fn parse_vop_with(r: &mut BitReader, vol: &VolHeader, time_bits: u32, strict: bool) -> Result<VopHeader> {
+pub(crate) fn parse_vop_with(
+    r: &mut BitReader,
+    vol: &VolHeader,
+    time_bits: u32,
+    strict: bool,
+) -> Result<VopHeader> {
     let vop_type = vop_type_of(r.read(2)?);
     let mut modulo_time_base = 0;
     while r.read_bit()? {
@@ -713,11 +784,7 @@ pub(crate) fn write_config(p: &VolParams) -> Vec<u8> {
 }
 
 /// A VOP header up to the first macroblock.
-pub(crate) fn write_vop_header(
-    w: &mut BitWriter,
-    time_increment_bits: u32,
-    h: &VopHeader,
-) {
+pub(crate) fn write_vop_header(w: &mut BitWriter, time_increment_bits: u32, h: &VopHeader) {
     put_start_code(w, sc::VOP);
     w.put(
         2,
@@ -801,6 +868,39 @@ mod tests {
         assert!(!vol.mpeg_quant);
         assert_eq!(vol.object_type, 1);
         vol.check_supported().unwrap();
+    }
+
+    #[test]
+    fn vop_header_round_trips() {
+        let vol = VolHeader::short_header(176, 144);
+        for (t, coded) in [
+            (VopType::I, true),
+            (VopType::P, true),
+            (VopType::B, true),
+            (VopType::P, false),
+        ] {
+            let h = VopHeader {
+                vop_type: t,
+                modulo_time_base: 2,
+                time_increment: 1234,
+                coded,
+                rounding: coded && t == VopType::P,
+                intra_dc_vlc_thr: 0,
+                quant: if coded { 17 } else { 0 },
+                fcode_forward: if t == VopType::I || !coded { 1 } else { 3 },
+                fcode_backward: if t == VopType::B { 2 } else { 1 },
+                warping: Vec::new(),
+                warping_divx500: false,
+                top_field_first: false,
+                alternate_vertical_scan: false,
+            };
+            let mut w = BitWriter::new();
+            write_vop_header(&mut w, vol.time_increment_bits, &h);
+            let b = w.into_bytes();
+            assert_eq!(&b[..4], &[0, 0, 1, sc::VOP]);
+            let got = parse_vop(&mut BitReader::new(&b[4..]), &vol).unwrap();
+            assert_eq!(got, h);
+        }
     }
 
     #[test]

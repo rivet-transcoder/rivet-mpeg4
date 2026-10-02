@@ -32,12 +32,12 @@ impl Quant {
         if self.mpeg {
             let mut sum = dc;
             b[0] = dc as i16;
-            for i in 1..64 {
-                let q = b[i] as i32;
+            for (v, &w) in b.iter_mut().zip(&self.intra_matrix).skip(1) {
+                let q = *v as i32;
                 if q != 0 {
                     // F'' = (2 QF W QP) / 16, truncating.
-                    let f = (2 * q * self.intra_matrix[i] as i32 * qp / 16).clamp(MIN, MAX);
-                    b[i] = f as i16;
+                    let f = (2 * q * w as i32 * qp / 16).clamp(MIN, MAX);
+                    *v = f as i16;
                     sum += f;
                 }
             }
@@ -53,12 +53,12 @@ impl Quant {
         let qp = qp as i32;
         if self.mpeg {
             let mut sum = 0;
-            for i in 0..64 {
-                let q = b[i] as i32;
+            for (v, &w) in b.iter_mut().zip(&self.inter_matrix) {
+                let q = *v as i32;
                 if q != 0 {
                     // F'' = ((2 QF + sign(QF)) W QP) / 16, truncating.
-                    let f = ((2 * q + q.signum()) * self.inter_matrix[i] as i32 * qp / 16).clamp(MIN, MAX);
-                    b[i] = f as i16;
+                    let f = ((2 * q + q.signum()) * w as i32 * qp / 16).clamp(MIN, MAX);
+                    *v = f as i16;
                     sum += f;
                 }
             }
@@ -102,7 +102,11 @@ pub(crate) fn quantise_h263(b: &mut [i16; 64], qp: u32, intra: bool) {
     for v in &mut b[from..] {
         let c = *v as i32;
         let a = c.abs();
-        let l = if intra { a / (2 * qp) } else { (a - qp / 2).max(0) / (2 * qp) };
+        let l = if intra {
+            a / (2 * qp)
+        } else {
+            (a - qp / 2).max(0) / (2 * qp)
+        };
         let l = l.min(2047);
         *v = (if c < 0 { -l } else { l }) as i16;
     }
@@ -141,7 +145,10 @@ mod tests {
 
     #[test]
     fn mpeg_reconstruction_and_mismatch() {
-        let q = Quant { mpeg: true, ..Quant::h263() };
+        let q = Quant {
+            mpeg: true,
+            ..Quant::h263()
+        };
         // One inter coefficient: ((2 + 1) * 16 * 2) / 16 = 6; the sum is
         // even, so F[7][7] (0) becomes 1.
         let mut b = [0i16; 64];
@@ -194,7 +201,11 @@ mod tests {
                 // Reconstruction is within one step of the input, or zero
                 // inside the dead zone.
                 let err = (r[1] as i32 - c as i32).abs();
-                assert!(err <= 2 * qp as i32 + qp as i32 / 2 + 1, "qp {qp} c {c} -> {}", r[1]);
+                assert!(
+                    err <= 2 * qp as i32 + qp as i32 / 2 + 1,
+                    "qp {qp} c {c} -> {}",
+                    r[1]
+                );
             }
         }
     }

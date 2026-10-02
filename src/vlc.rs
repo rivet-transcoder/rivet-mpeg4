@@ -198,7 +198,11 @@ mod tests {
     #[test]
     fn every_tcoef_codeword_decodes_to_its_event() {
         for intra in [false, true] {
-            let t = if intra { tables::TCOEF_INTRA } else { tables::TCOEF_INTER };
+            let t = if intra {
+                tables::TCOEF_INTRA
+            } else {
+                tables::TCOEF_INTER
+            };
             for &(s, last, run, level) in t {
                 let (b, l) = code(s);
                 let mut w = BitWriter::new();
@@ -208,7 +212,10 @@ mod tests {
                 let v = tcoef(intra).decode(&mut r).unwrap();
                 assert_eq!(v, (last as u32) << 16 | (run as u32) << 8 | level as u32);
                 assert_eq!(r.pos(), l as usize);
-                assert_eq!(tcoef_enc(intra).get(last == 1, run as u32, level as u32), Some((b, l)));
+                assert_eq!(
+                    tcoef_enc(intra).get(last == 1, run as u32, level as u32),
+                    Some((b, l))
+                );
             }
         }
     }

@@ -48,7 +48,11 @@ impl Gmc {
         let (w, h) = (vol.width as i64, vol.height as i64);
         let wp = (w as u64).next_power_of_two() as i64;
         let hp = (h as u64).next_power_of_two() as i64;
-        let d = |k: usize| warping.get(k).map_or((0, 0), |&(u, v)| (u as i64, v as i64));
+        let d = |k: usize| {
+            warping
+                .get(k)
+                .map_or((0, 0), |&(u, v)| (u as i64, v as i64))
+        };
         let (du0, dv0) = d(0);
         let (du1, dv1) = d(1);
         let (du2, dv2) = d(2);
@@ -63,7 +67,13 @@ impl Gmc {
         let i2p = k * (du2 + du0);
         let j2p = s * h + k * (dv2 + dv0);
         // `//`: to the nearest, halves away from zero.
-        let rd = |n: i64, d: i64| if n >= 0 { (n + d / 2) / d } else { -((-n + d / 2) / d) };
+        let rd = |n: i64, d: i64| {
+            if n >= 0 {
+                (n + d / 2) / d
+            } else {
+                -((-n + d / 2) / d)
+            }
+        };
         let i1pp = 16 * wp + rd((w - wp) * (r * i0p) + wp * (r * i1p - 16 * w), w);
         let j1pp = rd((w - wp) * (r * j0p) + wp * (r * j1p), w);
         let i2pp = rd((h - hp) * (r * i0p) + hp * (r * i2p), h);
@@ -98,12 +108,17 @@ impl Gmc {
                 let b = r * self.j0p - self.j1pp;
                 let c = -r * self.j0p + self.j1pp;
                 let d = self.wp * r;
-                (self.i0p + div_up(a * i + b * j, d), self.j0p + div_up(c * i + a * j, d))
+                (
+                    self.i0p + div_up(a * i + b * j, d),
+                    self.j0p + div_up(c * i + a * j, d),
+                )
             }
             _ => {
                 let d = self.wp * self.hp * r;
-                let f = (-r * self.i0p + self.i1pp) * self.hp * i + (-r * self.i0p + self.i2pp) * self.wp * j;
-                let g = (-r * self.j0p + self.j1pp) * self.hp * i + (-r * self.j0p + self.j2pp) * self.wp * j;
+                let f = (-r * self.i0p + self.i1pp) * self.hp * i
+                    + (-r * self.i0p + self.i2pp) * self.wp * j;
+                let g = (-r * self.j0p + self.j1pp) * self.hp * i
+                    + (-r * self.j0p + self.j2pp) * self.wp * j;
                 (self.i0p + div_up(f, d), self.j0p + div_up(g, d))
             }
         }
@@ -198,10 +213,19 @@ impl Gmc {
         }
         let unit = if self.quarter { 4 } else { 2 };
         let d = 256 * self.s / unit;
-        let rd = |n: i64| if n >= 0 { (n + d / 2) / d } else { -((-n + d / 2) / d) };
+        let rd = |n: i64| {
+            if n >= 0 {
+                (n + d / 2) / d
+            } else {
+                -((-n + d / 2) / d)
+            }
+        };
         // Kept within what the vector store holds; only a damaged
         // trajectory gets near it.
-        [rd(sx).clamp(-16384, 16383) as i32, rd(sy).clamp(-16384, 16383) as i32]
+        [
+            rd(sx).clamp(-16384, 16383) as i32,
+            rd(sy).clamp(-16384, 16383) as i32,
+        ]
     }
 }
 

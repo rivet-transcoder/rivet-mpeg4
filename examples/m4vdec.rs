@@ -55,7 +55,12 @@ fn main() {
         if let Some(p) = &prev
             && p.len() == y.len()
         {
-            let mad = p.iter().zip(y).map(|(&a, &b)| (a as f64 - b as f64).abs()).sum::<f64>() / y.len() as f64;
+            let mad = p
+                .iter()
+                .zip(y)
+                .map(|(&a, &b)| (a as f64 - b as f64).abs())
+                .sum::<f64>()
+                / y.len() as f64;
             let k = (f.vop_type == mpeg4::VopType::I) as usize;
             jump[k].0 += mad;
             jump[k].1 += 1;
@@ -85,7 +90,10 @@ fn main() {
                 for f in fs {
                     concealed += f.concealed as usize;
                     if f.concealed {
-                        println!("  frame {frames} (decode index {}) concealed", f.decode_index);
+                        println!(
+                            "  frame {frames} (decode index {}) concealed",
+                            f.decode_index
+                        );
                     }
                     out(f, &mut frames);
                 }
@@ -132,9 +140,16 @@ fn main() {
         vol.is_some_and(|v| v.data_partitioned),
     );
     println!("  stats {:?}", dec.stats());
-    println!("  concealed frames {concealed}, errors {errors} {}", first_error.unwrap_or_default());
+    println!(
+        "  concealed frames {concealed}, errors {errors} {}",
+        first_error.unwrap_or_default()
+    );
     if let Some(e) = dec.last_error() {
         println!("  last concealed error: {e}");
     }
-    println!("  {:.1} ms ({:.0} fps)", el.as_secs_f64() * 1e3, frames as f64 / el.as_secs_f64());
+    println!(
+        "  {:.1} ms ({:.0} fps)",
+        el.as_secs_f64() * 1e3,
+        frames as f64 / el.as_secs_f64()
+    );
 }

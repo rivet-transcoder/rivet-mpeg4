@@ -85,9 +85,21 @@ impl Frame {
 
     fn layout(width: u32, height: u32) -> ([Plane; 3], usize) {
         let (cw, ch) = Self::chroma_size(width, height);
-        let y = Plane { offset: 0, width, height };
-        let cb = Plane { offset: y.len(), width: cw, height: ch };
-        let cr = Plane { offset: cb.offset + cb.len(), width: cw, height: ch };
+        let y = Plane {
+            offset: 0,
+            width,
+            height,
+        };
+        let cb = Plane {
+            offset: y.len(),
+            width: cw,
+            height: ch,
+        };
+        let cr = Plane {
+            offset: cb.offset + cb.len(),
+            width: cw,
+            height: ch,
+        };
         let total = cr.offset + cr.len();
         ([y, cb, cr], total)
     }

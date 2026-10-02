@@ -43,7 +43,12 @@ fn run(mut cfg: EncoderConfig, n: u32) -> Run {
     frames.extend(dec.flush());
     // Reconstructions come in decode order, frames in display order.
     recon.sort_by_key(|f| f.timestamp);
-    Run { frames, recon, sources, bytes }
+    Run {
+        frames,
+        recon,
+        sources,
+        bytes,
+    }
 }
 
 fn check(r: &Run, min_psnr: f64, label: &str) -> f64 {
@@ -52,11 +57,17 @@ fn check(r: &Run, min_psnr: f64, label: &str) -> f64 {
     let mut sum = 0.0;
     for (i, ((d, e), s)) in r.frames.iter().zip(&r.recon).zip(&r.sources).enumerate() {
         assert!(!d.concealed, "{label}: frame {i} concealed");
-        assert_eq!(d.data, e.data, "{label}: frame {i} differs from the encoder's reconstruction");
+        assert_eq!(
+            d.data, e.data,
+            "{label}: frame {i} differs from the encoder's reconstruction"
+        );
         let p = psnr(s, d);
         worst = worst.min(p);
         sum += p;
-        assert!(psnr_plane(s, d, 1) > min_psnr - 3.0, "{label}: Cb of frame {i}");
+        assert!(
+            psnr_plane(s, d, 1) > min_psnr - 3.0,
+            "{label}: Cb of frame {i}"
+        );
     }
     let avg = sum / r.frames.len() as f64;
     println!(
@@ -91,7 +102,10 @@ fn intra_and_predicted() {
     let cfg = EncoderConfig::new(176, 144, 25);
     let r = run(cfg, 30);
     check(&r, 33.0, "IPPP q5");
-    assert_eq!(r.frames.iter().filter(|f| f.vop_type == VopType::I).count(), 3);
+    assert_eq!(
+        r.frames.iter().filter(|f| f.vop_type == VopType::I).count(),
+        3
+    );
     // Display order and timing.
     for (i, f) in r.frames.iter().enumerate() {
         assert_eq!(f.timestamp, i as i64);
@@ -107,8 +121,14 @@ fn predicted_compresses() {
     cfg.gop_size = 0;
     let inter = run(cfg, 12);
     check(&inter, 33.0, "P q5");
-    println!("all-intra {} bytes, IPPP {} bytes", intra.bytes, inter.bytes);
-    assert!(inter.bytes * 2 < intra.bytes, "P-VOPs should at least halve the size");
+    println!(
+        "all-intra {} bytes, IPPP {} bytes",
+        intra.bytes, inter.bytes
+    );
+    assert!(
+        inter.bytes * 2 < intra.bytes,
+        "P-VOPs should at least halve the size"
+    );
 }
 
 #[test]
@@ -158,7 +178,10 @@ fn bit_rate_control() {
         check(&r, 22.0, &format!("{kbps} kb/s"));
         let got = r.bytes as f64 * 8.0 * 25.0 / n as f64 / 1000.0;
         println!("{kbps} kb/s target: {got:.0} kb/s");
-        assert!(got > kbps as f64 * 0.6 && got < kbps as f64 * 1.5, "{kbps} kb/s target, {got:.0} kb/s");
+        assert!(
+            got > kbps as f64 * 0.6 && got < kbps as f64 * 1.5,
+            "{kbps} kb/s target, {got:.0} kb/s"
+        );
     }
 }
 

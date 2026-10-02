@@ -236,7 +236,9 @@ mod tests {
 
     fn plane() -> (Vec<u8>, usize) {
         let w = 32;
-        let v: Vec<u8> = (0..w * w).map(|i| ((i * 7 + i / w * 13) % 251) as u8).collect();
+        let v: Vec<u8> = (0..w * w)
+            .map(|i| ((i * 7 + i / w * 13) % 251) as u8)
+            .collect();
         (v, w)
     }
 
@@ -263,9 +265,13 @@ mod tests {
         halfpel(src, 4, 4, 0, 0, 8, 8, false, &mut o, 8);
         assert_eq!(o[0], p[4 * w + 4]);
         halfpel(src, 4, 4, 1, 0, 8, 8, false, &mut o, 8);
-        assert_eq!(o[0] as u32, (p[4 * w + 4] as u32 + p[4 * w + 5] as u32 + 1) >> 1);
+        assert_eq!(
+            o[0] as u32,
+            (p[4 * w + 4] as u32 + p[4 * w + 5] as u32 + 1) >> 1
+        );
         halfpel(src, 4, 4, 1, 1, 8, 8, true, &mut o, 8);
-        let s = p[4 * w + 4] as u32 + p[4 * w + 5] as u32 + p[5 * w + 4] as u32 + p[5 * w + 5] as u32;
+        let s =
+            p[4 * w + 4] as u32 + p[4 * w + 5] as u32 + p[5 * w + 4] as u32 + p[5 * w + 5] as u32;
         assert_eq!(o[0] as u32, (s + 1) >> 2);
         // Far outside: every sample is the corner.
         halfpel(src, 0, 0, -200, -200, 8, 8, false, &mut o, 8);

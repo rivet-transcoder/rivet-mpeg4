@@ -23,7 +23,13 @@ use mpeg4::{Decoder, DecoderStats};
 enum Expect {
     /// Frames out, VOPs decoded, VOPs concealed, VOPs misaligned, VOPs
     /// dropped (not-coded placeholders of packed streams).
-    Decodes { frames: usize, vops: u64, concealed: u64, misaligned: u64, dropped: u64 },
+    Decodes {
+        frames: usize,
+        vops: u64,
+        concealed: u64,
+        misaligned: u64,
+        dropped: u64,
+    },
     /// Refused: an error naming this.
     Refused(&'static str),
 }
@@ -33,49 +39,256 @@ use Expect::*;
 const SAMPLES: &[(&str, Expect)] = &[
     // libavcodec, 320x240, video packets; its VOL says 5 ticks a second but
     // its VOPs code 15-bit increments.
-    ("demo.m4v", Decodes { frames: 42, vops: 42, concealed: 0, misaligned: 0, dropped: 0 }),
+    (
+        "demo.m4v",
+        Decodes {
+            frames: 42,
+            vops: 42,
+            concealed: 0,
+            misaligned: 0,
+            dropped: 0,
+        },
+    ),
     // DivX-style packed B-VOPs.
-    ("packed_bframes.avi", Decodes { frames: 16, vops: 16, concealed: 0, misaligned: 0, dropped: 4 }),
+    (
+        "packed_bframes.avi",
+        Decodes {
+            frames: 16,
+            vops: 16,
+            concealed: 0,
+            misaligned: 0,
+            dropped: 4,
+        },
+    ),
     // Xvid, 720x576, Advanced Simple, MPEG quantiser.
-    ("xvid_vlc_trac7411.h263", Decodes { frames: 20, vops: 20, concealed: 0, misaligned: 0, dropped: 0 }),
+    (
+        "xvid_vlc_trac7411.h263",
+        Decodes {
+            frames: 20,
+            vops: 20,
+            concealed: 0,
+            misaligned: 0,
+            dropped: 0,
+        },
+    ),
     // 400x300: neither dimension a multiple of 16.
-    ("resize_down-up.h263", Decodes { frames: 150, vops: 150, concealed: 0, misaligned: 0, dropped: 0 }),
+    (
+        "resize_down-up.h263",
+        Decodes {
+            frames: 150,
+            vops: 150,
+            concealed: 0,
+            misaligned: 0,
+            dropped: 0,
+        },
+    ),
     // Early Xvid, interlaced (field DCT); the last VOP is cut off.
-    ("ttm1.avi", Decodes { frames: 234, vops: 234, concealed: 1, misaligned: 0, dropped: 0 }),
+    (
+        "ttm1.avi",
+        Decodes {
+            frames: 234,
+            vops: 234,
+            concealed: 1,
+            misaligned: 0,
+            dropped: 0,
+        },
+    ),
     // DivX 5.00, B-VOPs, 624x350.
-    ("test.b-frames.divx5.avi", Decodes { frames: 800, vops: 800, concealed: 0, misaligned: 0, dropped: 0 }),
+    (
+        "test.b-frames.divx5.avi",
+        Decodes {
+            frames: 800,
+            vops: 800,
+            concealed: 0,
+            misaligned: 0,
+            dropped: 0,
+        },
+    ),
     // DivX 5.00, GMC with two warping points, quarter-sample, B-VOPs.
-    ("01.avi", Decodes { frames: 239, vops: 239, concealed: 0, misaligned: 0, dropped: 0 }),
+    (
+        "01.avi",
+        Decodes {
+            frames: 239,
+            vops: 239,
+            concealed: 0,
+            misaligned: 0,
+            dropped: 0,
+        },
+    ),
     // DivX 5.03 and 6.6.1, quarter-sample, packed B-VOPs.
-    ("divx.5.0.5-qpel.avi", Decodes { frames: 281, vops: 281, concealed: 0, misaligned: 0, dropped: 138 }),
-    ("divx.6.6.1-qpel.avi", Decodes { frames: 281, vops: 281, concealed: 0, misaligned: 0, dropped: 97 }),
+    (
+        "divx.5.0.5-qpel.avi",
+        Decodes {
+            frames: 281,
+            vops: 281,
+            concealed: 0,
+            misaligned: 0,
+            dropped: 138,
+        },
+    ),
+    (
+        "divx.6.6.1-qpel.avi",
+        Decodes {
+            frames: 281,
+            vops: 281,
+            concealed: 0,
+            misaligned: 0,
+            dropped: 97,
+        },
+    ),
     // 712x368, MPEG quantiser; pads VOPs with ones.
-    ("color16.avi", Decodes { frames: 117, vops: 117, concealed: 0, misaligned: 0, dropped: 0 }),
+    (
+        "color16.avi",
+        Decodes {
+            frames: 117,
+            vops: 117,
+            concealed: 0,
+            misaligned: 0,
+            dropped: 0,
+        },
+    ),
     // OpenDivX: a verid 2 VOL without the verid 2 fields; cut off.
-    ("10-short.avi", Decodes { frames: 152, vops: 152, concealed: 1, misaligned: 0, dropped: 0 }),
+    (
+        "10-short.avi",
+        Decodes {
+            frames: 152,
+            vops: 152,
+            concealed: 1,
+            misaligned: 0,
+            dropped: 0,
+        },
+    ),
     // MS H.263 (the short video header) captured in fixed 32 KB records:
     // the record padding after each picture counts as misaligned, and two
     // pictures are damaged at a GOB start.
-    ("messenger.h263", Decodes { frames: 96, vops: 96, concealed: 2, misaligned: 94, dropped: 0 }),
+    (
+        "messenger.h263",
+        Decodes {
+            frames: 96,
+            vops: 96,
+            concealed: 2,
+            misaligned: 94,
+            dropped: 0,
+        },
+    ),
     // RealMagic, 640x480; omits stuffing when byte aligned.
-    ("greenlines.rmp4.p.avi", Decodes { frames: 290, vops: 290, concealed: 0, misaligned: 0, dropped: 0 }),
-    ("greenlines.rmp4.p.di.avi", Decodes { frames: 290, vops: 290, concealed: 0, misaligned: 0, dropped: 0 }),
+    (
+        "greenlines.rmp4.p.avi",
+        Decodes {
+            frames: 290,
+            vops: 290,
+            concealed: 0,
+            misaligned: 0,
+            dropped: 0,
+        },
+    ),
+    (
+        "greenlines.rmp4.p.di.avi",
+        Decodes {
+            frames: 290,
+            vops: 290,
+            concealed: 0,
+            misaligned: 0,
+            dropped: 0,
+        },
+    ),
     // UB Video, 640x480, Main object type, MPEG quantiser.
-    ("clip10-640x480-550k.avi", Decodes { frames: 354, vops: 354, concealed: 0, misaligned: 0, dropped: 0 }),
+    (
+        "clip10-640x480-550k.avi",
+        Decodes {
+            frames: 354,
+            vops: 354,
+            concealed: 0,
+            misaligned: 0,
+            dropped: 0,
+        },
+    ),
     // DivX (DXGM), 1024x464.
-    ("0x4D475844-wow.avi", Decodes { frames: 648, vops: 648, concealed: 0, misaligned: 0, dropped: 0 }),
+    (
+        "0x4D475844-wow.avi",
+        Decodes {
+            frames: 648,
+            vops: 648,
+            concealed: 0,
+            misaligned: 0,
+            dropped: 0,
+        },
+    ),
     // Xvid, 856x472, GMC with three warping points, quarter-sample, B-VOPs.
-    ("xvid_gmcqpel_artifact.avi", Decodes { frames: 743, vops: 743, concealed: 0, misaligned: 0, dropped: 0 }),
+    (
+        "xvid_gmcqpel_artifact.avi",
+        Decodes {
+            frames: 743,
+            vops: 743,
+            concealed: 0,
+            misaligned: 0,
+            dropped: 0,
+        },
+    ),
     // Data partitioning (no reversible VLCs), QCIF, stuffing before markers.
-    ("ErrDec_mpeg4datapart-64_qcif.m4v", Decodes { frames: 281, vops: 281, concealed: 0, misaligned: 0, dropped: 0 }),
+    (
+        "ErrDec_mpeg4datapart-64_qcif.m4v",
+        Decodes {
+            frames: 281,
+            vops: 281,
+            concealed: 0,
+            misaligned: 0,
+            dropped: 0,
+        },
+    ),
     // DivX 5.03 quarter-sample, 640x408.
-    ("DivX51-Qpel.avi", Decodes { frames: 600, vops: 600, concealed: 0, misaligned: 0, dropped: 0 }),
+    (
+        "DivX51-Qpel.avi",
+        Decodes {
+            frames: 600,
+            vops: 600,
+            concealed: 0,
+            misaligned: 0,
+            dropped: 0,
+        },
+    ),
     // DivX 5.01: GMC, B-VOPs, packed, 720x540.
-    ("dx502_b_qpel.avi", Decodes { frames: 600, vops: 600, concealed: 0, misaligned: 0, dropped: 298 }),
-    ("vdpart-bug.avi", Decodes { frames: 16, vops: 16, concealed: 0, misaligned: 0, dropped: 0 }),
+    (
+        "dx502_b_qpel.avi",
+        Decodes {
+            frames: 600,
+            vops: 600,
+            concealed: 0,
+            misaligned: 0,
+            dropped: 298,
+        },
+    ),
+    (
+        "vdpart-bug.avi",
+        Decodes {
+            frames: 16,
+            vops: 16,
+            concealed: 0,
+            misaligned: 0,
+            dropped: 0,
+        },
+    ),
     // Xvid, B-VOPs, 720x480.
-    ("qprd_cmp_b-frames_naq1.avi", Decodes { frames: 255, vops: 255, concealed: 0, misaligned: 0, dropped: 0 }),
-    ("prezentaciaXvid.avi", Decodes { frames: 228, vops: 228, concealed: 0, misaligned: 0, dropped: 0 }),
+    (
+        "qprd_cmp_b-frames_naq1.avi",
+        Decodes {
+            frames: 255,
+            vops: 255,
+            concealed: 0,
+            misaligned: 0,
+            dropped: 0,
+        },
+    ),
+    (
+        "prezentaciaXvid.avi",
+        Decodes {
+            frames: 228,
+            vops: 228,
+            concealed: 0,
+            misaligned: 0,
+            dropped: 0,
+        },
+    ),
     ("mpeg4_sstp_dpcm.m4v", Refused("Studio")),
     ("mpeg4-from-nc4000-w10.cmp", Refused("NEWPRED")),
 ];
@@ -109,7 +322,11 @@ fn decode(units: &[Vec<u8>], dsi: &[u8]) -> Outcome {
         }
     }
     frames += d.flush().len();
-    Outcome { frames, stats: d.stats().clone(), errors }
+    Outcome {
+        frames,
+        stats: d.stats().clone(),
+        errors,
+    }
 }
 
 #[test]
@@ -131,14 +348,36 @@ fn sample_streams() {
         let s = media::load(&data);
         let o = decode(&s.units, &s.dsi);
         match expect {
-            Decodes { frames, vops, concealed, misaligned, dropped } => {
+            Decodes {
+                frames,
+                vops,
+                concealed,
+                misaligned,
+                dropped,
+            } => {
                 assert!(o.errors.is_empty(), "{name}: {:?}", o.errors);
-                let got = (o.frames, o.stats.vops, o.stats.concealed_vops, o.stats.misaligned_vops, o.stats.dropped_vops);
-                assert_eq!(got, (*frames, *vops, *concealed, *misaligned, *dropped), "{name}: (frames, vops, concealed, misaligned, dropped)");
-                println!("{name}: {frames} frames, {vops} VOPs, {concealed} concealed, {misaligned} misaligned");
+                let got = (
+                    o.frames,
+                    o.stats.vops,
+                    o.stats.concealed_vops,
+                    o.stats.misaligned_vops,
+                    o.stats.dropped_vops,
+                );
+                assert_eq!(
+                    got,
+                    (*frames, *vops, *concealed, *misaligned, *dropped),
+                    "{name}: (frames, vops, concealed, misaligned, dropped)"
+                );
+                println!(
+                    "{name}: {frames} frames, {vops} VOPs, {concealed} concealed, {misaligned} misaligned"
+                );
             }
             Refused(what) => {
-                assert!(o.errors.iter().any(|e| e.contains(what)), "{name}: {:?}", o.errors);
+                assert!(
+                    o.errors.iter().any(|e| e.contains(what)),
+                    "{name}: {:?}",
+                    o.errors
+                );
                 println!("{name}: refused ({what})");
             }
         }
@@ -161,7 +400,9 @@ fn damaged_sample_streams() {
         seed
     };
     for (name, _) in SAMPLES {
-        let Ok(data) = std::fs::read(dir.join(name)) else { continue };
+        let Ok(data) = std::fs::read(dir.join(name)) else {
+            continue;
+        };
         let s = media::load(&data);
         // The first 40 access units keep it quick.
         let units: Vec<Vec<u8>> = s.units.into_iter().take(40).collect();

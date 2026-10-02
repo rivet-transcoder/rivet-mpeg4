@@ -14,12 +14,18 @@ pub(crate) fn put_code(w: &mut BitWriter, s: &str) {
 }
 
 pub(crate) fn put_mcbpc_i(w: &mut BitWriter, mb_type: u8, cbpc: u8) {
-    let e = tables::MCBPC_I.iter().find(|e| e.1 == mb_type && e.2 == cbpc).expect("MCBPC (I)");
+    let e = tables::MCBPC_I
+        .iter()
+        .find(|e| e.1 == mb_type && e.2 == cbpc)
+        .expect("MCBPC (I)");
     put_code(w, e.0);
 }
 
 pub(crate) fn put_mcbpc_p(w: &mut BitWriter, mb_type: u8, cbpc: u8) {
-    let e = tables::MCBPC_P.iter().find(|e| e.1 == mb_type && e.2 == cbpc).expect("MCBPC (P)");
+    let e = tables::MCBPC_P
+        .iter()
+        .find(|e| e.1 == mb_type && e.2 == cbpc)
+        .expect("MCBPC (P)");
     put_code(w, e.0);
 }
 
@@ -32,9 +38,20 @@ pub(crate) fn put_cbpy(w: &mut BitWriter, v: u8) {
 pub(crate) fn put_dc_diff(w: &mut BitWriter, diff: i32, luma: bool) {
     let a = diff.unsigned_abs();
     let size = 32 - a.leading_zeros();
-    put_code(w, if luma { tables::DC_SIZE_LUMA[size as usize] } else { tables::DC_SIZE_CHROMA[size as usize] });
+    put_code(
+        w,
+        if luma {
+            tables::DC_SIZE_LUMA[size as usize]
+        } else {
+            tables::DC_SIZE_CHROMA[size as usize]
+        },
+    );
     if size > 0 {
-        let v = if diff >= 0 { diff as u32 } else { (diff + (1 << size) - 1) as u32 };
+        let v = if diff >= 0 {
+            diff as u32
+        } else {
+            (diff + (1 << size) - 1) as u32
+        };
         w.put(size, v);
         if size > 8 {
             w.put(1, 1);
@@ -51,7 +68,11 @@ pub(crate) fn put_mvd(w: &mut BitWriter, d: i32, fcode: u32) {
     }
     let rs = fcode - 1;
     let a = d.unsigned_abs();
-    let (m, res) = if rs == 0 { (a, 0) } else { (((a - 1) >> rs) + 1, (a - 1) & ((1 << rs) - 1)) };
+    let (m, res) = if rs == 0 {
+        (a, 0)
+    } else {
+        (((a - 1) >> rs) + 1, (a - 1) & ((1 << rs) - 1))
+    };
     put_code(w, tables::MVD[m as usize]);
     w.put(1, (d < 0) as u32);
     if rs > 0 {
@@ -68,7 +89,13 @@ pub(crate) fn wrap_diff(d: i32, fcode: u32) -> i32 {
 /// Writes the coefficients of `levels` (raster order) in `scan` order from
 /// position `start` as TCOEF events. Returns false (writing nothing) when
 /// there are none.
-pub(crate) fn put_coeffs(w: &mut BitWriter, levels: &[i16; 64], scan: &[u8; 64], start: usize, intra_table: bool) -> bool {
+pub(crate) fn put_coeffs(
+    w: &mut BitWriter,
+    levels: &[i16; 64],
+    scan: &[u8; 64],
+    start: usize,
+    intra_table: bool,
+) -> bool {
     let mut events: Vec<(u32, i32)> = Vec::with_capacity(16);
     let mut run = 0;
     for &z in &scan[start..] {
@@ -138,10 +165,10 @@ mod tests {
     fn coefficients_round_trip_through_every_escape_mode() {
         let cases: Vec<Vec<(usize, i16)>> = vec![
             vec![(0, 1)],
-            vec![(0, 13)],                // intra run 0 up to 27 direct; inter 12 then type 1
-            vec![(0, 30)],                // type 1 in both (27 + 3, 12 + 18: not inter)
-            vec![(0, 400), (5, -2047)],   // type 3
-            vec![(20, 1), (63, 1)],       // long runs: type 2
+            vec![(0, 13)], // intra run 0 up to 27 direct; inter 12 then type 1
+            vec![(0, 30)], // type 1 in both (27 + 3, 12 + 18: not inter)
+            vec![(0, 400), (5, -2047)], // type 3
+            vec![(20, 1), (63, 1)], // long runs: type 2
             vec![(3, -3), (40, 2), (50, -1)],
             vec![(1, 28), (2, 11), (9, 4)],
         ];
@@ -173,7 +200,8 @@ mod tests {
                 let mut w = BitWriter::new();
                 put_dc_diff(&mut w, d, luma);
                 let b = w.into_bytes();
-                let v = crate::dec::texture_for_tests::read_dc_diff(&mut BitReader::new(&b), luma).unwrap();
+                let v = crate::dec::texture_for_tests::read_dc_diff(&mut BitReader::new(&b), luma)
+                    .unwrap();
                 assert_eq!(v, d);
             }
         }
@@ -183,7 +211,8 @@ mod tests {
                 let mut w = BitWriter::new();
                 put_mvd(&mut w, d, fcode);
                 let b = w.into_bytes();
-                let v = crate::dec::texture_for_tests::read_mvd(&mut BitReader::new(&b), fcode).unwrap();
+                let v = crate::dec::texture_for_tests::read_mvd(&mut BitReader::new(&b), fcode)
+                    .unwrap();
                 assert_eq!(v, d, "fcode {fcode}");
             }
         }
