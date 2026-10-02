@@ -6,15 +6,18 @@
 //! video header, ITU-T H.263's baseline, which 14496-2 incorporates. It is
 //! not a translation of any other implementation.
 //!
-//! - [`Decoder`]: Simple and Advanced Simple Profile streams — I-, P- and
-//!   B-VOPs, AC / DC prediction, both inverse quantisers, four-vector
-//!   macroblocks, unrestricted and quarter-sample motion vectors, video
-//!   packets, data partitioning, DivX-style packed bitstreams and the
-//!   H.263 short video header — to 8-bit 4:2:0 [`Frame`]s in display
-//!   order.
-//! - [`Encoder`]: Simple Profile I- and P-VOPs (half-sample motion search,
-//!   AC / DC prediction, the H.263 quantiser, constant-quantiser or
-//!   bit-rate control) that the decoder, and any 14496-2 decoder, decodes.
+//! - [`Decoder`]: Simple and Advanced Simple Profile streams — I-, P-, B-
+//!   and S-VOPs, AC / DC prediction, both inverse quantisers, four-vector
+//!   macroblocks, unrestricted and quarter-sample motion vectors, global
+//!   motion compensation, interlaced field DCT and field prediction, video
+//!   packets, data partitioning, DivX-style packed bitstreams and the H.263
+//!   short video header — to 8-bit 4:2:0 [`Frame`]s in display order, with
+//!   damage concealed and counted ([`DecoderStats`]).
+//! - [`Encoder`]: Simple Profile I- and P-VOPs and, on request, Advanced
+//!   Simple B-VOPs (half-sample motion search, four-vector macroblocks,
+//!   AC / DC prediction, the H.263 quantiser, video packets,
+//!   constant-quantiser or bit-rate control) that the decoder, and any
+//!   14496-2 decoder, decodes.
 //!
 //! What is not implemented is refused with [`Error::Unsupported`], naming
 //! the tool; the crate README lists them.

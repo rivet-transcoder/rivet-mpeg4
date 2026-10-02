@@ -10,7 +10,8 @@ any other implementation. The decoder takes the Simple and Advanced Simple
 Profile streams DivX, Xvid and their contemporaries made (B-VOPs,
 quarter-sample motion, global motion compensation, interlaced field DCT,
 packed bitstreams), and every VOP of the 23 real-world streams it was
-checked on parses to the bit (the figures are [below](#how-it-is-checked)).
+checked on parses to the bit, except where the files themselves are cut
+short or damaged (the figures are [below](#how-it-is-checked)).
 
 Written for the **[rivet](https://github.com/rivet-transcoder/rivet)**
 transcoder, where it is the MPEG-4 Visual codec on both sides: the decoder
@@ -150,8 +151,8 @@ No other implementation is run, in tests or in CI.
   mid-VOP, two damaged pictures in an H.263 call capture); pictures were
   inspected for drift. There is no reference output for these streams, so
   this checks syntax, VLCs and decisions exactly and reconstruction by eye.
-  [docs/SAMPLES.md](docs/SAMPLES.md) lists them, their sources and
-  checksums' home, and what each taught.
+  [docs/SAMPLES.md](docs/SAMPLES.md) lists them, their sources, and what
+  each taught.
 - **Malformed input**: property tests (`tests/fuzz.rs`, proptest; CI also
   runs them in a debug build, where overflow panics) feed arbitrary bytes,
   and valid streams with bits flipped, bytes cut and garbage spliced, to
@@ -178,8 +179,11 @@ from the standard alone, this is what the code does and what decided it:
   quarter-sample stream above reconstructs without visible drift.
 - *GMC.* `du`, `dv` in half samples; the warp through virtual points at
   `W'`, `H'`; `///` rounding halves upward; a GMC macroblock's vector for
-  prediction is the rounded mean of its luminance displacements. Two- and
-  three-point streams (DivX 5.01, Xvid) reconstruct cleanly.
+  prediction is the rounded mean of its luminance displacements, **clipped
+  to the `vop_fcode` range** — without the clip, an Xvid zoom whose warp
+  outruns that range wraps its neighbours' vectors into misplaced blocks
+  (the stream is named for that artifact; with the clip it is clean). Two-
+  and three-point streams (DivX 5.01, Xvid) reconstruct cleanly.
 - *Running QP for `intra_dc_vlc_thr`*: the previous coded macroblock's
   quantiser, the current one's at the start of a VOP or packet.
 - *B-VOP over an S-VOP's not-coded macroblock*: coded normally, the GMC

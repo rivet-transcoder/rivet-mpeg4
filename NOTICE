@@ -1,0 +1,41 @@
+rivet-mpeg4 — an MPEG-4 Part 2 Visual decoder and encoder
+Copyright 2026 Ely Erin Fox
+
+This product is licensed under the Open Encoding Attribution License,
+Version 1.0 (see LICENSE.md). It is source-available, not open source: the
+attribution duty in §5 applies to commercial use; §4 requires this NOTICE to
+be carried forward with any distribution.
+
+------------------------------------------------------------------------------
+Provenance
+------------------------------------------------------------------------------
+
+The decoder and encoder are original implementations written from ISO/IEC
+14496-2 (MPEG-4 Visual) and, for the short video header, ITU-T H.263, and
+from published literature (IEEE Std 1180-1990 for the IDCT accuracy test).
+They are not translations of, and do not derive from, any other MPEG-4
+Part 2 or H.263 encoder's or decoder's source; none was read. The normative
+tables (the variable length codes, the scans, the default quantiser
+matrices, the escape-mode limits) are the standard's data, transcribed.
+
+No other implementation was run, in development or in the tests. The
+decoder is checked against other encoders' streams used as data only: the
+sample bitstreams tools/fetch-samples.sh downloads from samples.ffmpeg.org
+and fate-suite.ffmpeg.org (listed with their sources in docs/SAMPLES.md),
+which are not redistributed with this crate.
+
+------------------------------------------------------------------------------
+Patents
+------------------------------------------------------------------------------
+
+MPEG-4 Visual may be subject to patent licensing in some jurisdictions; Via
+LA administers a licensing programme for it. This licence grants no rights
+under any patent, and the authors make no claim about whether a licence is
+needed for any use.
+
+------------------------------------------------------------------------------
+Third-party components
+------------------------------------------------------------------------------
+
+thiserror (https://crates.io/crates/thiserror) — MIT OR Apache-2.0
+proptest (https://crates.io/crates/proptest), development dependency only — MIT OR Apache-2.0

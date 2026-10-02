@@ -65,8 +65,8 @@ never sends a VOL header).
 
 The standard is the reference; where encoders that are in wide use depart
 from it, the decoder recognises them. Each of these was found by a sample
-failing to parse, and each workaround applies only where the standard
-reading fails:
+failing to parse (one, the GMC clip, by a sample's pictures), and each
+workaround applies only where the standard reading fails:
 
 - **libavcodec 54 (`demo.m4v`)**: the VOL says `vop_time_increment_resolution`
   5 (three-bit increments) while every VOP codes a 15-bit increment. When
@@ -95,6 +95,14 @@ reading fails:
   motion compensation pads from the edge of the decoded macroblock grid
   rather than from the VOP's `width` x `height`; the decoder (and encoder)
   do the former.
+- **GMC vectors as predictors** (`xvid_gmcqpel_artifact.avi`): during a
+  zoom, the mean warp displacement of a GMC macroblock (−133 quarter
+  samples) can exceed the range `vop_fcode` gives vectors (±128). Used as a
+  predictor unclipped, it makes the neighbouring vectors wrap (−133 + 0 →
+  123): misplaced blocks that spread through the S- and B-VOPs that follow
+  — the artifact the file is named after. Clipped to the range, every
+  frame is clean. This parses identically either way, so only the
+  pictures showed it.
 - **Stuffing before markers** (`ErrDec_mpeg4datapart-64_qcif.m4v`):
   macroblock stuffing may come right before a data-partitioning marker or a
   resync marker, so the decoder looks for the marker again after each

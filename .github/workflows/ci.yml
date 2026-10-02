@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: tests (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux x86-64,   os: ubuntu-latest }
+          - { name: linux arm64,    os: ubuntu-24.04-arm }
+          - { name: windows x86-64, os: windows-latest }
+          - { name: macos arm64,    os: macos-latest }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Tests
+        run: cargo test --release
+      - name: Property tests with overflow checks (debug)
+        run: cargo test --test fuzz
+
+  # The decoder is checked against other encoders' streams, used as data:
+  # tools/fetch-samples.sh downloads them (with their SHA-256) and the
+  # sample tests compare each one's decode counts with the recorded ones.
+  # Without the samples those tests skip, so this job fetches them and
+  # requires them.
+  samples:
+    name: sample bitstreams
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: tests/samples
+          key: mpeg4-samples-${{ hashFiles('tools/fetch-samples.sh') }}
+      - run: tools/fetch-samples.sh
+      - name: Tests
+        run: cargo test --release --test samples
+        env:
+          MPEG4_REQUIRE_SAMPLES: "1"
+
+  msrv:
+    name: MSRV (1.89)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+
+  lint:
+    name: clippy and rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
