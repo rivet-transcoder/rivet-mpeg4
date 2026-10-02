@@ -639,6 +639,8 @@ pub(crate) fn put_start_code(w: &mut BitWriter, code: u8) {
 /// The configuration the encoder writes into its VOL.
 pub(crate) struct VolParams {
     pub profile_and_level: u8,
+    /// Advanced Simple (B-VOPs) rather than Simple.
+    pub advanced_simple: bool,
     pub width: u32,
     pub height: u32,
     pub time_resolution: u32,
@@ -660,12 +662,13 @@ pub(crate) fn write_config(p: &VolParams) -> Vec<u8> {
     put_start_code(&mut w, sc::VO_FIRST);
     put_start_code(&mut w, sc::VOL_FIRST);
     w.put(1, 0); // random_accessible_vol
-    w.put(8, 1); // video_object_type_indication: Simple
+    // video_object_type_indication: Simple (1) or Advanced Simple (17).
+    w.put(8, if p.advanced_simple { 0x11 } else { 1 });
     w.put(1, 0); // is_object_layer_identifier
     w.put(4, 1); // aspect_ratio_info: square samples
     w.put(1, 1); // vol_control_parameters
     w.put(2, 1); // chroma_format 4:2:0
-    w.put(1, 1); // low_delay
+    w.put(1, !p.advanced_simple as u32); // low_delay: no B-VOPs
     w.put(1, 0); // vbv_parameters
     w.put(2, 0); // video_object_layer_shape: rectangular
     w.put(1, 1);
@@ -757,6 +760,7 @@ mod tests {
     fn config_round_trips() {
         let p = VolParams {
             profile_and_level: 3,
+            advanced_simple: false,
             width: 352,
             height: 288,
             time_resolution: 30000,

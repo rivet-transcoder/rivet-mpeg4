@@ -1,7 +1,7 @@
-//! A Simple Profile encoder: I- and P-VOPs with half-sample motion search,
-//! optional four-vector macroblocks and video packets, intra AC / DC
-//! prediction, the H.263 quantiser and a constant-quantiser or bit-rate
-//! control.
+//! The encoder: I- and P-VOPs (Simple Profile) and, on request, B-VOPs
+//! (Advanced Simple Profile), with half-sample motion search, optional
+//! four-vector macroblocks and video packets, intra AC / DC prediction, the
+//! H.263 quantiser and a constant-quantiser or bit-rate control.
 //!
 //! The encoder reconstructs every VOP with the decoder's own functions
 //! (prediction, inverse quantisation, IDCT, motion compensation), so its
@@ -9,8 +9,10 @@
 
 mod write;
 
+use std::collections::VecDeque;
+
 use crate::bits::BitWriter;
-use crate::dec::vop::{MbPix, add_block, predict_mb, put_block, write_mb};
+use crate::dec::vop::{MbPix, Motion, add_block, direct_vectors, predict_mb, put_block, write_mb};
 use crate::error::{Result, config};
 use crate::frame::{Frame, VopType};
 use crate::headers::{self, VolParams, VopHeader, time_increment_bits};
@@ -25,7 +27,8 @@ use write::*;
 /// How the encoder picks its quantiser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RateControl {
-    /// The same `vop_quant` (1..=31) for every VOP.
+    /// The same `vop_quant` (1..=31) for every I- and P-VOP; B-VOPs use
+    /// a quarter more.
     ConstantQuant(u8),
     /// A target bit rate in bits per second: one quantiser per VOP, raised
     /// and lowered to keep the running total near the target.
@@ -45,6 +48,11 @@ pub struct EncoderConfig {
     pub frame_duration: u32,
     /// An I-VOP every this many frames (0: only the first).
     pub gop_size: u32,
+    /// Consecutive B-VOPs between reference VOPs (0..=8). Anything but 0
+    /// makes the stream Advanced Simple Profile and delays output: frames
+    /// are coded in decode order, B-VOPs after the reference that follows
+    /// them.
+    pub b_frames: u32,
     /// Quantiser control.
     pub rate: RateControl,
     /// Motion search range in whole samples (1..=1023); `vop_fcode` is the
@@ -56,12 +64,16 @@ pub struct EncoderConfig {
     /// passes this many bytes; `None` codes each VOP as one packet with
     /// resync markers disabled in the VOL.
     pub packet_bytes: Option<u32>,
+    /// Keep the reconstruction of every coded VOP for
+    /// [`Encoder::take_reconstructions`] (for measuring quality; costs a
+    /// copy of every frame).
+    pub keep_reconstructions: bool,
 }
 
 impl EncoderConfig {
     /// `width` x `height` at `fps` frames per second: an I-VOP every 12
-    /// frames, constant quantiser 5, a 15-sample search, one vector per
-    /// macroblock, no video packets.
+    /// frames, no B-VOPs, constant quantiser 5, a 15-sample search, one
+    /// vector per macroblock, no video packets.
     pub fn new(width: u32, height: u32, fps: u32) -> EncoderConfig {
         EncoderConfig {
             width,
@@ -69,23 +81,35 @@ impl EncoderConfig {
             time_base: fps.max(1),
             frame_duration: 1,
             gop_size: 12,
+            b_frames: 0,
             rate: RateControl::ConstantQuant(5),
             search_range: 15,
             four_mv: false,
             packet_bytes: None,
+            keep_reconstructions: false,
         }
     }
 }
 
-/// The profile_and_level_indication for a frame size: Simple Profile at
-/// the lowest level whose macroblock count covers it.
-fn simple_profile_level(mbs: usize) -> u8 {
-    match mbs {
-        0..=99 => 0x01,     // L1, QCIF
-        100..=396 => 0x03,  // L3, CIF
-        397..=1200 => 0x04, // L4a, VGA
-        1201..=1620 => 0x05, // L5, D1
-        _ => 0x06,          // L6, 720p (beyond: no Simple level fits)
+/// The profile_and_level_indication for a frame size: Simple Profile (or,
+/// with B-VOPs, Advanced Simple) at the lowest level whose macroblock count
+/// covers it.
+fn profile_level(mbs: usize, advanced: bool) -> u8 {
+    if advanced {
+        match mbs {
+            0..=99 => 0xf1,   // ASP L1, QCIF
+            100..=396 => 0xf3, // L3, CIF
+            397..=792 => 0xf4, // L4, 352x576
+            _ => 0xf5,        // L5, 720x576 (and beyond)
+        }
+    } else {
+        match mbs {
+            0..=99 => 0x01,      // SP L1, QCIF
+            100..=396 => 0x03,   // L3, CIF
+            397..=1200 => 0x04,  // L4a, VGA
+            1201..=1620 => 0x05, // L5, D1
+            _ => 0x06,           // L6, 720p (and beyond)
+        }
     }
 }
 
@@ -95,31 +119,59 @@ struct Rc {
     err: f64,
 }
 
-/// An MPEG-4 Part 2 Simple Profile encoder.
+/// A coded I- or P-VOP kept for prediction.
+struct Ref {
+    pic: Pic,
+    motion: Motion,
+    /// Display time in ticks.
+    time: i64,
+}
+
+/// B-VOP macroblock modes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BMode {
+    Direct,
+    Interpolate,
+    Backward,
+    Forward,
+}
+
+/// An MPEG-4 Part 2 encoder: Simple Profile, or Advanced Simple with
+/// B-VOPs.
 ///
-/// Each [`Encoder::encode`] call codes one frame as one VOP and returns
-/// its bytes; the first call's bytes begin with the configuration headers
-/// ([`Encoder::config`]: visual object sequence, visual object, video
-/// object layer), so the concatenated output is a complete elementary
-/// stream. No B-VOPs are coded, so frames come out in input order and
-/// nothing is held back.
+/// Each [`Encoder::encode`] call takes one frame and returns the bytes of
+/// the VOPs it allowed to be coded, in decode order — one VOP per call
+/// without B-VOPs; with them, nothing for a frame that waits to be a
+/// B-VOP, then the next reference VOP and the B-VOPs before it in one
+/// buffer (the decoder takes such a buffer whole). [`Encoder::finish`]
+/// codes what is still waiting. The first bytes begin with the
+/// configuration headers ([`Encoder::config`]: visual object sequence,
+/// visual object, video object layer), so the concatenated output is a
+/// complete elementary stream.
 pub struct Encoder {
     cfg: EncoderConfig,
     config_bytes: Vec<u8>,
     headers_written: bool,
+    /// Frames received.
     n: u64,
-    reference: Option<Pic>,
+    /// Index of the last frame coded as a reference.
+    last_ref_index: Option<u64>,
+    /// Frames waiting to be coded as B-VOPs: (index, picture).
+    pending: VecDeque<(u64, Pic)>,
+    past: Option<Ref>,
+    future: Option<Ref>,
     st: MbState,
     prev_mv: Vec<[i16; 2]>,
     slice_counter: u32,
     slice: u32,
     fcode: u32,
     time_bits: u32,
-    last_sec: i64,
+    last_ref_sec: i64,
+    prev_ref_sec: i64,
     rounding: bool,
     quant: Quant,
     rc: Option<Rc>,
-    last_type: VopType,
+    recons: Vec<Frame>,
 }
 
 impl Encoder {
@@ -138,6 +190,9 @@ impl Encoder {
         if !(1..=1023).contains(&cfg.search_range) {
             return Err(config(format!("search range {} (1..=1023)", cfg.search_range)));
         }
+        if cfg.b_frames > 8 {
+            return Err(config(format!("{} consecutive B-VOPs (0..=8)", cfg.b_frames)));
+        }
         match cfg.rate {
             RateControl::ConstantQuant(q) if !(1..=31).contains(&q) => {
                 return Err(config(format!("quantiser {q} (1..=31)")));
@@ -151,8 +206,10 @@ impl Encoder {
         let fcode = (1..=7u32).find(|&f| 32 * (1 << (f - 1)) - 1 >= need).unwrap_or(7);
         let mbw = cfg.width.div_ceil(16) as usize;
         let mbh = cfg.height.div_ceil(16) as usize;
+        let advanced = cfg.b_frames > 0;
         let config_bytes = headers::write_config(&VolParams {
-            profile_and_level: simple_profile_level(mbw * mbh),
+            profile_and_level: profile_level(mbw * mbh, advanced),
+            advanced_simple: advanced,
             width: cfg.width,
             height: cfg.height,
             time_resolution: cfg.time_base,
@@ -172,17 +229,21 @@ impl Encoder {
             config_bytes,
             headers_written: false,
             n: 0,
-            reference: None,
+            last_ref_index: None,
+            pending: VecDeque::new(),
+            past: None,
+            future: None,
             st: MbState::new(mbw, mbh),
             prev_mv: vec![[0, 0]; 4 * mbw * mbh],
             slice_counter: 0,
             slice: 0,
             fcode,
-            last_sec: 0,
+            last_ref_sec: 0,
+            prev_ref_sec: 0,
             rounding: false,
             quant: Quant::h263(),
             rc,
-            last_type: VopType::I,
+            recons: Vec::new(),
             cfg,
         })
     }
@@ -193,8 +254,8 @@ impl Encoder {
         &self.config_bytes
     }
 
-    /// Codes one frame, which must be `width` x `height`. Returns the VOP
-    /// (preceded, the first time, by [`Encoder::config`]).
+    /// Takes one frame, which must be `width` x `height`, and returns the
+    /// VOPs that could be coded (see [`Encoder`] for when that is none).
     pub fn encode(&mut self, frame: &Frame) -> Result<Vec<u8>> {
         frame.validate()?;
         if frame.width != self.cfg.width || frame.height != self.cfg.height {
@@ -203,11 +264,71 @@ impl Encoder {
                 frame.width, frame.height, self.cfg.width, self.cfg.height
             )));
         }
-        let src = Pic::from_frame(frame);
+        let pic = Pic::from_frame(frame);
+        let index = self.n;
+        self.n += 1;
         let gop = self.cfg.gop_size as u64;
-        let intra = self.reference.is_none() || (gop > 0 && self.n % gop == 0);
-        let qp = self.frame_qp();
-        let t = self.n as i64 * self.cfg.frame_duration as i64;
+        let intra = self.future.is_none() || (gop > 0 && index % gop == 0);
+        let due = self.last_ref_index.is_none_or(|l| index - l > self.cfg.b_frames as u64);
+        let mut w = BitWriter::new();
+        self.put_headers(&mut w);
+        if intra || due {
+            self.code_ref(&mut w, &pic, index, intra);
+            self.code_pending(&mut w);
+        } else {
+            self.pending.push_back((index, pic));
+        }
+        Ok(w.into_bytes())
+    }
+
+    /// Codes the frames still waiting: the last as a P-VOP, the others as
+    /// B-VOPs before it. Returns their bytes (empty when nothing waits).
+    pub fn finish(&mut self) -> Result<Vec<u8>> {
+        let mut w = BitWriter::new();
+        if let Some((index, pic)) = self.pending.pop_back() {
+            self.put_headers(&mut w);
+            self.code_ref(&mut w, &pic, index, false);
+            self.code_pending(&mut w);
+        }
+        Ok(w.into_bytes())
+    }
+
+    /// The reconstructions of the VOPs coded since the last call, in
+    /// decode order, when [`EncoderConfig::keep_reconstructions`] is set:
+    /// the pictures every conforming decoder builds from the bytes.
+    pub fn take_reconstructions(&mut self) -> Vec<Frame> {
+        std::mem::take(&mut self.recons)
+    }
+
+    fn put_headers(&mut self, w: &mut BitWriter) {
+        if !self.headers_written {
+            w.put_bytes(&self.config_bytes);
+            self.headers_written = true;
+        }
+    }
+
+    fn code_pending(&mut self, w: &mut BitWriter) {
+        while let Some((index, pic)) = self.pending.pop_front() {
+            self.code_b(w, &pic, index);
+        }
+    }
+
+    fn ticks(&self, index: u64) -> i64 {
+        index as i64 * self.cfg.frame_duration as i64
+    }
+
+    fn keep(&mut self, pic: &Pic, index: u64, t: VopType) {
+        if self.cfg.keep_reconstructions {
+            self.recons.push(pic.to_frame(self.ticks(index), self.cfg.time_base, t, index));
+        }
+    }
+
+    /// Codes frame `index` as an I- or P-VOP and makes it the newest
+    /// reference.
+    fn code_ref(&mut self, w: &mut BitWriter, src: &Pic, index: u64, intra: bool) {
+        let intra = intra || self.future.is_none();
+        let qp = self.frame_qp(false);
+        let t = self.ticks(index);
         let res = self.cfg.time_base as i64;
         let sec = t / res;
         if !intra {
@@ -215,7 +336,7 @@ impl Encoder {
         }
         let hdr = VopHeader {
             vop_type: if intra { VopType::I } else { VopType::P },
-            modulo_time_base: (sec - self.last_sec) as u32,
+            modulo_time_base: (sec - self.last_ref_sec) as u32,
             time_increment: (t % res) as u32,
             coded: true,
             rounding: self.rounding,
@@ -226,49 +347,36 @@ impl Encoder {
             warping: Vec::new(),
             warping_divx500: false,
         };
-        self.last_sec = sec;
-        let mut w = BitWriter::new();
-        if !self.headers_written {
-            w.put_bytes(&self.config_bytes);
-            self.headers_written = true;
-        }
+        self.prev_ref_sec = self.last_ref_sec;
+        self.last_ref_sec = sec;
         let start = w.len_bits();
-        headers::write_vop_header(&mut w, self.time_bits, &hdr);
+        headers::write_vop_header(w, self.time_bits, &hdr);
         let mut recon = Pic::new(self.cfg.width, self.cfg.height);
-        self.code_vop(&mut w, &src, &mut recon, &hdr);
+        self.code_ip(w, src, &mut recon, &hdr);
         w.stuff();
-        let bits = w.len_bits() - start;
-        self.rate_update(bits, intra);
+        self.rate_update(w.len_bits() - start, intra);
         self.prev_mv.clone_from(&self.st.mv);
-        self.reference = Some(recon);
-        self.last_type = hdr.vop_type;
-        self.n += 1;
-        Ok(w.into_bytes())
+        let motion = if intra {
+            Motion::intra(self.st.mbw, self.st.mbh)
+        } else {
+            Motion { mbw: self.st.mbw, kind: self.st.kind.clone(), mv: self.st.mv.clone() }
+        };
+        self.keep(&recon, index, hdr.vop_type);
+        self.past = self.future.take();
+        self.future = Some(Ref { pic: recon, motion, time: t });
+        self.last_ref_index = Some(index);
     }
 
-    /// The reconstruction of the last coded frame: the picture every
-    /// conforming decoder builds from its bytes (the encoder predicts the
-    /// next frame from it). `None` before the first frame.
-    pub fn reconstruction(&self) -> Option<Frame> {
-        let t = (self.n.max(1) - 1) as i64 * self.cfg.frame_duration as i64;
-        self.reference.as_ref().map(|p| p.to_frame(t, self.cfg.time_base, self.last_type, self.n - 1))
-    }
-
-    /// Ends the stream. Nothing is held back (no B-VOPs), so this returns
-    /// no bytes; it exists so callers need not change when that changes.
-    pub fn finish(&mut self) -> Result<Vec<u8>> {
-        Ok(Vec::new())
-    }
-
-    fn frame_qp(&self) -> u32 {
-        match (&self.rc, self.cfg.rate) {
+    fn frame_qp(&self, b: bool) -> u32 {
+        let q = match (&self.rc, self.cfg.rate) {
             (_, RateControl::ConstantQuant(q)) => q as u32,
             (Some(rc), _) => {
                 let q = rc.base * 2f64.powf((rc.err / (6.0 * rc.target)).clamp(-2.0, 2.0));
                 q.round().clamp(1.0, 31.0) as u32
             }
             (None, _) => 5,
-        }
+        };
+        if b { ((q * 5 + 2) / 4).min(31) } else { q }
     }
 
     fn rate_update(&mut self, bits: usize, intra: bool) {
@@ -276,7 +384,7 @@ impl Encoder {
             rc.err += bits as f64 - rc.target;
             if !intra {
                 // Drift the base quantiser toward the one that hits the
-                // target on P-VOPs.
+                // target on inter VOPs.
                 let r = (bits as f64 / rc.target).clamp(0.25, 4.0);
                 rc.base = (rc.base * r.powf(0.2)).clamp(1.0, 31.0);
             }
@@ -288,40 +396,219 @@ impl Encoder {
         self.slice = self.slice_counter;
     }
 
-    fn resync_len(&self, h: &VopHeader) -> u32 {
-        if h.vop_type == VopType::I { 17 } else { 16 + h.fcode_forward }
+    /// Starts a new video packet at macroblock `mb` when the current one
+    /// has grown past the configured size.
+    fn maybe_packet(&mut self, w: &mut BitWriter, packet_start: &mut usize, mb: usize, h: &VopHeader) -> bool {
+        let Some(limit) = self.cfg.packet_bytes else { return false };
+        if mb == 0 || w.len_bits() - *packet_start <= limit as usize * 8 {
+            return false;
+        }
+        let total = self.st.mbw * self.st.mbh;
+        let mb_bits = (usize::BITS - (total - 1).leading_zeros()).max(1);
+        w.stuff();
+        let len = match h.vop_type {
+            VopType::I => 17,
+            VopType::B => 16 + h.fcode_forward.max(h.fcode_backward),
+            _ => 16 + h.fcode_forward,
+        };
+        w.put(len, 1);
+        w.put(mb_bits, mb as u32);
+        w.put(5, h.quant);
+        w.put(1, 0); // header_extension_code
+        *packet_start = w.len_bits();
+        self.new_slice();
+        true
     }
 
-    fn code_vop(&mut self, w: &mut BitWriter, src: &Pic, recon: &mut Pic, h: &VopHeader) {
+    fn code_ip(&mut self, w: &mut BitWriter, src: &Pic, recon: &mut Pic, h: &VopHeader) {
         let (mbw, mbh) = (self.st.mbw, self.st.mbh);
-        let total = mbw * mbh;
         self.new_slice();
         let mut packet_start = w.len_bits();
-        let mb_bits = usize::BITS - (total - 1).leading_zeros();
-        let reference = self.reference.take();
-        for mb in 0..total {
-            if let Some(limit) = self.cfg.packet_bytes
-                && mb > 0
-                && w.len_bits() - packet_start > limit as usize * 8
-            {
-                w.stuff();
-                let len = self.resync_len(h);
-                w.put(len, 1);
-                w.put(mb_bits.max(1), mb as u32);
-                w.put(5, h.quant);
-                w.put(1, 0); // header_extension_code
-                packet_start = w.len_bits();
-                self.new_slice();
-            }
+        let reference = self.future.take();
+        for mb in 0..mbw * mbh {
+            self.maybe_packet(w, &mut packet_start, mb, h);
             let (mbx, mby) = (mb % mbw, mb / mbw);
             self.st.slice[mb] = self.slice;
             self.st.qp[mb] = h.quant as u8;
             match (&reference, h.vop_type) {
-                (Some(rf), VopType::P) => self.code_p_mb(w, src, rf, recon, mbx, mby, h),
+                (Some(rf), VopType::P) => self.code_p_mb(w, src, &rf.pic, recon, mbx, mby, h),
                 _ => self.code_intra_mb(w, src, recon, mbx, mby, h.quant, false),
             }
         }
-        self.reference = reference;
+        self.future = reference;
+    }
+
+    /// Codes frame `index`, which lies between the two references, as a
+    /// B-VOP.
+    fn code_b(&mut self, w: &mut BitWriter, src: &Pic, index: u64) {
+        let (Some(past), Some(future)) = (self.past.take(), self.future.take()) else {
+            unreachable!("B-VOPs are coded after two references");
+        };
+        let qp = self.frame_qp(true);
+        let t = self.ticks(index);
+        let res = self.cfg.time_base as i64;
+        let hdr = VopHeader {
+            vop_type: VopType::B,
+            modulo_time_base: (t / res - self.prev_ref_sec) as u32,
+            time_increment: (t % res) as u32,
+            coded: true,
+            rounding: false,
+            intra_dc_vlc_thr: 0,
+            quant: qp,
+            fcode_forward: self.fcode,
+            fcode_backward: self.fcode,
+            warping: Vec::new(),
+            warping_divx500: false,
+        };
+        let start = w.len_bits();
+        headers::write_vop_header(w, self.time_bits, &hdr);
+        let trb = (t - past.time) as i32;
+        let trd = (future.time - past.time) as i32;
+        let mut recon = Pic::new(self.cfg.width, self.cfg.height);
+        let (mbw, mbh) = (self.st.mbw, self.st.mbh);
+        self.new_slice();
+        let mut packet_start = w.len_bits();
+        let mut pmv = [[0i32; 2]; 2];
+        for mb in 0..mbw * mbh {
+            if self.maybe_packet(w, &mut packet_start, mb, &hdr) {
+                pmv = [[0, 0]; 2];
+            }
+            let (mbx, mby) = (mb % mbw, mb / mbw);
+            if mbx == 0 {
+                pmv = [[0, 0]; 2];
+            }
+            self.code_b_mb(w, src, &past, &future, &mut recon, mbx, mby, qp, (trb, trd), &mut pmv);
+        }
+        w.stuff();
+        self.rate_update(w.len_bits() - start, false);
+        self.keep(&recon, index, VopType::B);
+        self.past = Some(past);
+        self.future = Some(future);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn code_b_mb(
+        &self,
+        w: &mut BitWriter,
+        src: &Pic,
+        past: &Ref,
+        future: &Ref,
+        recon: &mut Pic,
+        mbx: usize,
+        mby: usize,
+        qp: u32,
+        (trb, trd): (i32, i32),
+        pmv: &mut [[i32; 2]; 2],
+    ) {
+        let mb = mby * self.st.mbw + mbx;
+        let mut px = MbPix::new();
+        if future.motion.kind[mb] == MbKind::Skipped {
+            // Not coded: the decoder copies the past reference.
+            predict_mb(&past.pic, mbx, mby, &[[0, 0]; 4], false, false, false, &mut px);
+            write_mb(recon, mbx, mby, &px);
+            return;
+        }
+        let col = {
+            let v = future.motion.mv[(2 * mby) * 2 * self.st.mbw + 2 * mbx];
+            [v[0] as i32, v[1] as i32]
+        };
+        let scale = |n: i32| if trd != 0 { [col[0] * n / trd, col[1] * n / trd] } else { [0, 0] };
+        let (mvf, _) = self.search(src, &past.pic, mbx, mby, pmv[0], &[pmv[0], scale(trb)], qp, false);
+        let (mvb, _) = self.search(src, &future.pic, mbx, mby, pmv[1], &[pmv[1], scale(trb - trd)], qp, false);
+        // Compare the four modes on the luma prediction error plus a rate
+        // estimate.
+        let mut pf = MbPix::new();
+        let mut pb = MbPix::new();
+        predict_mb(&past.pic, mbx, mby, &[mvf; 4], false, false, false, &mut pf);
+        predict_mb(&future.pic, mbx, mby, &[mvb; 4], false, false, false, &mut pb);
+        let mut pi = MbPix { y: pf.y, cb: pf.cb, cr: pf.cr };
+        mc::average(&mut pi.y, &pb.y);
+        mc::average(&mut pi.cb, &pb.cb);
+        mc::average(&mut pi.cr, &pb.cr);
+        let (dmf, dmb) = direct_vectors(&future.motion, mbx, mby, [0, 0], trb, trd);
+        let mut pd = MbPix::new();
+        let mut pdb = MbPix::new();
+        predict_mb(&past.pic, mbx, mby, &dmf, true, false, false, &mut pd);
+        predict_mb(&future.pic, mbx, mby, &dmb, true, false, false, &mut pdb);
+        mc::average(&mut pd.y, &pdb.y);
+        mc::average(&mut pd.cb, &pdb.cb);
+        mc::average(&mut pd.cr, &pdb.cr);
+        let mut ys = [0u8; 256];
+        luma_mb(src, mbx, mby, &mut ys);
+        let sad = |p: &[u8; 256]| -> u32 { ys.iter().zip(p).map(|(&a, &b)| (a as i32 - b as i32).unsigned_abs()).sum() };
+        let lambda = qp;
+        let costs = [
+            (BMode::Direct, sad(&pd.y)),
+            (BMode::Forward, sad(&pf.y) + lambda * (self.mv_bits(mvf, pmv[0]) + 4)),
+            (BMode::Backward, sad(&pb.y) + lambda * (self.mv_bits(mvb, pmv[1]) + 3)),
+            (
+                BMode::Interpolate,
+                sad(&pi.y) + lambda * (self.mv_bits(mvf, pmv[0]) + self.mv_bits(mvb, pmv[1]) + 2),
+            ),
+        ];
+        let mode = costs.iter().min_by_key(|c| c.1).unwrap().0;
+        let px = match mode {
+            BMode::Direct => pd,
+            BMode::Forward => pf,
+            BMode::Backward => pb,
+            BMode::Interpolate => pi,
+        };
+        let mut levels = [[0i16; 64]; 6];
+        let mut cbp = 0u8;
+        for (k, lv) in levels.iter_mut().enumerate() {
+            let s = source_block(src, mbx, mby, k);
+            let p = pred_block(&px, k);
+            for i in 0..64 {
+                lv[i] = s[i] - p[i];
+            }
+            fdct(lv);
+            quantise_h263(lv, qp, false);
+            if lv.iter().any(|&v| v != 0) {
+                cbp |= 1 << (5 - k);
+            }
+        }
+        // modb: 1 (direct, no data), 01 (mb_type, no cbpb), 00 (both).
+        if mode == BMode::Direct && cbp == 0 {
+            w.put(1, 1);
+        } else {
+            w.put(2, if cbp == 0 { 0b01 } else { 0b00 });
+            match mode {
+                BMode::Direct => w.put(1, 1),
+                BMode::Interpolate => w.put(2, 0b01),
+                BMode::Backward => w.put(3, 0b001),
+                BMode::Forward => w.put(4, 0b0001),
+            }
+            if cbp != 0 {
+                w.put(6, cbp as u32);
+                if mode != BMode::Direct {
+                    w.put(1, 0); // dbquant: no change
+                }
+            }
+            if matches!(mode, BMode::Forward | BMode::Interpolate) {
+                self.put_mv(w, mvf, pmv[0]);
+                pmv[0] = mvf;
+            }
+            if matches!(mode, BMode::Backward | BMode::Interpolate) {
+                self.put_mv(w, mvb, pmv[1]);
+                pmv[1] = mvb;
+            }
+            if mode == BMode::Direct {
+                // MVDB (0, 0), f_code 1.
+                put_mvd(w, 0, 1);
+                put_mvd(w, 0, 1);
+            }
+        }
+        write_mb(recon, mbx, mby, &px);
+        for (k, lv) in levels.iter().enumerate() {
+            if cbp >> (5 - k) & 1 == 0 {
+                continue;
+            }
+            put_coeffs(w, lv, &ZIGZAG, 0, false);
+            let mut rec = *lv;
+            self.quant.inter(&mut rec, qp);
+            idct(&mut rec);
+            add_block(recon, mbx, mby, k, &rec);
+        }
     }
 
     /// An intra macroblock (in an I-VOP, or `in_p` a P-VOP).
@@ -411,7 +698,19 @@ impl Encoder {
         let qp = h.quant;
         let mb = mby * self.st.mbw + mbx;
         let pred0 = self.st.mv_pred(mbx, mby, 0, self.slice);
-        let (mv, sad16) = self.search(src, rf, mbx, mby, pred0, qp, h.rounding);
+        let mbw = self.st.mbw;
+        let prev = self.prev_mv[(2 * mby) * 2 * mbw + 2 * mbx];
+        let mut cands = vec![[prev[0] as i32, prev[1] as i32]];
+        if mbx > 0 {
+            cands.push(self.st.get_mv(mbx - 1, mby, 1));
+        }
+        if mby > 0 {
+            cands.push(self.st.get_mv(mbx, mby - 1, 2));
+            if mbx + 1 < mbw {
+                cands.push(self.st.get_mv(mbx + 1, mby - 1, 2));
+            }
+        }
+        let (mv, sad16) = self.search(src, rf, mbx, mby, pred0, &cands, qp, h.rounding);
         // TMN's intra decision: intra when the macroblock's deviation from
         // its own mean is clearly below the best prediction error.
         let mut ys = [0u8; 256];
@@ -538,31 +837,29 @@ impl Encoder {
         [v[0].clamp(-r, r), v[1].clamp(-r, r)]
     }
 
-    /// Predictive diamond search over whole samples from the best of a few
-    /// candidates, then the eight half-sample neighbours: the vector with
-    /// the lowest SAD plus a rate term, and its SAD.
+    /// Predictive diamond search over whole samples from the best of the
+    /// zero vector, the predictor and `extra` candidates, then the eight
+    /// half-sample neighbours: the vector with the lowest SAD plus a rate
+    /// term, and its SAD.
     #[allow(clippy::too_many_arguments)]
-    fn search(&self, src: &Pic, rf: &Pic, mbx: usize, mby: usize, pred: [i32; 2], qp: u32, rounding: bool) -> ([i32; 2], u32) {
+    fn search(
+        &self,
+        src: &Pic,
+        rf: &Pic,
+        mbx: usize,
+        mby: usize,
+        pred: [i32; 2],
+        extra: &[[i32; 2]],
+        qp: u32,
+        rounding: bool,
+    ) -> ([i32; 2], u32) {
         let lambda = qp;
         let cost = |v: [i32; 2], sad: u32| sad + lambda * self.mv_bits(v, pred);
         let even = |v: [i32; 2]| [v[0] & !1, v[1] & !1];
-        let mut cands = vec![[0, 0], even(pred)];
-        let mbw = self.st.mbw;
-        let prev = self.prev_mv[(2 * mby) * 2 * mbw + 2 * mbx];
-        cands.push(even([prev[0] as i32, prev[1] as i32]));
-        if mbx > 0 {
-            cands.push(even(self.st.get_mv(mbx - 1, mby, 1)));
-        }
-        if mby > 0 {
-            cands.push(even(self.st.get_mv(mbx, mby - 1, 2)));
-            if mbx + 1 < mbw {
-                cands.push(even(self.st.get_mv(mbx + 1, mby - 1, 2)));
-            }
-        }
         let mut best = [0, 0];
         let mut best_cost = u32::MAX;
         let mut best_sad = u32::MAX;
-        for c in cands {
+        for &c in [[0, 0], pred].iter().chain(extra) {
             let c = even(self.clamp_mv(c));
             let s = self.sad(src, rf, mbx, mby, None, c, rounding);
             let k = cost(c, s);

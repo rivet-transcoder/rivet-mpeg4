@@ -19,7 +19,8 @@ struct Run {
 }
 
 /// Encodes `n` synthetic frames, decoding each access unit as it comes.
-fn run(cfg: EncoderConfig, n: u32) -> Run {
+fn run(mut cfg: EncoderConfig, n: u32) -> Run {
+    cfg.keep_reconstructions = true;
     let (w, h) = (cfg.width, cfg.height);
     let mut enc = Encoder::new(cfg).unwrap();
     let mut dec = Decoder::new();
@@ -31,13 +32,17 @@ fn run(cfg: EncoderConfig, n: u32) -> Run {
         let src = synth(w, h, t);
         let au = enc.encode(&src).unwrap();
         bytes += au.len();
-        recon.push(enc.reconstruction().unwrap());
+        recon.extend(enc.take_reconstructions());
         frames.extend(dec.decode(&au).unwrap());
         sources.push(src);
     }
     let tail = enc.finish().unwrap();
+    bytes += tail.len();
+    recon.extend(enc.take_reconstructions());
     frames.extend(dec.decode(&tail).unwrap());
     frames.extend(dec.flush());
+    // Reconstructions come in decode order, frames in display order.
+    recon.sort_by_key(|f| f.timestamp);
     Run { frames, recon, sources, bytes }
 }
 
@@ -194,4 +199,41 @@ fn whole_stream_in_one_buffer() {
     frames.extend(dec.flush());
     assert_eq!(frames.len(), 7);
     assert!(frames.windows(2).all(|w| w[0].timestamp < w[1].timestamp));
+}
+
+#[test]
+fn b_frames() {
+    for b in [1u32, 2, 3] {
+        let mut cfg = EncoderConfig::new(176, 144, 25);
+        cfg.b_frames = b;
+        let r = run(cfg, 31);
+        check(&r, 31.0, &format!("{b} B-VOPs"));
+        assert!(r.frames.iter().any(|f| f.vop_type == VopType::B));
+        for (i, f) in r.frames.iter().enumerate() {
+            assert_eq!(f.timestamp, i as i64, "display order");
+        }
+    }
+}
+
+#[test]
+fn b_frames_with_packets_four_vectors_and_rate_control() {
+    let mut cfg = EncoderConfig::new(352, 288, 25);
+    cfg.b_frames = 2;
+    cfg.four_mv = true;
+    cfg.packet_bytes = Some(400);
+    cfg.rate = RateControl::Bitrate(500_000);
+    cfg.gop_size = 10;
+    let r = run(cfg, 25);
+    check(&r, 28.0, "B-VOPs, 4MV, packets, 500 kb/s");
+}
+
+#[test]
+fn b_frames_compress() {
+    let mut cfg = EncoderConfig::new(176, 144, 25);
+    cfg.gop_size = 0;
+    let p = run(cfg.clone(), 24);
+    cfg.b_frames = 2;
+    let b = run(cfg, 24);
+    println!("IPPP {} bytes, IBBP {} bytes", p.bytes, b.bytes);
+    assert!(b.bytes < p.bytes * 11 / 10);
 }
