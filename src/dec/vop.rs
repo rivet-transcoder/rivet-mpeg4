@@ -622,7 +622,7 @@ impl VopDec<'_> {
             // not_coded
             if let Some(g) = self.gmc {
                 // In an S-VOP, a GMC macroblock without texture.
-                let v = g.mb_vector(mbx, mby);
+                let v = self.gmc_vector(g, mbx, mby);
                 self.st.kind[mb] = MbKind::Inter;
                 self.st.field[mb] = false;
                 self.st.qp[mb] = self.qp as u8;
@@ -693,7 +693,7 @@ impl VopDec<'_> {
         if intra {
             self.st.set_mb_mv(mbx, mby, [0, 0]);
         } else if let Some(g) = self.gmc.filter(|_| mcsel) {
-            let v = g.mb_vector(mbx, mby);
+            let v = self.gmc_vector(g, mbx, mby);
             self.st.set_mb_mv(mbx, mby, v);
             h.mvs = [v; 4];
         } else if h.field_pred {
@@ -716,6 +716,20 @@ impl VopDec<'_> {
             h.mvs = [mv; 4];
         }
         Ok(Some(h))
+    }
+
+    /// The vector a GMC macroblock stands for in vector prediction (and as
+    /// a co-located vector in direct mode): the mean warp displacement,
+    /// clipped to the range `vop_fcode_forward` gives vectors. Unclipped,
+    /// a zoom whose warp outruns that range makes its neighbours' vectors
+    /// wrap — Xvid's GMC streams show it as misplaced blocks.
+    fn gmc_vector(&self, g: &crate::gmc::Gmc, mbx: usize, mby: usize) -> [i32; 2] {
+        let v = g.mb_vector(mbx, mby);
+        let f = 1i32 << (self.hdr.fcode_forward - 1);
+        [
+            v[0].clamp(-32 * f, 32 * f - 1),
+            v[1].clamp(-32 * f, 32 * f - 1),
+        ]
     }
 
     /// `dquant` when the type has one, then whether the intra DC uses its

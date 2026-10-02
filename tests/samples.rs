@@ -158,7 +158,7 @@ const SAMPLES: &[(&str, Expect)] = &[
             dropped: 0,
         },
     ),
-    // MS H.263 (the short video header) captured in fixed 32 KB records:
+    // An H.263 video call (the short video header) captured in fixed 32 KB records:
     // the record padding after each picture counts as misaligned, and two
     // pictures are damaged at a GOB start.
     (
@@ -171,7 +171,7 @@ const SAMPLES: &[(&str, Expect)] = &[
             dropped: 0,
         },
     ),
-    // RealMagic, 640x480; omits stuffing when byte aligned.
+    // Fourcc RMP4, 640x480; omits stuffing when byte aligned.
     (
         "greenlines.rmp4.p.avi",
         Decodes {
@@ -203,7 +203,7 @@ const SAMPLES: &[(&str, Expect)] = &[
             dropped: 0,
         },
     ),
-    // DivX (DXGM), 1024x464.
+    // Fourcc DXGM, 1024x464.
     (
         "0x4D475844-wow.avi",
         Decodes {

@@ -2,8 +2,8 @@
 # Downloads the sample bitstreams tests/samples.rs checks against into
 # tests/samples/ (or $MPEG4_SAMPLES), and verifies their SHA-256.
 #
-# They are encoder output — DivX 4/5/6, Xvid, OpenDivX, libavcodec, RealMagic,
-# UB Video, Microsoft's H.263 — published as test data on samples.ffmpeg.org
+# They are encoder output — DivX 5/6, Xvid, OpenDivX, libavcodec, UB Video and
+# others, and an H.263 call capture — published as test data on samples.ffmpeg.org
 # and fate-suite.ffmpeg.org. They are used as data only; no other decoder is
 # run. They are not redistributed in this repository: most are clips of
 # films and broadcasts whose licences are unknown. docs/SAMPLES.md says what
