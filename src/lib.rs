@@ -43,6 +43,7 @@ mod enc;
 mod error;
 mod frame;
 mod headers;
+pub(crate) mod gmc;
 pub(crate) mod idct;
 pub(crate) mod mbstate;
 pub(crate) mod mc;

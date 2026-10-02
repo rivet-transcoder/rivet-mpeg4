@@ -206,6 +206,9 @@ impl VolHeader {
         if self.sprite == SpriteMode::Static {
             return Err(unsupported("static sprites"));
         }
+        if self.sprite == SpriteMode::Gmc && self.sprite_warping_points > 3 {
+            return Err(unsupported("four-point (perspective) global motion compensation"));
+        }
         if self.sprite == SpriteMode::Gmc && self.sprite_brightness_change {
             return Err(unsupported("sprite brightness change"));
         }
@@ -491,6 +494,8 @@ pub(crate) struct VopHeader {
     pub fcode_backward: u32,
     /// Sprite / GMC warping vectors `(du, dv)` per point.
     pub warping: Vec<(i32, i32)>,
+    /// The trajectory had DivX 5.00's layout (one marker per point).
+    pub warping_divx500: bool,
 }
 
 fn vop_type_of(v: u32) -> VopType {
@@ -502,29 +507,48 @@ fn vop_type_of(v: u32) -> VopType {
     }
 }
 
-/// `warping_mv_code()`: a `dmv_length` VLC, that many bits coded like a DC
-/// differential, and a marker bit.
+/// `warping_mv_code()`: a `dmv_length` VLC, then that many bits coded
+/// like a DC differential.
 fn warping_mv_code(r: &mut BitReader) -> Result<i32> {
     let len = vlc::dmv_length().decode(r)?;
-    let v = if len == 0 {
+    Ok(if len == 0 {
         0
     } else {
         let code = r.read(len)? as i32;
         if code >> (len - 1) == 1 { code } else { code - ((1 << len) - 1) }
-    };
-    r.lenient_marker()?;
-    Ok(v)
+    })
 }
 
-/// `sprite_trajectory()`.
-pub(crate) fn parse_sprite_trajectory(r: &mut BitReader, points: u32) -> Result<Vec<(i32, i32)>> {
-    (0..points)
+/// `sprite_trajectory()`: per warping point, `du` and `dv` as
+/// `warping_mv_code()`s, each followed by a marker bit.
+///
+/// DivX 5.00 (build 413) writes one marker per point, after `dv`: when
+/// the standard layout meets a zero where a marker belongs, the trajectory
+/// is read again that way, and the second value returned is true.
+pub(crate) fn parse_sprite_trajectory(r: &mut BitReader, points: u32) -> Result<(Vec<(i32, i32)>, bool)> {
+    let start = r.pos();
+    let standard = (0..points)
+        .map(|_| {
+            let du = warping_mv_code(r)?;
+            r.marker("after a warping vector")?;
+            let dv = warping_mv_code(r)?;
+            r.marker("after a warping vector")?;
+            Ok((du, dv))
+        })
+        .collect::<Result<Vec<_>>>();
+    if let Ok(v) = standard {
+        return Ok((v, false));
+    }
+    r.set_pos(start);
+    let v = (0..points)
         .map(|_| {
             let du = warping_mv_code(r)?;
             let dv = warping_mv_code(r)?;
+            r.lenient_marker()?;
             Ok((du, dv))
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Ok((v, true))
 }
 
 /// `VideoObjectPlane()` up to the first macroblock, after the start code,
@@ -559,6 +583,7 @@ pub(crate) fn parse_vop_with(r: &mut BitReader, vol: &VolHeader, time_bits: u32,
         fcode_forward: 1,
         fcode_backward: 1,
         warping: Vec::new(),
+        warping_divx500: false,
     };
     if !h.coded {
         return Ok(h);
@@ -577,7 +602,7 @@ pub(crate) fn parse_vop_with(r: &mut BitReader, vol: &VolHeader, time_bits: u32,
     }
     h.intra_dc_vlc_thr = r.read(3)?;
     if vop_type == VopType::S && vol.sprite_warping_points > 0 {
-        h.warping = parse_sprite_trajectory(r, vol.sprite_warping_points)?;
+        (h.warping, h.warping_divx500) = parse_sprite_trajectory(r, vol.sprite_warping_points)?;
     }
     h.quant = r.read(5)?;
     if h.quant == 0 {

@@ -3,7 +3,7 @@
 //! and reconstruction (clause 7.4 texture, 7.6 motion compensation).
 
 use crate::bits::BitReader;
-use crate::error::{Error, Result, invalid, unsupported};
+use crate::error::{Error, Result, invalid};
 use crate::frame::VopType;
 use crate::headers::{VolHeader, VopHeader};
 use crate::idct::idct;
@@ -210,6 +210,9 @@ struct MbHdr {
     use_dc_vlc: bool,
     /// DC differentials read in an earlier partition (data partitioning).
     dc: Option<[i32; 6]>,
+    /// Predicted by global motion compensation (`mcsel`, or not coded in
+    /// an S-VOP).
+    gmc: bool,
 }
 
 /// B-VOP macroblock types (Table 6-26).
@@ -238,6 +241,8 @@ pub(crate) struct VopDec<'a> {
     pub bwd: Option<&'a Pic>,
     /// B: the future reference's motion.
     pub col: Option<&'a Motion>,
+    /// S-VOPs: the global motion.
+    pub gmc: Option<&'a crate::gmc::Gmc>,
     pub st: &'a mut MbState,
     pub slice_counter: &'a mut u32,
     /// B: temporal distances (7.6.9.5), in ticks.
@@ -289,6 +294,9 @@ impl VopDec<'_> {
     }
 
     fn record(&mut self, e: Error) {
+        if std::env::var_os("MPEG4_DEBUG").is_some() {
+            eprintln!("{:?}-VOP q{}: {e}", self.hdr.vop_type, self.hdr.quant);
+        }
         if self.error.is_none() {
             self.error = Some(e);
         }
@@ -485,6 +493,14 @@ impl VopDec<'_> {
         loop {
             if p && r.read_bit()? {
                 // not_coded
+                if let Some(g) = self.gmc {
+                    // In an S-VOP, a GMC macroblock without texture.
+                    let v = g.mb_vector(mbx, mby);
+                    self.st.kind[mb] = MbKind::Inter;
+                    self.st.qp[mb] = self.qp as u8;
+                    self.st.set_mb_mv(mbx, mby, v);
+                    return Ok(MbHdr { kind: MbKind::Inter, qp: self.qp, gmc: true, mvs: [v; 4], ..Default::default() });
+                }
                 self.st.kind[mb] = MbKind::Skipped;
                 self.st.qp[mb] = self.qp as u8;
                 self.st.set_mb_mv(mbx, mby, [0, 0]);
@@ -499,14 +515,13 @@ impl VopDec<'_> {
             if self.sh && mb_type == 2 {
                 return Err(invalid("INTER4V in a short-header picture"));
             }
-            if self.hdr.vop_type == VopType::S && !intra && r.read_bit()? {
-                return Err(unsupported("global motion compensation (mcsel)"));
-            }
+            let mcsel = self.gmc.is_some() && mb_type < 2 && r.read_bit()?;
             let mut h = MbHdr {
                 kind: if intra { MbKind::Intra } else { MbKind::Inter },
                 mb_type,
                 cbp: (v & 3) as u8,
                 four: mb_type == 2,
+                gmc: mcsel,
                 ..Default::default()
             };
             self.st.kind[mb] = h.kind;
@@ -525,6 +540,10 @@ impl VopDec<'_> {
             self.st.qp[mb] = self.qp as u8;
             if intra {
                 self.st.set_mb_mv(mbx, mby, [0, 0]);
+            } else if let Some(g) = self.gmc.filter(|_| mcsel) {
+                let v = g.mb_vector(mbx, mby);
+                self.st.set_mb_mv(mbx, mby, v);
+                h.mvs = [v; 4];
             } else if h.four {
                 for k in 0..4 {
                     let pred = self.st.mv_pred(mbx, mby, k, self.slice);
@@ -629,7 +648,19 @@ impl VopDec<'_> {
             MbKind::Inter => {
                 let src = self.fwd.ok_or_else(|| invalid("a P-VOP without a reference"))?;
                 let mut px = MbPix::new();
-                predict_mb(src, mbx, mby, &h.mvs, h.four, self.hdr.rounding, self.vol.quarter_sample, &mut px);
+                match self.gmc.filter(|_| h.gmc) {
+                    Some(g) => g.predict_mb(src, mbx, mby, self.hdr.rounding, &mut px),
+                    None => predict_mb(
+                        src,
+                        mbx,
+                        mby,
+                        &h.mvs,
+                        h.four,
+                        self.hdr.rounding,
+                        self.vol.quarter_sample,
+                        &mut px,
+                    ),
+                }
                 write_mb(self.cur, mbx, mby, &px);
                 self.residual(r, mbx, mby, h.cbp, h.qp)
             }
@@ -817,6 +848,9 @@ impl VopDec<'_> {
             let mut failed = false;
             for mb in g * per_gob..((g + 1) * per_gob).min(total) {
                 if let Err(e) = self.mb(r, mb) {
+                    if std::env::var_os("MPEG4_DEBUG").is_some() {
+                        eprintln!("short header: GOB {g} macroblock {mb}: {e} at bit {}", r.pos());
+                    }
                     self.record(e);
                     failed = true;
                     // Resume at the next GOB header, if there is one.
@@ -920,9 +954,11 @@ pub(crate) fn direct_vectors(
 
 /// Whether what follows the last macroblock is the stuffing that should
 /// be there: up to the byte boundary, `next_start_code()`'s zero then ones
-/// (zeros are accepted too, and for the short video header are the rule);
-/// then only padding bytes — `0x00`, a further `0x7f` stuffing byte or
-/// `0xff` — or, for the short video header, an end-of-sequence code. Real
+/// (zeros, and ones without the zero, are accepted too; zeros are the
+/// short video header's rule);
+/// then only padding bytes — a further `0x7f` stuffing byte, or bytes of
+/// ones then zeros (`0x00`, `0xff`, `0xc0`, ...) — or, for the short video
+/// header, an end-of-sequence code. Real
 /// encoders pad all three ways; what this rejects is macroblock data that
 /// stopped short of the end, the sign of a stream read wrongly.
 fn tail_ok(r: &BitReader, sh: bool) -> bool {
@@ -930,7 +966,7 @@ fn tail_ok(r: &BitReader, sh: bool) -> bool {
     if k > 0 {
         let bits = r.peek(k as u32);
         let stuffing = (1u32 << (k - 1)) - 1;
-        if bits != 0 && bits != stuffing {
+        if bits != 0 && bits != stuffing && bits != (1u32 << k) - 1 {
             return false;
         }
     }
@@ -940,7 +976,10 @@ fn tail_ok(r: &BitReader, sh: bool) -> bool {
         return true;
     }
     while t.left() >= 8 {
-        if !matches!(t.peek(8), 0x00 | 0x7f | 0xff) {
+        // Ones then zeros (0x00, 0x80, 0xc0, ... 0xff), or a 0x7f stuffing
+        // byte.
+        let b = t.peek(8) as u8;
+        if b != 0x7f && b.leading_ones() + b.trailing_zeros() < 8 {
             return false;
         }
         t.set_pos(t.pos() + 8);

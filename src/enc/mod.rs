@@ -224,6 +224,7 @@ impl Encoder {
             fcode_forward: self.fcode,
             fcode_backward: 1,
             warping: Vec::new(),
+            warping_divx500: false,
         };
         self.last_sec = sec;
         let mut w = BitWriter::new();

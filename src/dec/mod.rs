@@ -119,6 +119,8 @@ pub struct Decoder {
     /// A `vop_time_increment` length found by [`Decoder::parse_vop`] to
     /// differ from the VOL's.
     time_bits: Option<u32>,
+    /// The DivX version a user data string named (500 for DivX 5.00).
+    divx_version: Option<u32>,
 }
 
 /// Counts a [`Decoder`] keeps, for monitoring a stream's health.
@@ -171,6 +173,7 @@ impl Decoder {
             last_error: None,
             stats: DecoderStats::default(),
             time_bits: None,
+            divx_version: None,
         }
     }
 
@@ -295,9 +298,12 @@ impl Decoder {
     }
 
     fn user_data(&mut self, body: &[u8]) {
-        // DivX writes "DivX<version>b<build>" with a trailing 'p' when the
-        // stream packs B-VOPs with the following P-VOP.
+        // DivX writes "DivX<version>b<build>" (DivX 5.00: "DivX500Build413")
+        // with a trailing 'p' when the stream packs B-VOPs with the
+        // following P-VOP.
         if body.starts_with(b"DivX") {
+            let digits: Vec<u8> = body[4..].iter().copied().take_while(u8::is_ascii_digit).collect();
+            self.divx_version = std::str::from_utf8(&digits).ok().and_then(|s| s.parse().ok());
             let end = body.iter().rposition(|&b| b != 0).map_or(0, |p| p + 1);
             if end > 4 && body[end - 1] == b'p' {
                 self.packed = true;
@@ -386,9 +392,6 @@ impl Decoder {
         self.decode_index += 1;
         if !h.coded {
             return self.not_coded(&h, time, index);
-        }
-        if h.vop_type == VopType::S {
-            return Err(unsupported("global motion compensation (S-VOPs)"));
         }
         self.decode_vop(&vol, &h, &mut r, time, index, false)
     }
@@ -484,6 +487,11 @@ impl Decoder {
         } else {
             (self.future.as_ref().map(|f| &f.pic), None, None)
         };
+        let divx500 = h.warping_divx500 || self.divx_version == Some(500);
+        let gmc = (h.vop_type == VopType::S).then(|| crate::gmc::Gmc::new(vol, &h.warping, divx500));
+        if gmc.is_some() && std::env::var_os("MPEG4_DEBUG").is_some() {
+            eprintln!("S-VOP {index}: points {} accuracy {} warping {:?} q{} f{} rnd {}", vol.sprite_warping_points, vol.sprite_warping_accuracy, h.warping, h.quant, h.fcode_forward, h.rounding);
+        }
         let mut d = VopDec {
             vol,
             hdr: h,
@@ -493,6 +501,7 @@ impl Decoder {
             fwd,
             bwd,
             col,
+            gmc: gmc.as_ref(),
             st,
             slice_counter: &mut self.slice_counter,
             trb,
@@ -597,6 +606,7 @@ impl Decoder {
             fcode_forward: 1,
             fcode_backward: 1,
             warping: Vec::new(),
+            warping_divx500: false,
         };
         let index = self.decode_index;
         self.decode_index += 1;
