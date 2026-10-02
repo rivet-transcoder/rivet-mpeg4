@@ -1,0 +1,7 @@
+# Scripts, manifests and checksum lists must check out with LF on every platform.
+* text=auto eol=lf
+# Sample bitstreams are data, byte for byte.
+*.m4v binary
+*.263 binary
+*.avi binary
+*.yuv binary

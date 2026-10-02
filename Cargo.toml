@@ -1,0 +1,27 @@
+[package]
+name = "rivet-mpeg4"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license-file = "LICENSE.md"
+readme = "README.md"
+repository = "https://github.com/rivet-transcoder/rivet-mpeg4"
+homepage = "https://github.com/rivet-transcoder/rivet-mpeg4"
+documentation = "https://docs.rs/rivet-mpeg4"
+authors = ["Ely Erin Fox"]
+description = "An MPEG-4 Part 2 Visual (ISO/IEC 14496-2) decoder and encoder in Rust, written from the standard: no C, no system libraries, no build script. Simple and Advanced Simple Profile decoding (I/P/B-VOPs, quarter-pel, packed bitstreams, the H.263 short video header) to planar 4:2:0 in display order; a Simple Profile encoder. rivet's MPEG-4 Visual codec. Imported as `mpeg4`."
+keywords = ["mpeg4", "xvid", "divx", "h263", "video"]
+categories = ["multimedia::video", "multimedia::encoding"]
+exclude = [".github/", "docs/", "tools/"]
+
+[lib]
+name = "mpeg4"
+
+[dependencies]
+thiserror = "2"
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+[features]
+default = []
