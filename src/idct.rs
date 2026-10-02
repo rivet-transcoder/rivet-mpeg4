@@ -229,7 +229,7 @@ mod tests {
             for sign in [1, -1] {
                 let s = ieee1180_run(l, h, sign, blocks);
                 let msg = format!(
-                    "L={l} H={h} sign={sign}: peak {} pmse {:.4} omse {:.4} pme {:.4} ome {:.5}",
+                    "{blocks} blocks, L={l} H={h} sign={sign}: peak {} pmse {:.4} omse {:.4} pme {:.4} ome {:.5}",
                     s.peak, s.pmse, s.omse, s.pme, s.ome
                 );
                 println!("{msg}");

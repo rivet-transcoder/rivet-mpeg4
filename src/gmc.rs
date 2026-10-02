@@ -33,10 +33,12 @@ pub(crate) struct Gmc {
 }
 
 /// `///`: division rounding to the nearest integer, halves toward
-/// positive infinity.
+/// positive infinity. Every divisor the warp uses is a power of two (`W'`,
+/// `H'` and `r = 16 / s` are), so it is a shift.
 #[inline]
 fn div_up(n: i64, d: i64) -> i64 {
-    (n + d / 2).div_euclid(d)
+    debug_assert!(d > 0 && d & (d - 1) == 0);
+    (n + d / 2) >> d.trailing_zeros()
 }
 
 impl Gmc {
