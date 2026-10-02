@@ -1067,13 +1067,18 @@ pub(crate) fn direct_vectors(
             [v[0] as i32, v[1] as i32]
         };
         for j in 0..2 {
-            let scaled = if trd != 0 { trb * m[j] / trd } else { 0 };
-            f[k][j] = scaled + mvd[j];
-            b[k][j] = if mvd[j] == 0 {
-                if trd != 0 { (trb - trd) * m[j] / trd } else { 0 }
+            // In i64: the temporal distances of a damaged stream can be
+            // anything.
+            let (trb, trd, mj) = (trb as i64, trd as i64, m[j] as i64);
+            let scaled = if trd != 0 { trb * mj / trd } else { 0 };
+            let fv = (scaled + mvd[j] as i64).clamp(-(1 << 16), 1 << 16);
+            let bv = if mvd[j] == 0 {
+                if trd != 0 { (trb - trd) * mj / trd } else { 0 }
             } else {
-                f[k][j] - m[j]
+                fv - mj
             };
+            f[k][j] = fv as i32;
+            b[k][j] = bv.clamp(-(1 << 16), 1 << 16) as i32;
         }
     }
     (f, b)

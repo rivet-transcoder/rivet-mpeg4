@@ -23,7 +23,8 @@ pub(crate) fn split_units(data: &[u8]) -> Vec<(u8, &[u8])> {
     while i + 3 < data.len() {
         if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
             starts.push(i);
-            i += 3;
+            // The value byte belongs to this start code, never to the next.
+            i += 4;
         } else if data[i + 2] > 1 {
             i += 3;
         } else {

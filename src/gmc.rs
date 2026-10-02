@@ -10,7 +10,6 @@
 //! `H' >= H`, and samples are bilinear at that precision.
 
 use crate::headers::VolHeader;
-use crate::mbstate::round_div;
 use crate::picture::Pic;
 
 use crate::dec::vop::MbPix;
@@ -63,7 +62,8 @@ impl Gmc {
         let j1p = k * (dv1 + dv0);
         let i2p = k * (du2 + du0);
         let j2p = s * h + k * (dv2 + dv0);
-        let rd = |n: i64, d: i64| round_div(n as i32, d as i32) as i64;
+        // `//`: to the nearest, halves away from zero.
+        let rd = |n: i64, d: i64| if n >= 0 { (n + d / 2) / d } else { -((-n + d / 2) / d) };
         let i1pp = 16 * wp + rd((w - wp) * (r * i0p) + wp * (r * i1p - 16 * w), w);
         let j1pp = rd((w - wp) * (r * j0p) + wp * (r * j1p), w);
         let i2pp = rd((h - hp) * (r * i0p) + hp * (r * i2p), h);
@@ -199,7 +199,9 @@ impl Gmc {
         let unit = if self.quarter { 4 } else { 2 };
         let d = 256 * self.s / unit;
         let rd = |n: i64| if n >= 0 { (n + d / 2) / d } else { -((-n + d / 2) / d) };
-        [rd(sx) as i32, rd(sy) as i32]
+        // Kept within what the vector store holds; only a damaged
+        // trajectory gets near it.
+        [rd(sx).clamp(-16384, 16383) as i32, rd(sy).clamp(-16384, 16383) as i32]
     }
 }
 

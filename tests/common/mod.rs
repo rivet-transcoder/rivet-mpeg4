@@ -56,3 +56,5 @@ pub fn psnr_plane(a: &Frame, b: &Frame, i: usize) -> f64 {
 pub fn psnr(a: &Frame, b: &Frame) -> f64 {
     psnr_plane(a, b, 0)
 }
+
+pub mod media;

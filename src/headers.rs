@@ -290,8 +290,10 @@ pub(crate) fn parse_visual_object(r: &mut BitReader) -> Result<VisualObject> {
 pub(crate) fn parse_vol(r: &mut BitReader, vo: VisualObject, pl: Option<u8>) -> Result<VolHeader> {
     r.read(1)?; // random_accessible_vol
     let object_type = r.read(8)? as u8;
-    if object_type == 0x12 {
-        return Err(unsupported("fine granularity scalability"));
+    match object_type {
+        0x0f | 0x10 => return Err(unsupported("the Studio profiles (Simple Studio and Core Studio object types)")),
+        0x12 => return Err(unsupported("fine granularity scalability")),
+        _ => {}
     }
     let mut verid = if vo.verid == 0 { 1 } else { vo.verid };
     if r.read_bit()? {
