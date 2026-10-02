@@ -406,7 +406,29 @@ pub(crate) fn parse_vol(r: &mut BitReader, vo: VisualObject, pl: Option<u8>) -> 
     let reversible_vlc = if data_partitioned { r.read_bit()? } else { false };
     let mut newpred = false;
     let mut reduced_resolution = false;
-    if verid != 1 {
+    // Some early encoders (OpenDivX) declare verid 2 but write the verid 1
+    // tail, without newpred_enable and reduced_resolution_vop_enable: when
+    // reading it that way ends the header cleanly (scalability 0, then
+    // stuffing to the end) and the standard reading does not, take it.
+    let v1_tail = verid != 1 && {
+        let mut t = r.clone();
+        let clean = |t: &mut BitReader| -> bool {
+            // scalability == 0, then next_start_code() and nothing more.
+            t.read_bit().ok() == Some(false) && t.stuffing_end().is_some_and(|p| p == t.len_bits())
+        };
+        let mut s = r.clone();
+        let standard_clean = (|| -> Option<bool> {
+            let np = s.read_bit().ok()?;
+            if np {
+                s.skip(3).ok()?;
+            }
+            s.read_bit().ok()?;
+            Some(clean(&mut s))
+        })()
+        .unwrap_or(false);
+        !standard_clean && clean(&mut t)
+    };
+    if verid != 1 && !v1_tail {
         newpred = r.read_bit()?;
         if newpred {
             r.read(3)?; // requested_upstream_message_type, newpred_segment_type
@@ -505,8 +527,12 @@ pub(crate) fn parse_sprite_trajectory(r: &mut BitReader, points: u32) -> Result<
         .collect()
 }
 
-/// `VideoObjectPlane()` up to the first macroblock, after the start code.
-pub(crate) fn parse_vop(r: &mut BitReader, vol: &VolHeader) -> Result<VopHeader> {
+/// `VideoObjectPlane()` up to the first macroblock, after the start code,
+/// with `vop_time_increment` taken as `time_bits` long. With `strict`, the
+/// marker bit after the increment must be there (the decoder tries other
+/// lengths when it is not: some encoders code the increment with more bits
+/// than their VOL's resolution needs).
+pub(crate) fn parse_vop_with(r: &mut BitReader, vol: &VolHeader, time_bits: u32, strict: bool) -> Result<VopHeader> {
     let vop_type = vop_type_of(r.read(2)?);
     let mut modulo_time_base = 0;
     while r.read_bit()? {
@@ -516,8 +542,12 @@ pub(crate) fn parse_vop(r: &mut BitReader, vol: &VolHeader) -> Result<VopHeader>
         }
     }
     r.lenient_marker()?;
-    let time_increment = r.read(vol.time_increment_bits)?;
-    r.lenient_marker()?;
+    let time_increment = r.read(time_bits)?;
+    if strict {
+        r.marker("after vop_time_increment")?;
+    } else {
+        r.lenient_marker()?;
+    }
     let mut h = VopHeader {
         vop_type,
         modulo_time_base,
@@ -566,6 +596,12 @@ pub(crate) fn parse_vop(r: &mut BitReader, vol: &VolHeader) -> Result<VopHeader>
         }
     }
     Ok(h)
+}
+
+/// `VideoObjectPlane()` up to the first macroblock, as the VOL describes it.
+#[cfg(test)]
+pub(crate) fn parse_vop(r: &mut BitReader, vol: &VolHeader) -> Result<VopHeader> {
+    parse_vop_with(r, vol, vol.time_increment_bits, false)
 }
 
 // ---------------------------------------------------------------- writing

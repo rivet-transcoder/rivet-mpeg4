@@ -1,8 +1,9 @@
 //! Motion compensation (clause 7.6.2): half-sample bilinear interpolation,
 //! quarter-sample interpolation (the 8-tap filter of 7.6.2.1 with block-edge
 //! mirroring), the chrominance vector derivations, and unrestricted motion
-//! vectors — every reference sample outside the VOP takes the value of the
-//! nearest sample on its boundary (the padding of 7.6.4).
+//! vectors — every reference sample outside the reconstructed area takes
+//! the value of the nearest sample on its boundary (the padding of 7.6.4;
+//! see `Pic::ref_plane` for which boundary).
 
 use crate::tables::CHROMA_ROUND_16;
 

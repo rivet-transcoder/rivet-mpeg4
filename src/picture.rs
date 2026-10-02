@@ -59,6 +59,25 @@ impl Pic {
         }
     }
 
+    /// The planes as motion compensation reads them: `(data, stride,
+    /// width, height)` of the area whose edge samples are repeated outward
+    /// (unrestricted motion vectors, 7.6.4).
+    ///
+    /// That area is the whole reconstructed macroblock grid, not the VOL's
+    /// width and height: for a size that is not a multiple of 16 the
+    /// samples decoded past the VOP's right and bottom edges are part of
+    /// the reference. DivX 5 streams of such sizes drift at the bottom
+    /// edge when padding starts at the VOP boundary instead, and decode
+    /// cleanly this way.
+    pub fn ref_plane(&self, i: usize) -> (&[u8], usize, i32, i32) {
+        let (w, h) = ((self.mbw * 16) as i32, (self.mbh * 16) as i32);
+        match i {
+            0 => (&self.y, self.ystride(), w, h),
+            1 => (&self.cb, self.cstride(), w / 2, h / 2),
+            _ => (&self.cr, self.cstride(), w / 2, h / 2),
+        }
+    }
+
     /// Crops to a [`Frame`].
     pub fn to_frame(&self, timestamp: i64, time_base: u32, vop_type: VopType, decode_index: u64) -> Frame {
         let mut f = Frame::new(self.w, self.h);

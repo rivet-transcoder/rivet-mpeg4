@@ -119,6 +119,7 @@ pub struct Encoder {
     rounding: bool,
     quant: Quant,
     rc: Option<Rc>,
+    last_type: VopType,
 }
 
 impl Encoder {
@@ -181,6 +182,7 @@ impl Encoder {
             rounding: false,
             quant: Quant::h263(),
             rc,
+            last_type: VopType::I,
             cfg,
         })
     }
@@ -238,8 +240,17 @@ impl Encoder {
         self.rate_update(bits, intra);
         self.prev_mv.clone_from(&self.st.mv);
         self.reference = Some(recon);
+        self.last_type = hdr.vop_type;
         self.n += 1;
         Ok(w.into_bytes())
+    }
+
+    /// The reconstruction of the last coded frame: the picture every
+    /// conforming decoder builds from its bytes (the encoder predicts the
+    /// next frame from it). `None` before the first frame.
+    pub fn reconstruction(&self) -> Option<Frame> {
+        let t = (self.n.max(1) - 1) as i64 * self.cfg.frame_duration as i64;
+        self.reference.as_ref().map(|p| p.to_frame(t, self.cfg.time_base, self.last_type, self.n - 1))
     }
 
     /// Ends the stream. Nothing is held back (no B-VOPs), so this returns
@@ -253,7 +264,7 @@ impl Encoder {
             (_, RateControl::ConstantQuant(q)) => q as u32,
             (Some(rc), _) => {
                 let q = rc.base * 2f64.powf((rc.err / (6.0 * rc.target)).clamp(-2.0, 2.0));
-                q.round().clamp(2.0, 31.0) as u32
+                q.round().clamp(1.0, 31.0) as u32
             }
             (None, _) => 5,
         }
@@ -266,7 +277,7 @@ impl Encoder {
                 // Drift the base quantiser toward the one that hits the
                 // target on P-VOPs.
                 let r = (bits as f64 / rc.target).clamp(0.25, 4.0);
-                rc.base = (rc.base * r.powf(0.2)).clamp(2.0, 31.0);
+                rc.base = (rc.base * r.powf(0.2)).clamp(1.0, 31.0);
             }
         }
     }
@@ -508,7 +519,7 @@ impl Encoder {
         let x = (mbx * 16 + bx) as i32;
         let y = (mby * 16 + by) as i32;
         let mut p = [0u8; 256];
-        mc::halfpel(rf.plane(0), x, y, mv[0], mv[1], n, n, rounding, &mut p, 16);
+        mc::halfpel(rf.ref_plane(0), x, y, mv[0], mv[1], n, n, rounding, &mut p, 16);
         let s = src.ystride();
         let mut sum = 0;
         for r in 0..n {

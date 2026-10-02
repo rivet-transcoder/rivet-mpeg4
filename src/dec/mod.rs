@@ -115,6 +115,27 @@ pub struct Decoder {
     packed_debt: u32,
     ready: VecDeque<Frame>,
     last_error: Option<Error>,
+    stats: DecoderStats,
+    /// A `vop_time_increment` length found by [`Decoder::parse_vop`] to
+    /// differ from the VOL's.
+    time_bits: Option<u32>,
+}
+
+/// Counts a [`Decoder`] keeps, for monitoring a stream's health.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DecoderStats {
+    /// Coded VOPs decoded (including concealed ones).
+    pub vops: u64,
+    /// VOPs in which damage was concealed.
+    pub concealed_vops: u64,
+    /// VOPs decoded without error whose macroblock data did not end exactly
+    /// at the stuffing before the next start code: a stream that parses
+    /// but not as this decoder reads it (or an encoder that appends data).
+    pub misaligned_vops: u64,
+    /// VOPs that produced no frame: not-coded placeholders after packed
+    /// B-VOPs, B-VOPs or P-VOPs whose references were never decoded.
+    pub dropped_vops: u64,
 }
 
 impl Default for Decoder {
@@ -148,6 +169,8 @@ impl Decoder {
             packed_debt: 0,
             ready: VecDeque::new(),
             last_error: None,
+            stats: DecoderStats::default(),
+            time_bits: None,
         }
     }
 
@@ -174,6 +197,11 @@ impl Decoder {
     /// header, the one it implies).
     pub fn vol(&self) -> Option<&VolHeader> {
         self.vol.as_ref()
+    }
+
+    /// What the decoder has counted so far.
+    pub fn stats(&self) -> &DecoderStats {
+        &self.stats
     }
 
     /// The first error concealed in the most recent damaged VOP, if any:
@@ -291,6 +319,7 @@ impl Decoder {
             self.future_pending = false;
             self.spare = None;
         }
+        self.time_bits = None;
         self.quant = Quant { mpeg: vol.mpeg_quant, intra_matrix: vol.intra_matrix, inter_matrix: vol.inter_matrix };
         self.vol = Some(vol);
         Ok(())
@@ -351,7 +380,7 @@ impl Decoder {
     fn vop(&mut self, body: &[u8]) -> Result<()> {
         let vol = self.vol.clone().ok_or_else(|| invalid("a VOP before any video object layer header"))?;
         let mut r = BitReader::new(body);
-        let h = headers::parse_vop(&mut r, &vol)?;
+        let h = self.parse_vop(&mut r, &vol)?;
         let time = self.vop_time(&h, vol.time_resolution);
         let index = self.decode_index;
         self.decode_index += 1;
@@ -364,14 +393,40 @@ impl Decoder {
         self.decode_vop(&vol, &h, &mut r, time, index, false)
     }
 
+    /// The VOP header, with the VOL's `vop_time_increment` length or, when
+    /// the marker after it is missing, the first other length that parses
+    /// (kept for the rest of the stream).
+    fn parse_vop(&mut self, r: &mut BitReader, vol: &VolHeader) -> Result<VopHeader> {
+        let bits = self.time_bits.unwrap_or(vol.time_increment_bits);
+        let start = r.pos();
+        if let Ok(h) = headers::parse_vop_with(r, vol, bits, true) {
+            return Ok(h);
+        }
+        for n in (1..=16).filter(|&n| n != bits) {
+            r.set_pos(start);
+            if let Ok(h) = headers::parse_vop_with(r, vol, n, true)
+                && (!h.coded || h.quant != 0)
+            {
+                self.time_bits = Some(n);
+                return Ok(h);
+            }
+        }
+        r.set_pos(start);
+        headers::parse_vop_with(r, vol, bits, false)
+    }
+
     /// `vop_coded == 0`: a placeholder after a packed B-VOP (dropped), or
     /// a VOP identical to the reference (repeated).
     fn not_coded(&mut self, h: &VopHeader, time: i64, index: u64) -> Result<()> {
         if self.packed_debt > 0 {
             self.packed_debt -= 1;
+            self.stats.dropped_vops += 1;
             return Ok(());
         }
-        let Some(f) = &self.future else { return Ok(()) };
+        let Some(f) = &self.future else {
+            self.stats.dropped_vops += 1;
+            return Ok(());
+        };
         if h.vop_type == VopType::B {
             let src = self.past.as_ref().unwrap_or(f);
             let mut fr = self.ref_frame(src);
@@ -408,10 +463,12 @@ impl Decoder {
         if h.vop_type != VopType::I && self.future.is_none() {
             // A P-VOP with nothing to predict from (decoding started
             // mid-stream): nothing to show until an I-VOP.
+            self.stats.dropped_vops += 1;
             return Ok(());
         }
         if is_b && self.past.is_none() {
             // A leading B-VOP of an open GOP, its past reference missing.
+            self.stats.dropped_vops += 1;
             return Ok(());
         }
         let mut cur = self.take_pic(vol.width, vol.height);
@@ -445,10 +502,17 @@ impl Decoder {
             first_coded: true,
             pmv: [[0, 0]; 2],
             error: None,
+            tail_ok: false,
         };
         d.run(r);
         let error = d.error.take();
         let concealed = error.is_some();
+        self.stats.vops += 1;
+        if concealed {
+            self.stats.concealed_vops += 1;
+        } else if !d.tail_ok {
+            self.stats.misaligned_vops += 1;
+        }
         if let Some(e) = error {
             self.last_error = Some(e);
         }

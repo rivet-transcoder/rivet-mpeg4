@@ -66,7 +66,7 @@ pub(crate) fn predict_mb(
     out: &mut MbPix,
 ) {
     let (x, y) = (mbx as i32 * 16, mby as i32 * 16);
-    let luma = src.plane(0);
+    let luma = src.ref_plane(0);
     if !four {
         let [mx, my] = mvs[0];
         if qpel {
@@ -93,8 +93,8 @@ pub(crate) fn predict_mb(
         (chroma_mv_1(luma_to_halfpel(mvs[0][0], qpel)), chroma_mv_1(luma_to_halfpel(mvs[0][1], qpel)))
     };
     let (px, py) = (mbx as i32 * 8, mby as i32 * 8);
-    mc::halfpel(src.plane(1), px, py, cx, cy, 8, 8, rounding, &mut out.cb, 8);
-    mc::halfpel(src.plane(2), px, py, cx, cy, 8, 8, rounding, &mut out.cr, 8);
+    mc::halfpel(src.ref_plane(1), px, py, cx, cy, 8, 8, rounding, &mut out.cb, 8);
+    mc::halfpel(src.ref_plane(2), px, py, cx, cy, 8, 8, rounding, &mut out.cr, 8);
 }
 
 /// Copies a prediction into the picture.
@@ -249,6 +249,9 @@ pub(crate) struct VopDec<'a> {
     pub pmv: [[i32; 2]; 2],
     /// Set when part of the VOP was concealed; the first error is kept.
     pub error: Option<Error>,
+    /// Whether the macroblock data ended exactly where the VOP's stuffing
+    /// begins (set by [`Self::run`] when nothing was concealed).
+    pub tail_ok: bool,
 }
 
 impl VopDec<'_> {
@@ -367,6 +370,24 @@ impl VopDec<'_> {
     /// found are copied from the reference, and the error is kept in
     /// `self.error`.
     pub fn run(&mut self, r: &mut BitReader) {
+        self.run_inner(r);
+        if self.error.is_none() {
+            self.tail_ok = tail_ok(r, self.sh);
+            if !self.tail_ok && std::env::var_os("MPEG4_DEBUG").is_some() {
+                eprintln!(
+                    "misaligned {:?} q{} at bit {} of {} (left {}), next bytes {:02x?}",
+                    self.hdr.vop_type,
+                    self.hdr.quant,
+                    r.pos(),
+                    r.len_bits(),
+                    r.left(),
+                    &r.peek(32).to_be_bytes()
+                );
+            }
+        }
+    }
+
+    fn run_inner(&mut self, r: &mut BitReader) {
         let total = self.total();
         self.new_packet(self.hdr.quant);
         if self.sh {
@@ -895,6 +916,36 @@ pub(crate) fn direct_vectors(
         }
     }
     (f, b)
+}
+
+/// Whether what follows the last macroblock is the stuffing that should
+/// be there: up to the byte boundary, `next_start_code()`'s zero then ones
+/// (zeros are accepted too, and for the short video header are the rule);
+/// then only padding bytes — `0x00`, a further `0x7f` stuffing byte or
+/// `0xff` — or, for the short video header, an end-of-sequence code. Real
+/// encoders pad all three ways; what this rejects is macroblock data that
+/// stopped short of the end, the sign of a stream read wrongly.
+fn tail_ok(r: &BitReader, sh: bool) -> bool {
+    let k = (8 - (r.pos() & 7)) & 7;
+    if k > 0 {
+        let bits = r.peek(k as u32);
+        let stuffing = (1u32 << (k - 1)) - 1;
+        if bits != 0 && bits != stuffing {
+            return false;
+        }
+    }
+    let mut t = r.clone();
+    t.set_pos(r.pos() + k);
+    if sh && t.left() >= 22 && t.peek(22) == 0b0000_0000_0000_0000_1111_11 {
+        return true;
+    }
+    while t.left() >= 8 {
+        if !matches!(t.peek(8), 0x00 | 0x7f | 0xff) {
+            return false;
+        }
+        t.set_pos(t.pos() + 8);
+    }
+    true
 }
 
 /// Whether `r` is at `len` bits of resync marker: `len - 1` zeros, a one.
