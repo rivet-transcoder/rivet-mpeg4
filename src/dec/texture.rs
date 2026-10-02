@@ -97,3 +97,161 @@ pub(crate) fn read_coeffs(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bits::BitWriter;
+    use crate::tables::{TCOEF_ESCAPE, TCOEF_INTER, TCOEF_INTRA, ZIGZAG, code};
+
+    fn put(w: &mut BitWriter, s: &str) {
+        let (b, l) = code(s);
+        w.put(l, b);
+    }
+
+    /// The code of `(last, run, level)` in a table.
+    fn find(t: &[(&'static str, u8, u8, u8)], last: u8, run: u8, level: u8) -> &'static str {
+        t.iter().find(|e| (e.1, e.2, e.3) == (last, run, level)).unwrap().0
+    }
+
+    fn decode(w: BitWriter, intra: bool, short: bool) -> [i16; 64] {
+        let bytes = w.into_bytes();
+        let mut b = [0i16; 64];
+        read_coeffs(&mut BitReader::new(&bytes), &mut b, &ZIGZAG, 0, intra, short).unwrap();
+        b
+    }
+
+    /// Escape type 1 (7.4.1.3): ESC, 0, then a table code whose level is
+    /// offset by LMAX(last, run) — intra (1, 0, 1) means level 1 + 8.
+    #[test]
+    fn escape_mode_1() {
+        let mut w = BitWriter::new();
+        put(&mut w, TCOEF_ESCAPE);
+        w.put(1, 0);
+        put(&mut w, find(TCOEF_INTRA, 1, 0, 1));
+        w.put(1, 1); // negative
+        let b = decode(w, true, false);
+        assert_eq!(b[0], -9);
+        // Inter (1, 1, 1): LMAX(1, 1) = 2, so level 3, after one zero.
+        let mut w = BitWriter::new();
+        put(&mut w, TCOEF_ESCAPE);
+        w.put(1, 0);
+        put(&mut w, find(TCOEF_INTER, 1, 1, 1));
+        w.put(1, 0);
+        let b = decode(w, false, false);
+        assert_eq!(b[ZIGZAG[1] as usize], 3);
+    }
+
+    /// Escape type 2: ESC, 10, then a code whose run is offset by
+    /// RMAX(last, level) + 1 — inter (0, 0, 2) means run 0 + 10 + 1.
+    #[test]
+    fn escape_mode_2() {
+        let mut w = BitWriter::new();
+        put(&mut w, TCOEF_ESCAPE);
+        w.put(2, 0b10);
+        put(&mut w, find(TCOEF_INTER, 1, 0, 2));
+        w.put(1, 0);
+        let b = decode(w, false, false);
+        // RMAX(1, 2) = 1 for inter: run 0 + 1 + 1 = 2.
+        assert_eq!(b[ZIGZAG[2] as usize], 2);
+        let mut w = BitWriter::new();
+        put(&mut w, TCOEF_ESCAPE);
+        w.put(2, 0b10);
+        put(&mut w, find(TCOEF_INTRA, 1, 3, 1));
+        w.put(1, 1);
+        let b = decode(w, true, false);
+        // RMAX(1, 1) = 20 for intra: run 3 + 21 = 24.
+        assert_eq!(b[ZIGZAG[24] as usize], -1);
+    }
+
+    /// Escape type 3: ESC, 11, last, 6-bit run, marker, 12-bit two's
+    /// complement level, marker.
+    #[test]
+    fn escape_mode_3() {
+        let mut w = BitWriter::new();
+        put(&mut w, TCOEF_ESCAPE);
+        w.put(2, 0b11);
+        w.put(1, 0);
+        w.put(6, 5);
+        w.put(1, 1);
+        w.put(12, (-300i32 as u32) & 0xfff);
+        w.put(1, 1);
+        put(&mut w, TCOEF_ESCAPE);
+        w.put(2, 0b11);
+        w.put(1, 1);
+        w.put(6, 0);
+        w.put(1, 1);
+        w.put(12, 2047);
+        w.put(1, 1);
+        let b = decode(w, false, false);
+        assert_eq!(b[ZIGZAG[5] as usize], -300);
+        assert_eq!(b[ZIGZAG[6] as usize], 2047);
+        // A missing marker is an error.
+        let mut w = BitWriter::new();
+        put(&mut w, TCOEF_ESCAPE);
+        w.put(2, 0b11);
+        w.put(8, 0);
+        w.put(14, 1 << 1);
+        let bytes = w.into_bytes();
+        let mut b = [0i16; 64];
+        assert!(read_coeffs(&mut BitReader::new(&bytes), &mut b, &ZIGZAG, 0, false, false).is_err());
+    }
+
+    /// The short video header's escape (H.263 5.4.2): last, 6-bit run,
+    /// 8-bit signed level; 0 and -128 are forbidden.
+    #[test]
+    fn short_header_escape() {
+        let mut w = BitWriter::new();
+        put(&mut w, TCOEF_ESCAPE);
+        w.put(1, 1);
+        w.put(6, 3);
+        w.put(8, (-100i32 as u32) & 0xff);
+        let b = decode(w, false, true);
+        assert_eq!(b[ZIGZAG[3] as usize], -100);
+        for bad in [0u32, 0x80] {
+            let mut w = BitWriter::new();
+            put(&mut w, TCOEF_ESCAPE);
+            w.put(1, 1);
+            w.put(6, 0);
+            w.put(8, bad);
+            let bytes = w.into_bytes();
+            let mut b = [0i16; 64];
+            assert!(read_coeffs(&mut BitReader::new(&bytes), &mut b, &ZIGZAG, 0, false, true).is_err());
+        }
+    }
+
+    #[test]
+    fn run_past_the_block_is_an_error() {
+        let mut w = BitWriter::new();
+        for _ in 0..3 {
+            put(&mut w, find(TCOEF_INTER, 0, 26, 1));
+            w.put(1, 0);
+        }
+        let bytes = w.into_bytes();
+        let mut b = [0i16; 64];
+        assert!(read_coeffs(&mut BitReader::new(&bytes), &mut b, &ZIGZAG, 0, false, false).is_err());
+    }
+
+    /// dct_dc_differential (Table B-15 semantics): a leading 0 bit marks a
+    /// negative value, `code - (2^size - 1)`; sizes above 8 end in a marker.
+    #[test]
+    fn dc_differential() {
+        let cases: &[(&str, &str, i32)] = &[
+            ("011", "", 0),
+            ("11", "1", 1),
+            ("11", "0", -1),
+            ("10", "10", 2),
+            ("10", "00", -3),
+            ("0000 0000 1", "0000000000 1", -1023),
+        ];
+        for &(size, bits, v) in cases {
+            let mut w = BitWriter::new();
+            put(&mut w, size);
+            if !bits.is_empty() {
+                put(&mut w, bits);
+            }
+            let bytes = w.into_bytes();
+            assert_eq!(read_dc_diff(&mut BitReader::new(&bytes), true).unwrap(), v, "{size} {bits}");
+        }
+    }
+}

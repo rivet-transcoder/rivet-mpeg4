@@ -1155,3 +1155,102 @@ fn read_dcs(r: &mut BitReader) -> Result<[i32; 6]> {
     }
     Ok(d)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// With field DCT, luminance blocks 0 and 1 hold the macroblock's even
+    /// lines and 2 and 3 its odd lines; chrominance is unaffected.
+    #[test]
+    fn field_dct_block_placement() {
+        let mut pic = Pic::new(32, 32);
+        for k in 0..4 {
+            let blk = [10 * (k as i16 + 1); 64];
+            put_block(&mut pic, 1, 1, k, &blk, true);
+        }
+        let s = pic.ystride();
+        for r in 0..16 {
+            for c in 0..16 {
+                let k = (r & 1) * 2 + c / 8;
+                assert_eq!(pic.y[(16 + r) * s + 16 + c], 10 * (k as u8 + 1), "row {r} col {c}");
+            }
+        }
+        // Frame DCT: quadrants.
+        let mut pic = Pic::new(32, 32);
+        for k in 0..4 {
+            put_block(&mut pic, 0, 0, k, &[10 * (k as i16 + 1); 64], false);
+        }
+        assert_eq!(pic.y[s + 1], 10);
+        assert_eq!(pic.y[9 * s + 9], 40);
+    }
+
+    /// Field prediction with zero vectors from the same-parity fields is a
+    /// copy; from the opposite parity it swaps the lines.
+    #[test]
+    fn field_prediction_selects_fields() {
+        let mut pic = Pic::new(32, 32);
+        let s = pic.ystride();
+        for r in 0..32 {
+            for c in 0..32 {
+                pic.y[r * s + c] = (r * 7 + c) as u8;
+            }
+        }
+        let mut px = MbPix::new();
+        predict_fields(&pic, 1, 1, &[[0, 0]; 2], [false, true], false, false, &mut px);
+        for r in 0..16 {
+            assert_eq!(px.y[r * 16], pic.y[(16 + r) * s + 16]);
+        }
+        predict_fields(&pic, 1, 1, &[[0, 0]; 2], [true, false], false, false, &mut px);
+        assert_eq!(px.y[0], pic.y[17 * s + 16]);
+        assert_eq!(px.y[16], pic.y[16 * s + 16]);
+        // A one-line field vector moves two frame lines.
+        predict_fields(&pic, 1, 1, &[[0, 2], [0, 2]], [false, true], false, false, &mut px);
+        assert_eq!(px.y[0], pic.y[18 * s + 16]);
+        assert_eq!(px.y[16], pic.y[19 * s + 16]);
+    }
+
+    /// The frame vector a field-predicted macroblock contributes to
+    /// prediction: horizontal components averaged, vertical (in field
+    /// lines) summed.
+    #[test]
+    fn field_vectors_to_frame_vector() {
+        assert_eq!(field_to_frame([4, 3], [6, -1]), [5, 2]);
+        assert_eq!(field_to_frame([3, 1], [4, 1]), [3, 2]);
+        assert_eq!(field_to_frame([-3, 0], [-4, 0]), [-3, 0]);
+    }
+
+    /// AC prediction rescales the neighbour's coefficients to the current
+    /// quantiser with `//` (nearest, halves away from zero).
+    #[test]
+    fn ac_prediction_scaling() {
+        use crate::mbstate::ac_pred_value;
+        assert_eq!(ac_pred_value(10, 8, 8), 10);
+        assert_eq!(ac_pred_value(10, 4, 8), 5);
+        assert_eq!(ac_pred_value(3, 4, 8), 2); // 1.5 -> 2
+        assert_eq!(ac_pred_value(-3, 4, 8), -2);
+        assert_eq!(ac_pred_value(7, 10, 4), 18); // 17.5 -> 18
+        assert_eq!(ac_pred_value(1, 1, 31), 0);
+    }
+
+    #[test]
+    fn intra_dc_vlc_threshold() {
+        // Table 6-21: 0 always, 7 never, else running QP < 13, 15, ... 23.
+        assert!(use_intra_dc_vlc(0, 31));
+        assert!(!use_intra_dc_vlc(7, 1));
+        assert!(use_intra_dc_vlc(1, 12));
+        assert!(!use_intra_dc_vlc(1, 13));
+        assert!(use_intra_dc_vlc(6, 22));
+        assert!(!use_intra_dc_vlc(6, 23));
+    }
+
+    #[test]
+    fn vector_wrapping() {
+        // f_code 1: [-32, 31] half samples.
+        assert_eq!(wrap_mv(31, 1), 31);
+        assert_eq!(wrap_mv(32, 1), -32);
+        assert_eq!(wrap_mv(-33, 1), 31);
+        // f_code 3: [-128, 127].
+        assert_eq!(wrap_mv(130, 3), -126);
+    }
+}

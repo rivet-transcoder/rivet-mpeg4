@@ -678,3 +678,99 @@ pub(crate) mod texture_for_tests {
     pub(crate) use super::texture::{read_coeffs, read_dc_diff};
     pub(crate) use super::vop::read_mvd;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bits::BitWriter;
+
+    /// A short-header picture header: PSC, TR, PTYPE (sub-QCIF), PQUANT,
+    /// CPM, PEI.
+    fn picture_header(w: &mut BitWriter, tr: u32, p: bool) {
+        w.put(22, 0b0000_0000_0000_0000_1000_00);
+        w.put(8, tr);
+        w.put(1, 1); // marker
+        w.put(4, 0); // zero, split screen, document camera, freeze release
+        w.put(3, 1); // sub-QCIF
+        w.put(1, p as u32);
+        w.put(4, 0); // no optional modes
+        w.put(5, 8); // PQUANT
+        w.put(1, 0); // CPM
+        w.put(1, 0); // PEI
+    }
+
+    fn gob_header(w: &mut BitWriter, gn: u32, stuff: bool) {
+        if stuff {
+            w.align_zero(); // GSTUF
+        }
+        w.put(17, 1);
+        w.put(5, gn);
+        w.put(2, 0); // GFID
+        w.put(5, 8); // GQUANT
+    }
+
+    /// Sub-QCIF (8x6 macroblocks, one GOB per row): an intra picture whose
+    /// macroblocks are flat (INTRADC only), then a P picture of skipped
+    /// macroblocks but one moved a sample to the right.
+    #[test]
+    fn short_video_header_pictures() {
+        let mut w = BitWriter::new();
+        picture_header(&mut w, 0, false);
+        for gob in 0..6u32 {
+            if gob > 0 {
+                gob_header(&mut w, gob, gob == 3);
+            }
+            for x in 0..8u32 {
+                w.put(1, 1); // MCBPC: intra, no chroma blocks coded
+                w.put(4, 0b0011); // CBPY: none
+                for k in 0..6 {
+                    let dc = if k < 4 { 16 + (gob * 8 + x) * 3 + k } else { 128 };
+                    // INTRADC 128 is coded as 255 (1000 0000 is reserved).
+                    w.put(8, if dc == 128 { 255 } else { dc });
+                }
+            }
+        }
+        w.align_zero();
+        picture_header(&mut w, 1, true);
+        for gob in 0..6u32 {
+            for x in 0..8u32 {
+                if gob == 1 && x == 1 {
+                    w.put(1, 0); // COD: coded
+                    w.put(1, 1); // MCBPC: inter, no chroma blocks
+                    w.put(2, 0b11); // CBPY 15: inter, none coded
+                    w.put(4, 0b0010); // MVD x = +2 half samples
+                    w.put(1, 1); // MVD y = 0
+                } else {
+                    w.put(1, 1); // COD: skipped
+                }
+            }
+        }
+        w.align_zero();
+        w.put(22, 0b0000_0000_0000_0000_1111_11); // EOS
+        let bytes = w.into_bytes();
+        let mut d = Decoder::new();
+        let mut frames = d.decode(&bytes).unwrap();
+        frames.extend(d.flush());
+        assert_eq!(frames.len(), 2);
+        assert_eq!(d.stats().vops, 2);
+        assert_eq!(d.stats().concealed_vops, 0, "{:?}", d.last_error());
+        assert_eq!(d.stats().misaligned_vops, 0);
+        let (i, p) = (&frames[0], &frames[1]);
+        assert_eq!((i.width, i.height, i.time_base), (128, 96, 30000));
+        assert_eq!(p.timestamp - i.timestamp, 1001);
+        let y = |f: &Frame, x: usize, r: usize| f.plane(0)[r * 128 + x];
+        for gob in 0..6usize {
+            for x in 0..8usize {
+                let mb = (gob * 8 + x) as u8;
+                // Block 0's DC, alone: 8 * dc / 8.
+                assert_eq!(y(i, x * 16 + 2, gob * 16 + 2), 16 + mb * 3);
+                assert_eq!(y(i, x * 16 + 13, gob * 16 + 13), 16 + mb * 3 + 3);
+            }
+        }
+        // Skipped macroblocks copy; the moved one samples one to the right.
+        assert_eq!(y(p, 40, 40), y(i, 40, 40));
+        assert_eq!(y(p, 16 + 7, 16 + 3), y(i, 16 + 8, 16 + 3));
+        assert_eq!(y(p, 16 + 15, 16), y(i, 32, 16));
+        assert!(i.plane(1).iter().all(|&v| v == 128));
+    }
+}
