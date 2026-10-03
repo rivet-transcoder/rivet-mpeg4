@@ -34,6 +34,9 @@ fn main() {
     c.b_frames = 2;
     cases.push(("bframes", c, 30));
     let mut c = base(352, 288);
+    c.packet_bytes = Some(300);
+    cases.push(("packets", c, 30));
+    let mut c = base(352, 288);
     c.b_frames = 2;
     c.four_mv = true;
     c.packet_bytes = Some(400);

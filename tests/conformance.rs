@@ -256,6 +256,7 @@ fn rivet_encoder_in_xvid() {
             ("simple", 4, 52.0),
             ("four_mv", 4, 52.0),
             ("bframes", 4, 52.0),
+            ("packets", 4, 52.0),
             ("packets_b", 4, 52.0),
             ("wide_search", 4, 52.0),
             ("oddsize", 4, 52.0),

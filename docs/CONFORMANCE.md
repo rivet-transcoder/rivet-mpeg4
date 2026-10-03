@@ -34,7 +34,7 @@ against its SHA-256), builds the library and its two example programs,
   each, and `tests/conformance.rs` compares this decoder's pictures with
   Xvid's.
 - **`rivet-enc/`**: this crate's encoder (`examples/m4venc.rs`: IPPP, four
-  vectors, B-VOPs, B-VOPs with four vectors and video packets, a wide
+  vectors, B-VOPs, video packets with and without B-VOPs and four vectors, a wide
   search with a larger `vop_fcode`, an odd size, quantisers 1 and 31,
   bit-rate control) read by Xvid's decoder, against this crate's decode
   (which equals the encoder's reconstruction byte for byte).
@@ -66,7 +66,10 @@ What the comparison found:
   16 + max(`vop_fcode_forward`, `vop_fcode_backward`) bits; with both codes
   1 that is 17, and Xvid writes 18. Every B-VOP of Xvid's `slices` stream
   was concealed until the decoder accepted the longer marker there (a one
-  after a 17th zero can only be a marker).
+  after a 17th zero can only be a marker). The other way, Xvid's decoder
+  misread this crate's B-VOPs with video packets (17-bit markers) until the
+  encoder used `vop_fcode` 2 or more in streams with both, where the two
+  lengths agree.
 - **Quarter-sample interpolation.** Pictures predicted at quarter-sample
   positions that lie between two half-sample rows or columns — a
   horizontal quarter position combined with a vertical half or quarter one
