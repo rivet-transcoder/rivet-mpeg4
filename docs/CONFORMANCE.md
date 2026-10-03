@@ -20,6 +20,16 @@ Simple and Advanced Simple profiles are not among ISO's publicly available
 electronic inserts (only the Studio profile set of Amd 35 is, beside AVC
 and SVC sets that do not concern this crate), so they are not used.
 
+Searched for on 2026-10-03 and not found as public data: any stream with
+reversible VLCs or other MPEG-4 error-resilience tools (none in ISO's
+public inserts), and any H.263 stream with the Advanced Prediction mode
+(Annex F) alone. ITU-T's H.263 archive (`h263plus/bitstreams/`: the
+Intel set, the 9804 and 9807 anchors) has Annex F only together with
+Annex D or in H.263 version 2's extended picture type, both refused. So
+reversible VLCs, OBMC, Annex F, four-point GMC and field direct mode are
+checked by this crate's own encoder's streams (byte-exact round trips,
+damage recovery) and by hand-worked values, not by another encoder.
+
 ## Xvid as a black box (`tools/xvid-vectors.sh`)
 
 The script downloads Xvid 1.3.7's release tarball from xvid.com (checked
@@ -106,8 +116,10 @@ and is now covered by no external stream:
   distinguish the two readings by its content);
 - the GMC vector clip, found on an Xvid zoom whose warp outran the
   `vop_fcode` range; the synthetic source zooms too slowly to reach it;
-- data partitioning (and stuffing before its markers): neither Xvid nor
-  this crate's encoder writes it, so only the unit tests check it;
+- data partitioning from another encoder (and stuffing before its
+  markers): Xvid does not write it; this crate's encoder now does, with
+  and without reversible VLCs, so the round trips and damage tests check
+  it against that encoder only;
 - real-world H.263 damage (a video-call capture with damaged GOBs) and
   DivX packed streams in AVI; the raw packed stream above and the fuzz
   tests stand in for them;

@@ -10,8 +10,8 @@ pub enum Error {
     #[error("invalid MPEG-4 Visual data: {0}")]
     Invalid(String),
     /// Valid MPEG-4 Visual this crate does not implement, named: arbitrary
-    /// shape, interlaced coding, sprites, scalability, reversible VLCs and
-    /// the other tools the README lists as absent. A caller with another
+    /// shape, static sprites, scalability, NEWPRED and the other tools the
+    /// README lists as absent. A caller with another
     /// decoder available can hand the stream to it.
     #[error("unsupported MPEG-4 Visual feature: {0}")]
     Unsupported(String),

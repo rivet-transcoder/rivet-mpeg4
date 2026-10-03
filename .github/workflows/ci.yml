@@ -29,6 +29,8 @@ jobs:
         run: cargo test --release
       - name: Property tests with overflow checks (debug)
         run: cargo test --test fuzz
+      - name: Round-trip and RVLC damage figures
+        run: cargo test --release --test roundtrip --test error_resilience -- --nocapture
 
   # The decoder against pictures from outside this crate: the published
   # conformance streams (ITU-T's H.263 set, an ISO/IEC 14496-4 stream),

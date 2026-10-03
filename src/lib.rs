@@ -10,14 +10,17 @@
 //!   and S-VOPs, AC / DC prediction, both inverse quantisers, four-vector
 //!   macroblocks, unrestricted and quarter-sample motion vectors, global
 //!   motion compensation, interlaced field DCT and field prediction, video
-//!   packets, data partitioning, DivX-style packed bitstreams and the H.263
-//!   short video header — to 8-bit 4:2:0 [`Frame`]s in display order, with
-//!   damage concealed and counted ([`DecoderStats`]).
+//!   packets, data partitioning with reversible VLCs (read backwards after
+//!   damage), OBMC, DivX-style packed bitstreams and the H.263 short video
+//!   header (with H.263's Advanced Prediction mode) — to 8-bit 4:2:0
+//!   [`Frame`]s in display order, with damage concealed and counted
+//!   ([`DecoderStats`]).
 //! - [`Encoder`]: Simple Profile I- and P-VOPs and, on request, Advanced
-//!   Simple B-VOPs (half-sample motion search, four-vector macroblocks,
-//!   AC / DC prediction, the H.263 quantiser, video packets,
-//!   constant-quantiser or bit-rate control) that the decoder, and any
-//!   14496-2 decoder, decodes.
+//!   Simple tools — B-VOPs, quarter-sample motion, the MPEG quantiser with
+//!   matrices, interlaced coding — with four-vector macroblocks, AC / DC
+//!   prediction, video packets, data partitioning and reversible VLCs,
+//!   OBMC, the short video header, forced I-VOPs, `video_signal_type()`,
+//!   and constant-quantiser or bit-rate control.
 //!
 //! What is not implemented is refused with [`Error::Unsupported`], naming
 //! the tool; the crate README lists them.

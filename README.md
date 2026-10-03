@@ -33,11 +33,19 @@ mpeg4 = { package = "rivet-mpeg4", git = "https://github.com/rivet-transcoder/ri
 
 | | supported | refused with `Error::Unsupported` |
 |---|---|---|
-| **Headers** | visual object sequence, visual object, video object layer (in band, or from an MP4 `esds` / AVI `strf` / Matroska `CodecPrivate` via `Decoder::with_config`), GOV, VOP; quantiser matrices; complexity estimation headers (skipped); user data (DivX packing and version strings) | arbitrary shape, scalability, NEWPRED, reduced-resolution VOPs, `not_8_bit`, OBMC, the Studio and FGS object types, static sprites, sprite brightness change |
-| **Simple Profile** | I- and P-VOPs; intra AC / DC prediction; both inverse quantisers (H.263 and MPEG with matrices and mismatch control); the three escape modes; half-sample, four-vector and unrestricted motion vectors (`vop_fcode` 1–7); video packets with resync markers and header extension; data partitioning; macroblock stuffing; not-coded VOPs | reversible VLCs (data partitioning with `reversible_vlc` set) |
-| **Advanced Simple Profile** | B-VOPs (direct, interpolated, forward, backward; skipped macroblocks over not-coded ones); quarter-sample motion; global motion compensation (S-VOPs, one to three warping points, at any `sprite_warping_accuracy`); interlaced coding — field DCT, field prediction in P-, S- and B-VOPs, the alternate vertical scan | four-point (perspective) GMC; field direct mode (a direct-mode B macroblock over a field-predicted one) |
+| **Headers** | visual object sequence, visual object (with `video_signal_type()`: format, range, colour description, reported on `VolHeader::video_signal`), video object layer (in band, or from an MP4 `esds` / AVI `strf` / Matroska `CodecPrivate` via `Decoder::with_config`), GOV, VOP; quantiser matrices; complexity estimation headers (skipped); user data (DivX packing and version strings) | arbitrary shape, scalability, NEWPRED, reduced-resolution VOPs, `not_8_bit`, the Studio and FGS object types, static sprites, sprite brightness change, interlaced coding together with data partitioning |
+| **Simple Profile** | I- and P-VOPs; intra AC / DC prediction; both inverse quantisers (H.263 and MPEG with matrices and mismatch control); the three escape modes; half-sample, four-vector and unrestricted motion vectors (`vop_fcode` 1–7); video packets with resync markers and header extension; data partitioning; **reversible VLCs**, read forwards and, after damage, backwards with Annex E's recovery; macroblock stuffing; not-coded VOPs; **OBMC** (`obmc_disable` 0, 7.6.6) | — |
+| **Advanced Simple Profile** | B-VOPs (direct, interpolated, forward, backward; skipped macroblocks over not-coded ones); quarter-sample motion; global motion compensation (S-VOPs, one to **four** warping points — four is the perspective warp — at any `sprite_warping_accuracy`); interlaced coding — field DCT, field prediction in P-, S- and B-VOPs, **field direct mode**, the alternate vertical scan | — |
 | **Streams** | one access unit per call, or any buffer of whole start-code units (a raw `.m4v` read in one go); DivX-style packed bitstreams (a P-VOP and its B-VOP in one access unit, then a placeholder) | — |
-| **Short video header** | H.263 baseline pictures (sub-QCIF to 16CIF), GOB headers with and without stuffing, the H.263 escape | H.263 optional modes (UMV, SAC, AP, PB), PLUSPTYPE (H.263 version 2), CPM |
+| **Short video header** | H.263 baseline pictures (sub-QCIF to 16CIF), GOB headers with and without stuffing, the H.263 escape; beyond 14496-2's subset, H.263's **Advanced Prediction mode** (Annex F: OBMC and four vectors) | H.263's Unrestricted Motion Vector, Syntax-based Arithmetic Coding and PB-frames modes, PLUSPTYPE (H.263 version 2), CPM |
+
+Why the refusals remain: arbitrary shape, scalability, static sprites
+(and brightness change), NEWPRED, reduced resolution, `not_8_bit` and the
+Studio / FGS object types are whole further toolsets outside Simple and
+Advanced Simple, unimplemented; interlaced coding with data partitioning
+is excluded by 14496-2 itself (Annex G's table of tool combinations, note
+e: "Interlace does not support Data Partitioning nor RVLC"); H.263's other optional modes and
+version 2 are not part of MPEG-4's short video header.
 
 Output is 8-bit 4:2:0 planar [`Frame`](src/frame.rs)s — Y, then Cb, then
 Cr in one buffer, tightly packed, cropped to the VOL's width and height —
@@ -49,7 +57,11 @@ in **display order**: an I- or P-VOP is held until the next one arrives (or
 Damage inside a VOP is concealed rather than returned: the macroblocks from
 the failure to the next video packet are copied from the reference, the
 frame comes back with `concealed` set, and `Decoder::last_error` says what
-was wrong. `Decoder::stats` counts VOPs decoded, concealed, dropped
+was wrong. With reversible VLCs, a damaged texture partition is also read
+backwards from its packet's end, and the macroblocks both directions
+recovered are kept as Annex E.1.4.4.2.1's four strategies allow (the rest
+are predicted from their intact motion, or in I-VOPs rebuilt from their
+DC); `DecoderStats::rvlc_backward_mbs` and `rvlc_discarded_mbs` count them. `Decoder::stats` counts VOPs decoded, concealed, dropped
 (packed-stream placeholders, B-VOPs without references) and *misaligned*
 (decoded without error, but the macroblock data did not end where the
 VOP's stuffing begins). Header errors and unsupported tools are errors.
@@ -77,7 +89,7 @@ fetched, so only the last is still checked by an external stream):
 ## What it encodes
 
 Simple Profile I- and P-VOPs, and, with `EncoderConfig::b_frames`,
-Advanced Simple B-VOPs:
+`quarter_sample`, `quantiser` or `interlaced`, Advanced Simple:
 
 - motion: a predictive diamond search over whole samples, then half-sample
   refinement, with a rate term from the actual vector code lengths;
@@ -90,7 +102,28 @@ Advanced Simple B-VOPs:
   per macroblock when it shrinks the coefficients), all three escape modes;
 - rate: a constant quantiser (B-VOPs a quarter higher) or a bit-rate target,
   the quantiser moved per VOP by the running error;
-- optional video packets (resync markers) of a given size;
+- optional video packets (resync markers) of a given size; **data
+  partitioning**, with or without **reversible VLCs** (`data_partitioning`,
+  `reversible_vlc`);
+- **quarter-sample motion** (the search refines to quarter samples) and the
+  **MPEG quantiser** with the default or custom matrices (written in the
+  VOL);
+- **interlaced coding**: frame or field DCT per macroblock, frame or field
+  prediction (each field's vector from either reference field) in P-VOPs,
+  field direct mode in B-VOPs, either field order;
+- **OBMC** (`obmc`): `obmc_disable` 0 — the encoder plans a VOP's motion
+  before predicting, since a macroblock's overlapped prediction needs its
+  right neighbour's vectors. OBMC is outside the Simple and Advanced
+  Simple profiles, so such a stream claims a profile it exceeds;
+- the **short video header** (`short_header`): H.263 baseline pictures at
+  the five standard sizes, vectors kept inside the picture, GOB headers in
+  place of video packets; with `obmc`, H.263's Advanced Prediction mode
+  (OBMC and four vectors), which makes it an H.263 stream outside
+  14496-2's subset;
+- `Encoder::force_keyframe` makes the next frame an I-VOP; `video_signal`
+  writes `video_signal_type()` (format, range, colour primaries, transfer
+  and matrix) in the visual object header — 14496-2 carries it there, not
+  in the VOL;
 - alternating `vop_rounding_type`, so P-VOP prediction does not drift in
   one direction.
 
@@ -102,9 +135,8 @@ specific info for an `esds`). The encoder reconstructs with the decoder's
 own prediction, inverse quantisation and IDCT, and
 `EncoderConfig::keep_reconstructions` hands those pictures back.
 
-Not encoded: quarter-sample motion, GMC, interlaced coding, the MPEG
-quantiser, data partitioning, the short video header. The decoder handles
-all of them.
+Not encoded: GMC (S-VOPs), which the decoder handles; field prediction
+in B-VOPs (their non-direct macroblocks use frame prediction).
 
 ## How it is checked
 
@@ -134,6 +166,40 @@ No other implementation is run, in tests or in CI.
   reference; GMC translations against ordinary motion compensation.
 - **A hand-built short-header sequence**: GOB headers with and without
   stuffing, INTRADC, skipped and moved macroblocks.
+- **Reversible VLCs** (Table B-23, transcribed from 14496-2:2001 and
+  checked against the 1998 committee draft's event columns): every code is
+  a *core* plus one free bit, the core ending at its second `1` (a leading
+  `1`; such cores are palindromes) or third `0` (a leading `0`), a rule
+  that reads the same in either direction; the codes are exactly the
+  construction's cores in ascending order with both free bits, `0000`
+  being the escape and only the longest length cut short; codes with
+  their sign are prefix-free forwards and backwards; each column codes 169
+  distinct events with no level gaps. Every table event, and escapes (long
+  runs, levels to 2047, both signs, `last` or not), read back the same
+  forwards and backwards with the backward reader ending where the event
+  began; the illegal forms Annex E.1.4.4.1 lists (escaped level 0, an
+  escaped event the table codes, a leading `0000 0`, a missing marker) are
+  refused both ways. The four recovery strategies by hand.
+- **RVLC damage** (`tests/error_resilience.rs`): this encoder's data-
+  partitioned RVLC streams with 16 bits cleared mid-texture. A QCIF P-VOP
+  in one packet (texture 1594 bits, forward error after 648 bits / 38
+  macroblocks, backward error after 945 bits / 60 macroblocks: strategy
+  1): 33 macroblocks kept forwards, 60 backwards, 6 concealed with their
+  motion, and only 5 macroblocks differ from the encoder's reconstruction;
+  an I-VOP (16604 bits, 45 / 53 macroblocks): 46 forwards, 53 backwards,
+  one rebuilt from its DC; with 200-byte packets, the damage stays in its
+  packet (one macroblock differs). Every other frame is exact.
+- **GMC with four points**: a translation-only trajectory equals ordinary
+  motion compensation sample for sample (luma and chroma); an affine one
+  matches the three-point warp to one unit; a true perspective one puts
+  the corners where the trajectory says and the centre where the
+  diagonals cross; a hand-built S-VOP of not-coded macroblocks decodes to
+  the warp of its reference.
+- **Field direct mode** (7.7.2.3, Table 7-12) by hand: field distances for
+  both field orders and reference parities, and the four vectors.
+- **OBMC**: the weights sum to 8 everywhere; equal vectors give plain
+  motion compensation; the remote-vector rules (picture edge and intra:
+  own vector; not coded: zero; never the macroblock below).
 - **Round trips** (`tests/roundtrip.rs`): the decoder must reproduce the
   encoder's reconstruction **byte for byte** (any difference is a desync
   between the two sides), and the PSNR against the source is gated loosely.
@@ -142,7 +208,20 @@ No other implementation is run, in tests or in CI.
   at a fifth of the all-intra size; four vectors 42.7; with B-VOPs 42.6–42.8
   and about 20% smaller than IPPP; video packets of 300 bytes at CIF 43.4;
   odd sizes down to 1x1; bit-rate targets of 100, 300 and 700 kb/s at CIF
-  land at 112, 332 and 765 kb/s.
+  land at 112, 332 and 765 kb/s. Every round trip also requires each VOP
+  to end exactly at its stuffing. The tools added on 2026-10-03, all byte
+  exact: data partitioning (CIF, 4MV) 43.45 dB, 27.6 KB for 12 frames,
+  28.9 KB with RVLC, 29.9 KB with RVLC and 300-byte packets; the MPEG
+  quantiser 47.7 / 42.7 / 34.8 dB at quantisers 2 / 5 / 20 (default
+  matrices; flat and custom ones too); quarter-sample 42.4 dB (with two
+  B-VOPs 42.4); all Advanced Simple tools with data partitioning, RVLC and
+  packets at CIF 43.5; short header 41.7 (sub-QCIF), 42.5 (QCIF), 43.3 (CIF
+  with GOB headers) dB; interlaced CIF (synthetic interlaced content)
+  41.4 dB at under a quarter of the progressive coding's size, with B-VOPs
+  39.4–39.5 dB using field direct mode (2 to 84 macroblocks per run), with
+  quarter-sample 40.5; OBMC 42.6–42.8 dB (one or four vectors, quarter-
+  sample, packets); H.263 Advanced Prediction 42.5 / 42.8 dB (one / four
+  vectors); forced I-VOPs land where asked, with and without B-VOPs.
 - **Published conformance streams** (`tests/conformance.rs`, fetched by
   `tools/fetch-conformance.sh` from ITU-T's and ISO's servers; CI fetches
   them and requires them): baseline H.263 (the short video header) from
@@ -212,11 +291,41 @@ from the standard alone, this is what the code does and what decided it:
   components to later prediction.
 - *Complexity estimation*: which statistics each VOP type carries
   (unexercised).
+- *RVLC escape*: Table B-23 prints the escape as `0000s` at both ends and
+  its syntax as `0000 1` … `0000 s`; E.1.4.4.1 calls a leading escape other
+  than `0000 1` an error when reading backwards. Both directions here
+  require `0000 1` in front, so they accept the same streams.
+- *RVLC recovery*: `f_mb(S)` counts a macroblock "once one of its bits is
+  decoded", so a strategy can name the macroblock in which the error was
+  found; the kept counts are capped at the macroblocks each direction
+  decoded whole (`N1`, `N2`). A partition read forwards without an error
+  but not ending at the stuffing before the next resync marker is damaged
+  (E.1.4.4.1's stuffing rule); when both directions read the whole
+  partition (an error neither direction localised), strategy 4 keeps
+  nothing. E.1.4.4.2.2's concealment of every intra macroblock of a damaged
+  packet is applied in P- and S-VOPs; in I-VOPs, where it would discard
+  everything, the strategies decide.
+- *Field direct mode*: the text computes the backward prediction from
+  `mvb[1]` for both fields, read here as `mvb[0]` for the top field and
+  `mvb[1]` for the bottom (the forward one uses both); the `MVD[i]` of the
+  backward rule as the one `MVD[0]`; Table 7-12's `d[i]` as the position of
+  field `i` in its frame minus that of the field it was predicted from (the
+  printed table, garbled in the copy read, agrees wherever legible);
+  `Tframe` as the first B-VOP's distance from its past reference after the
+  VOL.
+- *OBMC across packets*: 7.6.6 bounds remote vectors only by the VOP and,
+  in S-VOPs, by `mcsel`; video packet and GOB boundaries are crossed (as
+  H.263 F.3 says outside slice mode).
+- *Four-point GMC*: chroma uses 7.8.5's chroma formula with `Ic = 4 ic +
+  1`; a zero denominator (disallowed) falls back to no warp.
 
 ## Provenance and licensing
 
-Written from ISO/IEC 14496-2 and ITU-T H.263 and published literature
-(IEEE Std 1180-1990 for the IDCT test); **no MPEG-4 Part 2 or H.263
+Written from ISO/IEC 14496-2 (the 2001 edition's text, and the 1998
+committee draft's, for the reversible VLC table, the field direct, OBMC,
+GMC and error-resilience clauses) and ITU-T H.263 (the 01/2005 edition,
+for Annex F) and published literature (IEEE Std 1180-1990 for the IDCT
+test); **no MPEG-4 Part 2 or H.263
 implementation's source was read** — not FFmpeg's, Xvid, DivX, the MPEG-4
 reference software or any other. The VLC tables, scans and default
 matrices are the standard's data, transcribed. Xvid's encoder and decoder

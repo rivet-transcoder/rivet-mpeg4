@@ -102,8 +102,9 @@ pub struct EncoderConfig {
     /// MPEG quantiser and data partitioning.
     pub short_header: bool,
     /// Overlapped block motion compensation for P-VOPs: in an MPEG-4
-    /// stream, `obmc_disable` 0 (7.6.6 — a tool no profile of 14496-2
-    /// Annex N includes, so such streams claim a profile they exceed); with
+    /// stream, `obmc_disable` 0 (7.6.6 — a tool outside the Simple and
+    /// Advanced Simple profiles, so such streams claim a profile they
+    /// exceed); with
     /// the short video header, H.263's Advanced Prediction mode (Annex F,
     /// which also allows four vectors), making the stream H.263 rather
     /// than 14496-2's short-header subset.
