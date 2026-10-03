@@ -1,6 +1,6 @@
 # rivet-mpeg4
 
-[![CI](https://github.com/rivet-transcoder/rivet-mpeg4/actions/workflows/ci.yml/badge.svg)](https://github.com/rivet-transcoder/rivet-mpeg4/actions/workflows/ci.yml)
+[![CI](https://github.com/safewords/rivet-mpeg4/actions/workflows/ci.yml/badge.svg)](https://github.com/safewords/rivet-mpeg4/actions/workflows/ci.yml)
 
 An **MPEG-4 Part 2 Visual** (ISO/IEC 14496-2) decoder and encoder in Rust:
 no C, no system libraries, no build script, nothing to install on a build
@@ -13,7 +13,7 @@ packed bitstreams), and every VOP of the 23 real-world streams it was
 checked on parses to the bit, except where the files themselves are cut
 short or damaged (the figures are [below](#how-it-is-checked)).
 
-Written for the **[rivet](https://github.com/rivet-transcoder/rivet)**
+Written for the **[rivet](https://github.com/safewords/rivet)**
 transcoder, where it is the MPEG-4 Visual codec on both sides: the decoder
 that lets a DivX / Xvid / 3GP source be transcoded without a GPU that takes
 MPEG-4, and the encoder for targets that still want MPEG-4 Part 2. Usable on
@@ -26,7 +26,7 @@ dependency (`thiserror`), no features, no build script.
 
 ```toml
 [dependencies]
-mpeg4 = { package = "rivet-mpeg4", git = "https://github.com/rivet-transcoder/rivet-mpeg4", branch = "develop" }
+mpeg4 = { package = "rivet-mpeg4", git = "https://github.com/safewords/rivet-mpeg4", branch = "develop" }
 ```
 
 ## What it decodes
