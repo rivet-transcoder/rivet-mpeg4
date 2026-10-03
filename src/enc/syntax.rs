@@ -18,6 +18,15 @@ pub(crate) struct MbSyntax {
     /// The short video header's syntax (H.263 baseline): no `ac_pred_flag`,
     /// `dc` holds 8-bit INTRADC codes, H.263's escape.
     pub sh: bool,
+    /// Interlaced VOL: `interlaced_information()` is written.
+    pub interlaced: bool,
+    /// `dct_type`: field DCT (written when the macroblock is intra or has
+    /// coded blocks).
+    pub field_dct: bool,
+    /// `field_prediction` and, when set, the reference field of the top
+    /// and bottom fields (true: bottom); `mvd` then holds the two field
+    /// vectors' differences.
+    pub field_pred: Option<[bool; 2]>,
     /// In a P-VOP (the `not_coded` bit and the P MCBPC table).
     pub p: bool,
     /// `not_coded` (P-VOPs): nothing else is written.
@@ -46,6 +55,9 @@ impl MbSyntax {
     pub fn new(p: bool, fcode: u32) -> MbSyntax {
         MbSyntax {
             sh: false,
+            interlaced: false,
+            field_dct: false,
+            field_pred: None,
             p,
             not_coded: false,
             mb_type: 0,
@@ -125,6 +137,19 @@ impl MbSyntax {
         }
         self.cbpy(w);
         self.dquant(w);
+        if self.interlaced {
+            // interlaced_information()
+            if self.intra() || self.cbp != 0 {
+                w.put(1, self.field_dct as u32);
+            }
+            if !self.intra() && self.mb_type < 2 {
+                w.put(1, self.field_pred.is_some() as u32);
+                if let Some([t, b]) = self.field_pred {
+                    w.put(1, t as u32);
+                    w.put(1, b as u32);
+                }
+            }
+        }
         self.mvs(w);
         for k in 0..6 {
             if self.intra() && self.sh {

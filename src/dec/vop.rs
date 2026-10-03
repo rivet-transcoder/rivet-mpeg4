@@ -3,7 +3,7 @@
 //! and reconstruction (clause 7.4 texture, 7.6 motion compensation).
 
 use crate::bits::BitReader;
-use crate::error::{Error, Result, invalid, unsupported};
+use crate::error::{Error, Result, invalid};
 use crate::frame::VopType;
 use crate::headers::{VolHeader, VopHeader};
 use crate::idct::idct;
@@ -26,6 +26,9 @@ pub(crate) struct Motion {
     pub mv: Vec<[i16; 2]>,
     /// Interlaced: field-predicted macroblocks.
     pub field: Vec<bool>,
+    /// Interlaced: their field vectors and reference fields.
+    pub field_mv: Vec<[[i16; 2]; 2]>,
+    pub field_ref: Vec<[bool; 2]>,
 }
 
 impl Motion {
@@ -36,6 +39,20 @@ impl Motion {
             kind: vec![MbKind::Intra; mbw * mbh],
             mv: vec![[0, 0]; 4 * mbw * mbh],
             field: vec![false; mbw * mbh],
+            field_mv: vec![[[0, 0]; 2]; mbw * mbh],
+            field_ref: vec![[false; 2]; mbw * mbh],
+        }
+    }
+
+    /// The motion a P- or S-VOP left in `st`.
+    pub fn of(st: &MbState) -> Motion {
+        Motion {
+            mbw: st.mbw,
+            kind: st.kind.clone(),
+            mv: st.mv.clone(),
+            field: st.field.clone(),
+            field_mv: st.field_mv.clone(),
+            field_ref: st.field_ref.clone(),
         }
     }
 }
@@ -399,10 +416,16 @@ pub(crate) struct VopDec<'a> {
     /// Interlaced: read `dct_type` for every coded P/S-VOP macroblock, not
     /// only for intra ones and those with coded blocks (early Xvid).
     pub dct_type_always: bool,
+    /// B-VOPs: the display times (ticks) of the past reference, this VOP
+    /// and the future reference, and the frame period `Tframe` (7.7.2.3),
+    /// for field direct mode.
+    pub field_times: [i64; 4],
     /// Reversible VLCs: macroblocks whose texture was recovered by
     /// decoding backwards, and macroblocks whose texture was discarded.
     pub rvlc_backward_mbs: u64,
     pub rvlc_discarded_mbs: u64,
+    /// B-VOP macroblocks predicted in field direct mode.
+    pub field_direct_mbs: u64,
 }
 
 impl VopDec<'_> {
@@ -727,6 +750,9 @@ impl VopDec<'_> {
             }
         }
         self.st.field[mb] = h.field_pred;
+        if h.field_pred {
+            self.st.field_ref[mb] = h.field_ref;
+        }
         self.st.qp[mb] = self.qp as u8;
         if intra {
             self.st.set_mb_mv(mbx, mby, [0, 0]);
@@ -738,6 +764,7 @@ impl VopDec<'_> {
             let pred = self.st.mv_pred(mbx, mby, 0, self.slice);
             let (mvs, frame) = read_field_mvs(r, pred, self.hdr.fcode_forward)?;
             h.field_mvs = mvs;
+            self.st.field_mv[mb] = mvs.map(|v| [v[0] as i16, v[1] as i16]);
             self.st.set_mb_mv(mbx, mby, frame);
             h.mvs = [frame; 4];
         } else if h.four {
@@ -1272,22 +1299,38 @@ impl VopDec<'_> {
             }
         }
         if t == BType::Direct {
-            if col.field[mb] {
-                return Err(unsupported(
-                    "field direct mode (a B-VOP macroblock over a field-predicted one)",
-                ));
-            }
             // MVDB: absent (zero) when modb is 1, else coded with f_code 1.
             let mvd = if modb_one {
                 [0, 0]
             } else {
                 [read_mvd(r, 1)?, read_mvd(r, 1)?]
             };
-            let (mvf, mvb) = direct_vectors(col, mbx, mby, mvd, self.trb, self.trd);
-            predict_mb(fwd, mbx, mby, &mvf, true, false, qpel, &mut px);
-            let mut pb = MbPix::new();
-            predict_mb(bwd, mbx, mby, &mvb, true, false, qpel, &mut pb);
-            px.average(&pb);
+            if col.field[mb] && col.kind[mb] == MbKind::Inter {
+                let (trb, trd) = field_direct_distances(
+                    self.field_times,
+                    self.hdr.top_field_first,
+                    col.field_ref[mb],
+                );
+                let (mvf, mvb) = field_direct_vectors(col.field_mv[mb], mvd, trb, trd);
+                field_direct_predict(
+                    fwd,
+                    bwd,
+                    mbx,
+                    mby,
+                    &mvf,
+                    &mvb,
+                    col.field_ref[mb],
+                    qpel,
+                    &mut px,
+                );
+                self.field_direct_mbs += 1;
+            } else {
+                let (mvf, mvb) = direct_vectors(col, mbx, mby, mvd, self.trb, self.trd);
+                predict_mb(fwd, mbx, mby, &mvf, true, false, qpel, &mut px);
+                let mut pb = MbPix::new();
+                predict_mb(bwd, mbx, mby, &mvb, true, false, qpel, &mut pb);
+                px.average(&pb);
+            }
         } else if field_pred {
             let mut mvs = [[[0, 0]; 2]; 2];
             for (d, refd) in [(0, fwd), (1, bwd)] {
@@ -1596,6 +1639,88 @@ pub(crate) fn rvlc_strategy(
     (front.clamp(0, n) as usize, back.clamp(0, n) as usize)
 }
 
+/// The temporal distances of field direct mode (7.7.2.3), in field
+/// periods, for the B-VOP's top (0) and bottom (1) fields: `TRB[i] =
+/// 2 (T(cur) // Tframe - T(past) // Tframe) + d[i]` and likewise `TRD[i]`
+/// from the future reference, where `d[i]` (Table 7-12) is how many field
+/// periods field `i` lies after the past reference field the co-located
+/// macroblock's field `i` was predicted from: the fields' order in the
+/// frame (`top_field_first`) decides which comes first.
+pub(crate) fn field_direct_distances(
+    [past, cur, future, tframe]: [i64; 4],
+    top_field_first: bool,
+    refs: [bool; 2],
+) -> ([i64; 2], [i64; 2]) {
+    let tf = tframe.max(1);
+    let rd = |t: i64| crate::mbstate::round_div64(t, tf);
+    let frames_b = rd(cur) - rd(past);
+    let frames_d = rd(future) - rd(past);
+    // Position of a field within its frame, in field periods.
+    let pos = |bottom: bool| (bottom != !top_field_first) as i64;
+    let mut trb = [0; 2];
+    let mut trd = [0; 2];
+    for i in 0..2 {
+        let delta = pos(i == 1) - pos(refs[i]);
+        trb[i] = 2 * frames_b + delta;
+        trd[i] = 2 * frames_d + delta;
+    }
+    (trb, trd)
+}
+
+/// The four field vectors of a field direct macroblock (7.7.2.3) from the
+/// co-located macroblock's field vectors `mv` and the one delta `mvd`:
+/// `mvf[i] = TRB[i] MV[i] / TRD[i] + MVD`, `mvb[i] = (TRB[i] - TRD[i])
+/// MV[i] / TRD[i]` where `MVD` is zero, else `mvf[i] - MV[i]`.
+pub(crate) fn field_direct_vectors(
+    mv: [[i16; 2]; 2],
+    mvd: [i32; 2],
+    trb: [i64; 2],
+    trd: [i64; 2],
+) -> ([[i32; 2]; 2], [[i32; 2]; 2]) {
+    let mut f = [[0; 2]; 2];
+    let mut b = [[0; 2]; 2];
+    for i in 0..2 {
+        for j in 0..2 {
+            let m = mv[i][j] as i64;
+            let scaled = if trd[i] != 0 { trb[i] * m / trd[i] } else { 0 };
+            let fv = (scaled + mvd[j] as i64).clamp(-(1 << 16), 1 << 16);
+            let bv = if mvd[j] == 0 {
+                if trd[i] != 0 {
+                    (trb[i] - trd[i]) * m / trd[i]
+                } else {
+                    0
+                }
+            } else {
+                fv - m
+            };
+            f[i][j] = fv as i32;
+            b[i][j] = bv.clamp(-(1 << 16), 1 << 16) as i32;
+        }
+    }
+    (f, b)
+}
+
+/// Field direct prediction: each field forward from the past reference
+/// field the co-located macroblock's field used, backward from the same
+/// field of the future reference, averaged.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn field_direct_predict(
+    fwd: &Pic,
+    bwd: &Pic,
+    mbx: usize,
+    mby: usize,
+    mvf: &[[i32; 2]; 2],
+    mvb: &[[i32; 2]; 2],
+    refs: [bool; 2],
+    qpel: bool,
+    out: &mut MbPix,
+) {
+    predict_fields(fwd, mbx, mby, mvf, refs, false, qpel, out);
+    let mut pb = MbPix::new();
+    predict_fields(bwd, mbx, mby, mvb, [false, true], false, qpel, &mut pb);
+    out.average(&pb);
+}
+
 /// Whether what follows the last macroblock is the stuffing that should
 /// be there: up to the byte boundary, `next_start_code()`'s zero then ones
 /// (zeros, and ones without the zero, are accepted too; zeros are the
@@ -1847,5 +1972,36 @@ mod tests {
             rvlc_strategy(1000, 10, 1000, 1000, 10, 10, mbs, mbs),
             (0, 0)
         );
+    }
+
+    /// Field direct mode by hand (7.7.2.3, Table 7-12). Frames one tick
+    /// apart; past reference at 0, B-VOP at 1, future at 3: two field
+    /// periods per frame. Co-located top field predicted from the past
+    /// bottom field, bottom field from the past top field.
+    #[test]
+    fn field_direct_mode() {
+        // Top field first: the top field is first in the frame.
+        let (trb, trd) = field_direct_distances([0, 1, 3, 1], true, [true, false]);
+        // Top field (position 0) from a bottom field (position 1): -1.
+        // Bottom field (1) from a top field (0): +1.
+        assert_eq!((trb, trd), ([1, 3], [5, 7]));
+        // Bottom field first reverses the positions.
+        let (trb, trd) = field_direct_distances([0, 1, 3, 1], false, [true, false]);
+        assert_eq!((trb, trd), ([3, 1], [7, 5]));
+        // Same-parity references: whole frames.
+        let (trb, trd) = field_direct_distances([0, 1, 3, 1], true, [false, true]);
+        assert_eq!((trb, trd), ([2, 2], [6, 6]));
+        // Times in 1001ths at 30000 ticks a second: Tframe 1001.
+        let (trb, trd) = field_direct_distances([0, 1001, 3003, 1001], true, [false, true]);
+        assert_eq!((trb, trd), ([2, 2], [6, 6]));
+        // The vectors: MV = (10, -6) and (4, 8), TRB 2 / TRD 6, MVD 0:
+        // mvf = 2 MV / 6, mvb = -4 MV / 6, truncating.
+        let (f, b) = field_direct_vectors([[10, -6], [4, 8]], [0, 0], [2, 2], [6, 6]);
+        assert_eq!(f, [[3, -2], [1, 2]]);
+        assert_eq!(b, [[-6, 4], [-2, -5]]);
+        // With MVD (1, 0): mvf x gains 1 and mvb x = mvf x - MV x.
+        let (f, b) = field_direct_vectors([[10, -6], [4, 8]], [1, 0], [2, 2], [6, 6]);
+        assert_eq!(f, [[4, -2], [2, 2]]);
+        assert_eq!(b, [[-6, 4], [-2, -5]]);
     }
 }

@@ -797,6 +797,7 @@ pub(crate) struct VolParams {
     pub reversible_vlc: bool,
     pub video_signal: Option<VideoSignal>,
     pub quarter_sample: bool,
+    pub interlaced: bool,
     /// The MPEG quantiser and its intra and non-intra matrices (raster).
     pub mpeg_quant: Option<([u8; 64], [u8; 64])>,
 }
@@ -880,7 +881,7 @@ pub(crate) fn write_config(p: &VolParams) -> Vec<u8> {
     w.put(1, 1);
     w.put(13, p.height);
     w.put(1, 1);
-    w.put(1, 0); // interlaced
+    w.put(1, p.interlaced as u32);
     w.put(1, 1); // obmc_disable
     w.put(if verid2 { 2 } else { 1 }, 0); // sprite_enable
     w.put(1, 0); // not_8_bit
@@ -950,7 +951,12 @@ pub(crate) fn write_short_header(w: &mut BitWriter, tr: u32, format: u32, p: boo
 }
 
 /// A VOP header up to the first macroblock.
-pub(crate) fn write_vop_header(w: &mut BitWriter, time_increment_bits: u32, h: &VopHeader) {
+pub(crate) fn write_vop_header(
+    w: &mut BitWriter,
+    time_increment_bits: u32,
+    h: &VopHeader,
+    interlaced: bool,
+) {
     put_start_code(w, sc::VOP);
     w.put(
         2,
@@ -976,6 +982,10 @@ pub(crate) fn write_vop_header(w: &mut BitWriter, time_increment_bits: u32, h: &
         w.put(1, h.rounding as u32);
     }
     w.put(3, h.intra_dc_vlc_thr);
+    if interlaced {
+        w.put(1, h.top_field_first as u32);
+        w.put(1, h.alternate_vertical_scan as u32);
+    }
     w.put(5, h.quant);
     if h.vop_type != VopType::I {
         w.put(3, h.fcode_forward);
@@ -1019,6 +1029,7 @@ mod tests {
                 colour: Some(ColourDescription::SMPTE170M),
             }),
             quarter_sample: false,
+            interlaced: false,
             mpeg_quant: None,
         };
         let b = write_config(&p);
@@ -1071,7 +1082,7 @@ mod tests {
                 alternate_vertical_scan: false,
             };
             let mut w = BitWriter::new();
-            write_vop_header(&mut w, vol.time_increment_bits, &h);
+            write_vop_header(&mut w, vol.time_increment_bits, &h, false);
             let b = w.into_bytes();
             assert_eq!(&b[..4], &[0, 0, 1, sc::VOP]);
             let got = parse_vop(&mut BitReader::new(&b[4..]), &vol).unwrap();
@@ -1103,6 +1114,7 @@ mod tests {
                 reversible_vlc: true,
                 video_signal: None,
                 quarter_sample: q,
+                interlaced: false,
                 mpeg_quant: Some(matrices),
             };
             let b = write_config(&p);

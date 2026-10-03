@@ -9,8 +9,12 @@ use mpeg4::Frame;
 /// chroma that moves with them — content that exercises half-sample
 /// motion, intra decisions and every block.
 pub fn synth(w: u32, h: u32, t: u32) -> Frame {
+    synth_at(w, h, t as f64)
+}
+
+/// [`synth`] at any time.
+pub fn synth_at(w: u32, h: u32, tf: f64) -> Frame {
     let mut f = Frame::new(w, h);
-    let tf = t as f64;
     let (dx, dy) = (tf * 1.5, tf * 0.75);
     let (sx, sy) = (w as f64 * 0.6 - tf * 2.0, h as f64 * 0.3 + tf);
     let wy = w as usize;
@@ -39,6 +43,27 @@ pub fn synth(w: u32, h: u32, t: u32) -> Frame {
                 let v = 128.0 + 30.0 * (xf * 0.05 + phase).sin() + 20.0 * (yf * 0.04).cos();
                 p[r * cw as usize + c] = v.clamp(0.0, 255.0) as u8;
             }
+        }
+    }
+    f
+}
+
+/// An interlaced picture of [`synth`]'s scene moving `speed` times as
+/// fast: the top field's lines sampled at `t`, the bottom field's half a
+/// frame later (with `top_first`; the other way round without).
+pub fn synth_interlaced(w: u32, h: u32, t: u32, speed: f64, top_first: bool) -> Frame {
+    let early = synth_at(w, h, t as f64 * speed);
+    let late = synth_at(w, h, (t as f64 + 0.5) * speed);
+    let mut f = Frame::new(w, h);
+    let (cw, _) = Frame::chroma_size(w, h);
+    for i in 0..3 {
+        let width = if i == 0 { w as usize } else { cw as usize };
+        let (a, b) = (early.plane(i).to_vec(), late.plane(i).to_vec());
+        let p = f.plane_mut(i);
+        for (r, row) in p.chunks_mut(width).enumerate() {
+            let bottom = r & 1 == 1;
+            let src = if bottom == top_first { &b } else { &a };
+            row.copy_from_slice(&src[r * width..r * width + width]);
         }
     }
     f

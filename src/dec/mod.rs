@@ -131,6 +131,9 @@ pub struct Decoder {
     /// Interlaced streams whose P-VOPs carry `dct_type` in every coded
     /// macroblock (see `VopDec::dct_type_always`).
     dct_type_always: bool,
+    /// `Tframe` of field direct mode: the first B-VOP's distance from its
+    /// past reference (7.7.2.3).
+    tframe: Option<i64>,
 }
 
 /// Counts a [`Decoder`] keeps, for monitoring a stream's health.
@@ -154,6 +157,9 @@ pub struct DecoderStats {
     /// Reversible VLCs: macroblocks of damaged video packets whose texture
     /// was discarded (Annex E.1.4.4.2) and concealed.
     pub rvlc_discarded_mbs: u64,
+    /// Interlaced B-VOP macroblocks predicted in field direct mode (direct
+    /// mode over a field-predicted macroblock, 7.7.2.3).
+    pub field_direct_mbs: u64,
 }
 
 impl Default for Decoder {
@@ -194,6 +200,7 @@ impl Decoder {
             time_bits: None,
             divx_version: None,
             dct_type_always: false,
+            tframe: None,
         }
     }
 
@@ -358,6 +365,7 @@ impl Decoder {
         }
         self.time_bits = None;
         self.dct_type_always = false;
+        self.tframe = None;
         self.quant = Quant {
             mpeg: vol.mpeg_quant,
             intra_matrix: vol.intra_matrix,
@@ -483,10 +491,8 @@ impl Decoder {
         let r = RefPic {
             pic: f.pic.clone(),
             motion: Motion {
-                mbw,
                 kind: vec![MbKind::Skipped; mbw * mbh],
-                mv: vec![[0, 0]; 4 * mbw * mbh],
-                field: vec![false; mbw * mbh],
+                ..Motion::intra(mbw, mbh)
             },
             time,
             vop_type: h.vop_type,
@@ -523,6 +529,12 @@ impl Decoder {
             (Some(p), Some(f)) if is_b => ((time - p.time) as i32, (f.time - p.time) as i32),
             _ => (0, 0),
         };
+        let mut field_times = [0; 4];
+        if is_b && let (Some(p), Some(f)) = (&self.past, &self.future) {
+            // Tframe: the first B-VOP's distance from its past reference.
+            let tframe = *self.tframe.get_or_insert(time - p.time);
+            field_times = [p.time, time, f.time, tframe];
+        }
         let st = self
             .st
             .as_mut()
@@ -559,8 +571,10 @@ impl Decoder {
             error: None,
             tail_ok: false,
             dct_type_always: self.dct_type_always,
+            field_times,
             rvlc_backward_mbs: 0,
             rvlc_discarded_mbs: 0,
+            field_direct_mbs: 0,
         };
         d.run(r);
         if d.error.is_some() && vol.interlaced && !self.dct_type_always {
@@ -582,6 +596,7 @@ impl Decoder {
         let error = d.error.take();
         self.stats.rvlc_backward_mbs += d.rvlc_backward_mbs;
         self.stats.rvlc_discarded_mbs += d.rvlc_discarded_mbs;
+        self.stats.field_direct_mbs += d.field_direct_mbs;
         let concealed = error.is_some();
         self.stats.vops += 1;
         if concealed {
@@ -603,12 +618,7 @@ impl Decoder {
         let motion = if h.vop_type == VopType::I {
             Motion::intra(st.mbw, st.mbh)
         } else {
-            Motion {
-                mbw: st.mbw,
-                kind: st.kind.clone(),
-                mv: st.mv.clone(),
-                field: st.field.clone(),
-            }
+            Motion::of(st)
         };
         self.push_ref(RefPic {
             pic: cur,
@@ -798,7 +808,7 @@ mod tests {
             top_field_first: false,
             alternate_vertical_scan: false,
         };
-        headers::write_vop_header(&mut w, 1, &h);
+        headers::write_vop_header(&mut w, 1, &h, false);
         w.stuff();
         w.into_bytes()
     }

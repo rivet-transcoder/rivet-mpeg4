@@ -13,7 +13,10 @@ mod write;
 use std::collections::VecDeque;
 
 use crate::bits::BitWriter;
-use crate::dec::vop::{MbPix, Motion, add_block, direct_vectors, predict_mb, put_block, write_mb};
+use crate::dec::vop::{
+    MbPix, Motion, add_block, direct_vectors, field_direct_distances, field_direct_predict,
+    field_direct_vectors, field_to_frame, predict_fields, predict_mb, put_block, write_mb,
+};
 use crate::error::{Result, config};
 use crate::frame::{Frame, VopType};
 use crate::headers::{self, VideoSignal, VolParams, VopHeader, time_increment_bits};
@@ -98,6 +101,15 @@ pub struct EncoderConfig {
     /// Incompatible with B-VOPs, quarter-sample motion, four vectors, the
     /// MPEG quantiser and data partitioning.
     pub short_header: bool,
+    /// Interlaced coding (an Advanced Simple tool): each macroblock picks
+    /// frame or field DCT, P-VOP macroblocks frame or field prediction (a
+    /// vector per field, from either reference field), and B-VOP direct
+    /// mode over a field-predicted macroblock uses field direct mode.
+    /// Not with data partitioning (which 14496-2's profiles exclude) or
+    /// the short video header.
+    pub interlaced: bool,
+    /// Interlaced: `top_field_first` (the top field is the earlier one).
+    pub top_field_first: bool,
     /// Quarter-sample motion vectors (7.6.2.2's 8-tap interpolation), an
     /// Advanced Simple Profile tool: the search refines to quarter samples.
     pub quarter_sample: bool,
@@ -143,6 +155,8 @@ impl EncoderConfig {
             search_range: 15,
             four_mv: false,
             short_header: false,
+            interlaced: false,
+            top_field_first: true,
             quarter_sample: false,
             quantiser: Quantiser::H263,
             packet_bytes: None,
@@ -237,6 +251,9 @@ pub struct Encoder {
     recons: Vec<Frame>,
     /// The next frame is to be an I-VOP.
     force_intra: bool,
+    /// `Tframe` of field direct mode: the first B-VOP's distance from its
+    /// past reference, as the decoder takes it.
+    tframe: Option<i64>,
 }
 
 impl Encoder {
@@ -298,6 +315,11 @@ impl Encoder {
                 ));
             }
         }
+        if cfg.interlaced && (cfg.data_partitioning || cfg.short_header) {
+            return Err(config(
+                "interlaced coding with data partitioning or the short video header",
+            ));
+        }
         if cfg.reversible_vlc && !cfg.data_partitioning {
             return Err(config("reversible VLCs without data partitioning"));
         }
@@ -331,7 +353,7 @@ impl Encoder {
         let mbw = cfg.width.div_ceil(16) as usize;
         let mbh = cfg.height.div_ceil(16) as usize;
         let mpeg = matches!(cfg.quantiser, Quantiser::Mpeg { .. });
-        let advanced = cfg.b_frames > 0 || cfg.quarter_sample || mpeg;
+        let advanced = cfg.b_frames > 0 || cfg.quarter_sample || mpeg || cfg.interlaced;
         let (intra_matrix, inter_matrix) = match &cfg.quantiser {
             Quantiser::Mpeg { intra, inter } => (*intra, *inter),
             Quantiser::H263 => (
@@ -354,6 +376,7 @@ impl Encoder {
                 reversible_vlc: cfg.reversible_vlc,
                 video_signal: cfg.video_signal,
                 quarter_sample: cfg.quarter_sample,
+                interlaced: cfg.interlaced,
                 mpeg_quant: mpeg.then_some((intra_matrix, inter_matrix)),
             })
         };
@@ -394,6 +417,7 @@ impl Encoder {
             rc,
             recons: Vec::new(),
             force_intra: false,
+            tframe: None,
             cfg,
         })
     }
@@ -509,7 +533,7 @@ impl Encoder {
             fcode_backward: 1,
             warping: Vec::new(),
             warping_divx500: false,
-            top_field_first: false,
+            top_field_first: self.cfg.top_field_first,
             alternate_vertical_scan: false,
         };
         self.prev_ref_sec = self.last_ref_sec;
@@ -523,7 +547,7 @@ impl Encoder {
             let format = headers::short_header_format(self.cfg.width, self.cfg.height).unwrap();
             headers::write_short_header(w, tr, format, !intra, qp);
         } else {
-            headers::write_vop_header(w, self.time_bits, &hdr);
+            headers::write_vop_header(w, self.time_bits, &hdr, self.cfg.interlaced);
         }
         let mut recon = Pic::new(self.cfg.width, self.cfg.height);
         self.code_ip(w, src, &mut recon, &hdr);
@@ -537,12 +561,7 @@ impl Encoder {
         let motion = if intra {
             Motion::intra(self.st.mbw, self.st.mbh)
         } else {
-            Motion {
-                mbw: self.st.mbw,
-                kind: self.st.kind.clone(),
-                mv: self.st.mv.clone(),
-                field: vec![false; self.st.mbw * self.st.mbh],
-            }
+            Motion::of(&self.st)
         };
         self.keep(&recon, index, hdr.vop_type);
         self.past = self.future.take();
@@ -704,13 +723,15 @@ impl Encoder {
             fcode_backward: self.fcode,
             warping: Vec::new(),
             warping_divx500: false,
-            top_field_first: false,
+            top_field_first: self.cfg.top_field_first,
             alternate_vertical_scan: false,
         };
         let start = w.len_bits();
-        headers::write_vop_header(w, self.time_bits, &hdr);
+        headers::write_vop_header(w, self.time_bits, &hdr, self.cfg.interlaced);
         let trb = (t - past.time) as i32;
         let trd = (future.time - past.time) as i32;
+        let tframe = *self.tframe.get_or_insert(t - past.time);
+        let field_times = [past.time, t, future.time, tframe];
         let mut recon = Pic::new(self.cfg.width, self.cfg.height);
         let (mbw, mbh) = (self.st.mbw, self.st.mbh);
         self.new_slice();
@@ -734,6 +755,7 @@ impl Encoder {
                 mby,
                 qp,
                 (trb, trd),
+                field_times,
                 &mut pmv,
             );
         }
@@ -756,6 +778,7 @@ impl Encoder {
         mby: usize,
         qp: u32,
         (trb, trd): (i32, i32),
+        field_times: [i64; 4],
         pmv: &mut [[i32; 2]; 2],
     ) {
         let mb = mby * self.st.mbw + mbx;
@@ -830,14 +853,33 @@ impl Encoder {
         mc::average(&mut pi.y, &pb.y);
         mc::average(&mut pi.cb, &pb.cb);
         mc::average(&mut pi.cr, &pb.cr);
-        let (dmf, dmb) = direct_vectors(&future.motion, mbx, mby, [0, 0], trb, trd);
+        let fm = &future.motion;
         let mut pd = MbPix::new();
-        let mut pdb = MbPix::new();
-        predict_mb(&past.pic, mbx, mby, &dmf, true, false, qpel, &mut pd);
-        predict_mb(&future.pic, mbx, mby, &dmb, true, false, qpel, &mut pdb);
-        mc::average(&mut pd.y, &pdb.y);
-        mc::average(&mut pd.cb, &pdb.cb);
-        mc::average(&mut pd.cr, &pdb.cr);
+        if fm.field[mb] && fm.kind[mb] == MbKind::Inter {
+            // Field direct mode (7.7.2.3).
+            let refs = fm.field_ref[mb];
+            let (tb, td) = field_direct_distances(field_times, self.cfg.top_field_first, refs);
+            let (f, b) = field_direct_vectors(fm.field_mv[mb], [0, 0], tb, td);
+            field_direct_predict(
+                &past.pic,
+                &future.pic,
+                mbx,
+                mby,
+                &f,
+                &b,
+                refs,
+                qpel,
+                &mut pd,
+            );
+        } else {
+            let (dmf, dmb) = direct_vectors(fm, mbx, mby, [0, 0], trb, trd);
+            let mut pdb = MbPix::new();
+            predict_mb(&past.pic, mbx, mby, &dmf, true, false, qpel, &mut pd);
+            predict_mb(&future.pic, mbx, mby, &dmb, true, false, qpel, &mut pdb);
+            mc::average(&mut pd.y, &pdb.y);
+            mc::average(&mut pd.cb, &pdb.cb);
+            mc::average(&mut pd.cr, &pdb.cr);
+        }
         let mut ys = [0u8; 256];
         luma_mb(src, mbx, mby, &mut ys);
         let sad = |p: &[u8; 256]| -> u32 {
@@ -869,11 +911,12 @@ impl Encoder {
             BMode::Backward => pb,
             BMode::Interpolate => pi,
         };
+        let field_dct = self.cfg.interlaced && prefer_field_dct(&luma_residual(src, mbx, mby, &px));
         let mut levels = [[0i16; 64]; 6];
         let mut cbp = 0u8;
         for (k, lv) in levels.iter_mut().enumerate() {
-            let s = source_block(src, mbx, mby, k);
-            let p = pred_block(&px, k);
+            let s = source_block_f(src, mbx, mby, k, field_dct);
+            let p = pred_block_f(&px, k, field_dct);
             for i in 0..64 {
                 lv[i] = s[i] - p[i];
             }
@@ -900,6 +943,15 @@ impl Encoder {
                     w.put(1, 0); // dbquant: no change
                 }
             }
+            if self.cfg.interlaced {
+                // interlaced_information(): frame prediction only.
+                if cbp != 0 {
+                    w.put(1, field_dct as u32);
+                }
+                if mode != BMode::Direct {
+                    w.put(1, 0); // field_prediction
+                }
+            }
             if matches!(mode, BMode::Forward | BMode::Interpolate) {
                 self.put_mv(w, mvf, pmv[0]);
                 pmv[0] = mvf;
@@ -923,7 +975,7 @@ impl Encoder {
             let mut rec = *lv;
             self.quant.inter(&mut rec, qp);
             idct(&mut rec);
-            add_block(recon, mbx, mby, k, &rec, false);
+            add_block(recon, mbx, mby, k, &rec, field_dct);
         }
     }
 
@@ -940,11 +992,17 @@ impl Encoder {
     ) -> MbSyntax {
         let mb = mby * self.st.mbw + mbx;
         self.st.kind[mb] = MbKind::Intra;
+        self.st.field[mb] = false;
         self.st.set_mb_mv(mbx, mby, [0, 0]);
+        let field_dct = self.cfg.interlaced && {
+            let mut ys = [0u8; 256];
+            luma_mb(src, mbx, mby, &mut ys);
+            prefer_field_dct(&ys.map(|v| v as i16))
+        };
         let mut levels = [[0i16; 64]; 6];
         let mut preds: [Option<IntraPred>; 6] = [None; 6];
         for k in 0..6 {
-            let mut b = source_block(src, mbx, mby, k);
+            let mut b = source_block_f(src, mbx, mby, k, field_dct);
             fdct(&mut b);
             let scaler = dc_scaler(qp, k < 4) as i32;
             let dc = round_div(b[0] as i32, scaler).clamp(0, 2047 / scaler);
@@ -1002,9 +1060,11 @@ impl Encoder {
             let mut rec = *lv;
             self.quant.intra(&mut rec, qp, dc_scaler(qp, k < 4));
             idct(&mut rec);
-            put_block(recon, mbx, mby, k, &rec, false);
+            put_block(recon, mbx, mby, k, &rec, field_dct);
         }
         MbSyntax {
+            interlaced: self.cfg.interlaced,
+            field_dct,
             mb_type: 3,
             cbp,
             ac_pred,
@@ -1116,12 +1176,45 @@ impl Encoder {
         }
         let mut px = MbPix::new();
         let qpel = self.cfg.quarter_sample;
-        predict_mb(rf, mbx, mby, &mvs, four, h.rounding, qpel, &mut px);
+        // Interlaced: field prediction when its two vectors predict better
+        // than the frame vector, rate included.
+        let mut field: Option<([[i32; 2]; 2], [bool; 2])> = None;
+        if self.cfg.interlaced && !four {
+            let fp = [pred0[0], pred0[1] >> 1];
+            let start = [mv[0], mv[1] >> 1];
+            let mut fsad = 0;
+            let mut fmv = [[0; 2]; 2];
+            let mut fref = [false; 2];
+            for f in 0..2 {
+                let mut best = (u32::MAX, [0, 0], false);
+                for parity in [f == 1, f != 1] {
+                    let (v, sad) =
+                        self.search_field(src, rf, mbx, mby, f, parity, start, h.rounding);
+                    let c = sad + qp * self.mv_bits(v, fp);
+                    if c < best.0 {
+                        best = (c, v, parity);
+                    }
+                }
+                fsad += best.0;
+                fmv[f] = best.1;
+                fref[f] = best.2;
+            }
+            if fsad + 2 * qp < sad16 + qp * self.mv_bits(mv, pred0) {
+                field = Some((fmv, fref));
+            }
+        }
+        match field {
+            Some((fmv, fref)) => {
+                predict_fields(rf, mbx, mby, &fmv, fref, h.rounding, qpel, &mut px)
+            }
+            None => predict_mb(rf, mbx, mby, &mvs, four, h.rounding, qpel, &mut px),
+        }
+        let field_dct = self.cfg.interlaced && prefer_field_dct(&luma_residual(src, mbx, mby, &px));
         let mut levels = [[0i16; 64]; 6];
         let mut cbp = 0u8;
         for (k, lv) in levels.iter_mut().enumerate() {
-            let s = source_block(src, mbx, mby, k);
-            let p = pred_block(&px, k);
+            let s = source_block_f(src, mbx, mby, k, field_dct);
+            let p = pred_block_f(&px, k, field_dct);
             for i in 0..64 {
                 lv[i] = s[i] - p[i];
             }
@@ -1134,6 +1227,8 @@ impl Encoder {
         write_mb(recon, mbx, mby, &px);
         let mut syn = MbSyntax::new(true, self.fcode);
         syn.sh = self.cfg.short_header;
+        syn.interlaced = self.cfg.interlaced;
+        self.st.field[mb] = false;
         if syn.sh {
             // H.263's escape codes levels up to 127; reconstruct what is
             // coded.
@@ -1143,7 +1238,7 @@ impl Encoder {
                 }
             }
         }
-        if !four && mv == [0, 0] && cbp == 0 {
+        if !four && field.is_none() && mv == [0, 0] && cbp == 0 {
             self.st.kind[mb] = MbKind::Skipped;
             self.st.set_mb_mv(mbx, mby, [0, 0]);
             syn.not_coded = true;
@@ -1152,7 +1247,18 @@ impl Encoder {
         self.st.kind[mb] = MbKind::Inter;
         syn.mb_type = if four { 2 } else { 0 };
         syn.cbp = cbp;
-        if four {
+        syn.field_dct = field_dct && cbp != 0;
+        let field_dct = syn.field_dct;
+        if let Some((fmv, fref)) = field {
+            let fp = [pred0[0], pred0[1] >> 1];
+            syn.field_pred = Some(fref);
+            syn.mvd.push(self.mv_diff(fmv[0], fp));
+            syn.mvd.push(self.mv_diff(fmv[1], fp));
+            self.st.set_mb_mv(mbx, mby, field_to_frame(fmv[0], fmv[1]));
+            self.st.field[mb] = true;
+            self.st.field_mv[mb] = fmv.map(|v| [v[0] as i16, v[1] as i16]);
+            self.st.field_ref[mb] = fref;
+        } else if four {
             for (k, v) in mvs.iter().enumerate() {
                 let p = self.st.mv_pred(mbx, mby, k, self.slice);
                 syn.mvd.push(self.mv_diff(*v, p));
@@ -1169,7 +1275,7 @@ impl Encoder {
             let mut rec = *lv;
             self.quant.inter(&mut rec, qp);
             idct(&mut rec);
-            add_block(recon, mbx, mby, k, &rec, false);
+            add_block(recon, mbx, mby, k, &rec, field_dct);
         }
         syn.blocks = levels;
         syn
@@ -1387,6 +1493,77 @@ impl Encoder {
         (best, best_sad)
     }
 
+    /// SAD of field `f` (0 top, 1 bottom: every other line, 16x8) of
+    /// macroblock `(mbx, mby)` against reference field `parity` (true:
+    /// bottom) at vector `mv`, whose vertical component counts field lines.
+    #[allow(clippy::too_many_arguments)]
+    fn sad_field(
+        &self,
+        src: &Pic,
+        rf: &Pic,
+        mbx: usize,
+        mby: usize,
+        f: usize,
+        parity: bool,
+        mv: [i32; 2],
+        rounding: bool,
+    ) -> u32 {
+        let (p, stride, w, h) = rf.ref_plane(0);
+        let fld: mc::Src = (&p[parity as usize * stride..], 2 * stride, w, h / 2);
+        let (x, y) = (mbx as i32 * 16, mby as i32 * 8);
+        let mut out = [0u8; 128];
+        if self.cfg.quarter_sample {
+            mc::qpel(fld, x, y, mv[0], mv[1], 16, 8, rounding, &mut out, 16);
+        } else {
+            mc::halfpel(fld, x, y, mv[0], mv[1], 16, 8, rounding, &mut out, 16);
+        }
+        let s = src.ystride();
+        let mut sum = 0;
+        for r in 0..8 {
+            let row = &src.y[(mby * 16 + f + 2 * r) * s + mbx * 16..];
+            for c in 0..16 {
+                sum += (row[c] as i32 - out[r * 16 + c] as i32).unsigned_abs();
+            }
+        }
+        sum
+    }
+
+    /// A field vector for field `f` from reference field `parity`: a
+    /// whole-sample diamond from `start`, then finer steps.
+    #[allow(clippy::too_many_arguments)]
+    fn search_field(
+        &self,
+        src: &Pic,
+        rf: &Pic,
+        mbx: usize,
+        mby: usize,
+        f: usize,
+        parity: bool,
+        start: [i32; 2],
+        rounding: bool,
+    ) -> ([i32; 2], u32) {
+        let u = self.unit();
+        let mut best = self.clamp_mv([start[0] & !(u - 1), start[1] & !(u - 1)]);
+        let mut best_sad = self.sad_field(src, rf, mbx, mby, f, parity, best, rounding);
+        for step in [u, u / 2, u / 4].into_iter().filter(|&s| s > 0) {
+            for _ in 0..16 {
+                let mut moved = false;
+                for d in [[step, 0], [-step, 0], [0, step], [0, -step]] {
+                    let c = self.clamp_mv([best[0] + d[0], best[1] + d[1]]);
+                    let s = self.sad_field(src, rf, mbx, mby, f, parity, c, rounding);
+                    if s < best_sad {
+                        (best, best_sad) = (c, s);
+                        moved = true;
+                    }
+                }
+                if !moved {
+                    break;
+                }
+            }
+        }
+        (best, best_sad)
+    }
+
     /// Refines one 8x8 block's vector around the macroblock's.
     #[allow(clippy::too_many_arguments)]
     fn search8(
@@ -1449,6 +1626,65 @@ fn source_block(src: &Pic, mbx: usize, mby: usize, k: usize) -> [i16; 64] {
         }
     }
     b
+}
+
+/// Block `k` of the source; with `field_dct`, luminance blocks 0 and 1
+/// are the top field's lines and 2 and 3 the bottom field's.
+fn source_block_f(src: &Pic, mbx: usize, mby: usize, k: usize, field_dct: bool) -> [i16; 64] {
+    if !field_dct || k > 3 {
+        return source_block(src, mbx, mby, k);
+    }
+    let s = src.ystride();
+    let o = (mby * 16 + (k >> 1)) * s + mbx * 16 + (k & 1) * 8;
+    let mut b = [0i16; 64];
+    for r in 0..8 {
+        for c in 0..8 {
+            b[r * 8 + c] = src.y[o + 2 * r * s + c] as i16;
+        }
+    }
+    b
+}
+
+/// Block `k` of a prediction, laid out as [`source_block_f`].
+fn pred_block_f(px: &MbPix, k: usize, field_dct: bool) -> [i16; 64] {
+    if !field_dct || k > 3 {
+        return pred_block(px, k);
+    }
+    let mut b = [0i16; 64];
+    for r in 0..8 {
+        for c in 0..8 {
+            b[r * 8 + c] = px.y[((k >> 1) + 2 * r) * 16 + (k & 1) * 8 + c] as i16;
+        }
+    }
+    b
+}
+
+/// The luminance residual of a macroblock against a prediction.
+fn luma_residual(src: &Pic, mbx: usize, mby: usize, px: &MbPix) -> [i16; 256] {
+    let mut ys = [0u8; 256];
+    luma_mb(src, mbx, mby, &mut ys);
+    let mut d = [0i16; 256];
+    for i in 0..256 {
+        d[i] = ys[i] as i16 - px.y[i] as i16;
+    }
+    d
+}
+
+/// Whether field DCT suits 16x16 luminance (samples or residual): its
+/// lines differ less from the next line of the same field than from the
+/// next line of the frame.
+fn prefer_field_dct(y: &[i16; 256]) -> bool {
+    let diff = |gap: usize| -> i32 {
+        (0..16 - gap)
+            .map(|r| {
+                (0..16)
+                    .map(|c| (y[r * 16 + c] - y[(r + gap) * 16 + c]).unsigned_abs() as i32)
+                    .sum::<i32>()
+            })
+            .sum()
+    };
+    // The frame sum has 15 line pairs, the field sum 14.
+    diff(2) * 15 < diff(1) * 14
 }
 
 /// Block `k` of a macroblock prediction.

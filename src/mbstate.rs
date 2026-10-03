@@ -67,6 +67,21 @@ pub(crate) struct MbState {
     pub mv: Vec<[i16; 2]>,
     /// Interlaced: whether each macroblock was field predicted.
     pub field: Vec<bool>,
+    /// Interlaced: a field-predicted macroblock's top and bottom field
+    /// vectors (vertical components in field lines) and the reference
+    /// field each used (true: bottom), for field direct mode.
+    pub field_mv: Vec<[[i16; 2]; 2]>,
+    pub field_ref: Vec<[bool; 2]>,
+}
+
+/// `//` on 64-bit values (positive divisor).
+#[inline]
+pub(crate) fn round_div64(n: i64, d: i64) -> i64 {
+    if n >= 0 {
+        (n + d / 2) / d
+    } else {
+        -((-n + d / 2) / d)
+    }
 }
 
 /// Rounding integer division of 7.4.3 (`//`): to the nearest integer,
@@ -91,6 +106,8 @@ impl MbState {
             pred: vec![[BlockPred::default(); 6]; mbw * mbh],
             mv: vec![[0, 0]; 4 * mbw * mbh],
             field: vec![false; mbw * mbh],
+            field_mv: vec![[[0, 0]; 2]; mbw * mbh],
+            field_ref: vec![[false; 2]; mbw * mbh],
         }
     }
 

@@ -107,7 +107,7 @@ proptest! {
         let mut aus = match kind {
             0 => stream(0, false, false),
             1 => stream(2, false, true),
-            2 => stream(0, true, true),
+            2 => stream_with(0, true, true, |c| c.interlaced = true),
             3 => stream(1, true, false),
             4 => stream_with(0, true, true, |c| {
                 c.data_partitioning = true;
@@ -145,6 +145,7 @@ proptest! {
         packets in proptest::option::of(8u32..200),
         range in 1u32..64, gop in 0u32..5,
         dp in 0u8..3, qpel in any::<bool>(), mpeg in any::<bool>(),
+        interlaced in any::<bool>(),
     ) {
         let mut cfg = EncoderConfig::new(w, h, 30);
         cfg.b_frames = b;
@@ -156,6 +157,7 @@ proptest! {
         cfg.data_partitioning = dp > 0;
         cfg.reversible_vlc = dp > 1;
         cfg.quarter_sample = qpel;
+        cfg.interlaced = interlaced && dp == 0;
         if mpeg {
             cfg.quantiser = mpeg4::Quantiser::mpeg_default();
         }

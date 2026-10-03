@@ -447,3 +447,89 @@ fn short_video_header() {
     cfg.b_frames = 1;
     assert!(Encoder::new(cfg).is_err());
 }
+
+/// Runs `n` interlaced frames through encoder and decoder; returns the
+/// decoder's stats with the run.
+fn run_interlaced(mut cfg: EncoderConfig, n: u32, speed: f64) -> (Run, mpeg4::DecoderStats) {
+    cfg.keep_reconstructions = true;
+    let (w, h, tff) = (cfg.width, cfg.height, cfg.top_field_first);
+    let mut enc = Encoder::new(cfg).unwrap();
+    let mut dec = Decoder::new();
+    let (mut frames, mut recon, mut sources, mut bytes) = (Vec::new(), Vec::new(), Vec::new(), 0);
+    for t in 0..n {
+        let src = common::synth_interlaced(w, h, t, speed, tff);
+        let au = enc.encode(&src).unwrap();
+        bytes += au.len();
+        recon.extend(enc.take_reconstructions());
+        frames.extend(dec.decode(&au).unwrap());
+        sources.push(src);
+    }
+    let tail = enc.finish().unwrap();
+    bytes += tail.len();
+    recon.extend(enc.take_reconstructions());
+    frames.extend(dec.decode(&tail).unwrap());
+    frames.extend(dec.flush());
+    recon.sort_by_key(|f| f.timestamp);
+    let st = dec.stats().clone();
+    assert_eq!(
+        (st.concealed_vops, st.misaligned_vops),
+        (0, 0),
+        "{:?}",
+        dec.last_error()
+    );
+    (
+        Run {
+            frames,
+            recon,
+            sources,
+            bytes,
+        },
+        st,
+    )
+}
+
+#[test]
+fn interlaced() {
+    for (b, tff, qpel) in [
+        (0u32, true, false),
+        (2, true, false),
+        (2, false, false),
+        (1, true, true),
+    ] {
+        let mut cfg = EncoderConfig::new(352, 288, 25);
+        cfg.interlaced = true;
+        cfg.top_field_first = tff;
+        cfg.b_frames = b;
+        cfg.quarter_sample = qpel;
+        cfg.gop_size = 12;
+        let (r, st) = run_interlaced(cfg, 13, 6.0);
+        let label = format!("interlaced, {b} B-VOPs, top field first {tff}, quarter-sample {qpel}");
+        check(&r, 30.0, &label);
+        println!("{label}: {} field direct macroblocks", st.field_direct_mbs);
+        if b > 0 {
+            assert!(
+                st.field_direct_mbs > 0,
+                "field direct mode was not exercised"
+            );
+        }
+    }
+}
+
+#[test]
+fn interlaced_compresses_interlaced_content() {
+    let mut cfg = EncoderConfig::new(352, 288, 25);
+    cfg.gop_size = 0;
+    let (prog, _) = run_interlaced(cfg.clone(), 8, 6.0);
+    cfg.interlaced = true;
+    let (int, _) = run_interlaced(cfg, 8, 6.0);
+    let p = check(&prog, 30.0, "interlaced content, progressive coding");
+    let i = check(&int, 30.0, "interlaced content, interlaced coding");
+    println!(
+        "progressive {} bytes {p:.2} dB, interlaced {} bytes {i:.2} dB",
+        prog.bytes, int.bytes
+    );
+    assert!(
+        int.bytes < prog.bytes,
+        "field tools should pay on interlaced content"
+    );
+}
