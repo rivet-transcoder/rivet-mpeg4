@@ -7,15 +7,41 @@
 //! `(0, H)`; the trajectory moves them by `du`, `dv` (half samples); the
 //! warp is computed at `1 / s` sample precision (`s = 2^(accuracy + 1)`)
 //! through the "virtual" points at the powers of two `W' >= W`,
-//! `H' >= H`, and samples are bilinear at that precision.
+//! `H' >= H`, and samples are bilinear at that precision. With four
+//! points the fourth corner `(W, H)` moves too, and the warp is the
+//! perspective transform of 7.8.5, in 128-bit integers.
 
 use crate::headers::VolHeader;
 use crate::picture::Pic;
 
 use crate::dec::vop::MbPix;
 
+/// The coefficients of the four-point (perspective) warp of 7.8.5.
+#[derive(Clone, Copy)]
+struct Persp {
+    a: i128,
+    b: i128,
+    c: i128,
+    d: i128,
+    e: i128,
+    f: i128,
+    g: i128,
+    h: i128,
+    /// `D W H`.
+    dwh: i128,
+}
+
+/// `///` for any divisor: to the nearest integer, halves toward positive
+/// infinity (3 /// 2 = 2, -3 /// 2 = -1).
+#[inline]
+fn div_round_up(n: i128, d: i128) -> i128 {
+    let (n, d) = if d < 0 { (-n, -d) } else { (n, d) };
+    (2 * n + d).div_euclid(2 * d)
+}
+
 pub(crate) struct Gmc {
     points: usize,
+    persp: Option<Persp>,
     /// `s`, and its log2.
     s: i64,
     rho: u32,
@@ -58,6 +84,7 @@ impl Gmc {
         let (du0, dv0) = d(0);
         let (du1, dv1) = d(1);
         let (du2, dv2) = d(2);
+        let (du3, dv3) = d(3);
         // Corners (i0, j0) = (0, 0), (i1, j1) = (W, 0), (i2, j2) = (0, H).
         // i0' = (s / 2)(2 i0 + du[0]), i1' = (s / 2)(2 i1 + du[1] + du[0]),
         // i2' = (s / 2)(2 i2 + du[2] + du[0]), and likewise for j.
@@ -68,6 +95,27 @@ impl Gmc {
         let j1p = k * (dv1 + dv0);
         let i2p = k * (du2 + du0);
         let j2p = s * h + k * (dv2 + dv0);
+        let i3p = s * w + k * (du3 + du2 + du1 + du0);
+        let j3p = s * h + k * (dv3 + dv2 + dv1 + dv0);
+        let persp = (warping.len() >= 4).then(|| {
+            let (i0, j0, i1, j1) = (i0p as i128, j0p as i128, i1p as i128, j1p as i128);
+            let (i2, j2, i3, j3) = (i2p as i128, j2p as i128, i3p as i128, j3p as i128);
+            let (w, h) = (w as i128, h as i128);
+            let g = ((i0 - i1 - i2 + i3) * (j2 - j3) - (i2 - i3) * (j0 - j1 - j2 + j3)) * h;
+            let hh = ((i1 - i3) * (j0 - j1 - j2 + j3) - (i0 - i1 - i2 + i3) * (j1 - j3)) * w;
+            let dd = (i1 - i3) * (j2 - j3) - (i2 - i3) * (j1 - j3);
+            Persp {
+                a: dd * (i1 - i0) * h + g * i1,
+                b: dd * (i2 - i0) * w + hh * i2,
+                c: dd * i0 * w * h,
+                d: dd * (j1 - j0) * h + g * j1,
+                e: dd * (j2 - j0) * w + hh * j2,
+                f: dd * j0 * w * h,
+                g,
+                h: hh,
+                dwh: dd * w * h,
+            }
+        });
         // `//`: to the nearest, halves away from zero.
         let rd = |n: i64, d: i64| {
             if n >= 0 {
@@ -81,7 +129,8 @@ impl Gmc {
         let i2pp = rd((h - hp) * (r * i0p) + hp * (r * i2p), h);
         let j2pp = 16 * hp + rd((h - hp) * (r * j0p) + hp * (r * j2p - 16 * h), h);
         Gmc {
-            points: warping.len().min(3),
+            points: warping.len().min(4),
+            persp,
             s,
             rho: s.trailing_zeros(),
             r,
@@ -102,6 +151,18 @@ impl Gmc {
     #[inline]
     fn luma(&self, i: i64, j: i64) -> (i64, i64) {
         let (s, r) = (self.s, self.r);
+        if let Some(p) = &self.persp {
+            let (ii, jj) = (i as i128, j as i128);
+            let den = p.g * ii + p.h * jj + p.dwh;
+            if den == 0 {
+                // Disallowed by 7.8.5; a damaged trajectory gets no warp.
+                return (s * i, s * j);
+            }
+            return (
+                clamp_i64(div_round_up(p.a * ii + p.b * jj + p.c, den)),
+                clamp_i64(div_round_up(p.d * ii + p.e * jj + p.f, den)),
+            );
+        }
         match self.points {
             0 => (s * i, s * j),
             1 => (self.i0p + s * i, self.j0p + s * j),
@@ -132,6 +193,19 @@ impl Gmc {
     #[inline]
     fn chroma(&self, ic: i64, jc: i64) -> (i64, i64) {
         let (s, r) = (self.s, self.r);
+        if let Some(p) = &self.persp {
+            let (x, y) = ((4 * ic + 1) as i128, (4 * jc + 1) as i128);
+            let gh = p.g * x + p.h * y;
+            let den = 4 * gh + 8 * p.dwh;
+            if den == 0 {
+                return (s * ic, s * jc);
+            }
+            let t = (gh + 2 * p.dwh) * s as i128;
+            return (
+                clamp_i64(div_round_up(2 * p.a * x + 2 * p.b * y + 4 * p.c - t, den)),
+                clamp_i64(div_round_up(2 * p.d * x + 2 * p.e * y + 4 * p.f - t, den)),
+            );
+        }
         match self.points {
             0 => (s * ic, s * jc),
             1 => (s * ic + div_up(self.i0p, 2), s * jc + div_up(self.j0p, 2)),
@@ -231,6 +305,13 @@ impl Gmc {
     }
 }
 
+/// A warped position kept within what later arithmetic handles (only a
+/// damaged or degenerate trajectory comes near the limit).
+#[inline]
+fn clamp_i64(v: i128) -> i64 {
+    v.clamp(-(1 << 40), 1 << 40) as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,5 +364,102 @@ mod tests {
         assert_eq!(g.luma(10, 0), (16 * 20, 0));
         assert_eq!(g.luma(0, 10), (0, 16 * 20));
         assert_eq!(g.luma(5, 7), (16 * 10, 16 * 14));
+    }
+
+    /// `///` rounds halves toward positive infinity, for either sign of
+    /// divisor.
+    #[test]
+    fn sign_dependent_rounding() {
+        assert_eq!(div_round_up(3, 2), 2);
+        assert_eq!(div_round_up(-3, 2), -1);
+        assert_eq!(div_round_up(3, -2), -1);
+        assert_eq!(div_round_up(7, 4), 2);
+        assert_eq!(div_round_up(-7, 4), -2);
+        assert_eq!(div_round_up(5, 4), 1);
+        assert_eq!(div_round_up(-6, 4), -1);
+    }
+
+    /// Four points that only translate the VOP make the perspective warp
+    /// a translation: ordinary motion compensation, sample for sample.
+    #[test]
+    fn four_point_translation_matches_halfpel_mc() {
+        let mut pic = Pic::new(64, 48);
+        for (i, v) in pic.y.iter_mut().enumerate() {
+            *v = ((i * 37 + i / 64 * 11) % 251) as u8;
+        }
+        for acc in 0..4 {
+            for (du, dv) in [(0, 0), (3, -5), (-7, 2)] {
+                let g = Gmc::new(
+                    &vol(64, 48, acc, false),
+                    &[(du, dv), (0, 0), (0, 0), (0, 0)],
+                    false,
+                );
+                let mut a = MbPix::new();
+                let mut b = MbPix::new();
+                for rounding in [false, true] {
+                    g.predict_mb(&pic, 1, 1, rounding, &mut a);
+                    predict_mb(&pic, 1, 1, &[[du, dv]; 4], false, rounding, false, &mut b);
+                    assert_eq!(a.y, b.y, "acc {acc} du {du} dv {dv}");
+                    assert_eq!(a.cb, b.cb, "acc {acc} du {du} dv {dv}");
+                }
+                assert_eq!(g.mb_vector(1, 1), [du, dv]);
+            }
+        }
+    }
+
+    /// Four points whose fourth corner moves as an affine map would move
+    /// it make the perspective denominators constant: the warp is the
+    /// three-point one, to within the one unit the three-point warp's
+    /// virtual points can round differently.
+    #[test]
+    fn four_point_affine_matches_three_point() {
+        let v = vol(176, 144, 3, false);
+        // du[3] = -du[1] - du[2] - ... so that i3' = i1' + i2' - i0'.
+        let three = [(4, -2), (10, 6), (-8, 12)];
+        let four = [three[0], three[1], three[2], (0, 0)];
+        let g3 = Gmc::new(&v, &three, false);
+        let g4 = Gmc::new(&v, &four, false);
+        let p = g4.persp.unwrap();
+        assert_eq!((p.g, p.h), (0, 0));
+        for j in (0..144).step_by(7) {
+            for i in (0..176).step_by(5) {
+                let (a, b) = (g3.luma(i, j), g4.luma(i, j));
+                assert!(
+                    (a.0 - b.0).abs() <= 1 && (a.1 - b.1).abs() <= 1,
+                    "{i},{j}: {a:?} {b:?}"
+                );
+            }
+        }
+        for j in (0..72).step_by(5) {
+            for i in (0..88).step_by(3) {
+                let (a, b) = (g3.chroma(i, j), g4.chroma(i, j));
+                assert!(
+                    (a.0 - b.0).abs() <= 1 && (a.1 - b.1).abs() <= 1,
+                    "{i},{j}: {a:?} {b:?}"
+                );
+            }
+        }
+    }
+
+    /// A true perspective warp: the corners land where the trajectory puts
+    /// them (in 1/s samples), and the warp is not affine in between.
+    #[test]
+    fn four_point_perspective_moves_the_corners() {
+        let v = vol(64, 64, 1, false); // s = 4
+        let t = [(0, 0), (0, 0), (0, 0), (-16, -16)];
+        let g = Gmc::new(&v, &t, false);
+        assert_eq!(g.luma(0, 0), (0, 0));
+        assert_eq!(g.luma(64, 0), (4 * 64, 0));
+        assert_eq!(g.luma(0, 64), (0, 4 * 64));
+        // (W, H) moved by du = dv = -16 half samples: 8 samples in.
+        assert_eq!(g.luma(64, 64), (4 * 56, 4 * 56));
+        // The centre goes where the diagonals cross, as under any
+        // projective map; the middle of the right edge stays on the moved
+        // edge but, unlike an affine map, not at its middle.
+        assert_eq!(g.luma(32, 32), (128, 128));
+        let (x, y) = g.luma(64, 32);
+        // On the line from (256, 0) to (224, 224): 7 x + y = 7 * 256.
+        assert!((7 * x + y - 7 * 256).abs() <= 8, "{x},{y}");
+        assert_ne!((x, y), (240, 112));
     }
 }

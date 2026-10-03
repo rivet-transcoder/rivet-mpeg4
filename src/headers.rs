@@ -294,11 +294,6 @@ impl VolHeader {
         if self.sprite == SpriteMode::Static {
             return Err(unsupported("static sprites"));
         }
-        if self.sprite == SpriteMode::Gmc && self.sprite_warping_points > 3 {
-            return Err(unsupported(
-                "four-point (perspective) global motion compensation",
-            ));
-        }
         if self.sprite == SpriteMode::Gmc && self.sprite_brightness_change {
             return Err(unsupported("sprite brightness change"));
         }

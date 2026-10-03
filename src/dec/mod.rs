@@ -936,4 +936,134 @@ mod tests {
         assert_eq!(y(p, 16 + 15, 16), y(i, 32, 16));
         assert!(i.plane(1).iter().all(|&v| v == 128));
     }
+
+    /// `warping_mv_code()`: `dmv_length`, then the value coded like a DC
+    /// differential.
+    fn put_warping_code(w: &mut BitWriter, v: i32) {
+        let len = 32 - v.unsigned_abs().leading_zeros();
+        let (b, l) = crate::tables::code(crate::tables::DMV_LENGTH[len as usize]);
+        w.put(l, b);
+        if len > 0 {
+            w.put(
+                len,
+                if v > 0 {
+                    v as u32
+                } else {
+                    (v + (1 << len) - 1) as u32
+                },
+            );
+        }
+    }
+
+    /// A VOL with four-point GMC (sprite_enable 2, perspective), QCIF, 25
+    /// ticks a second, otherwise what this crate's encoder writes.
+    fn gmc4_vol() -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.put_bytes(&[0, 0, 1, 0x20]);
+        w.put(1, 0); // random_accessible_vol
+        w.put(8, 0x11); // Advanced Simple
+        w.put(1, 1);
+        w.put(4, 2); // verid 2
+        w.put(3, 1);
+        w.put(4, 1); // square samples
+        w.put(1, 1); // vol_control_parameters
+        w.put(2, 1);
+        w.put(1, 1); // low_delay
+        w.put(1, 0);
+        w.put(2, 0); // rectangular
+        w.put(1, 1);
+        w.put(16, 25);
+        w.put(1, 1);
+        w.put(1, 0); // fixed_vop_rate
+        w.put(1, 1);
+        w.put(13, 176);
+        w.put(1, 1);
+        w.put(13, 144);
+        w.put(1, 1);
+        w.put(1, 0); // interlaced
+        w.put(1, 1); // obmc_disable
+        w.put(2, 2); // sprite_enable: GMC
+        w.put(6, 4); // no_of_sprite_warping_points
+        w.put(2, 3); // sprite_warping_accuracy: 1/16
+        w.put(1, 0); // sprite_brightness_change
+        w.put(1, 0); // not_8_bit
+        w.put(1, 0); // quant_type
+        w.put(1, 0); // quarter_sample
+        w.put(1, 1); // complexity_estimation_disable
+        w.put(1, 1); // resync_marker_disable
+        w.put(1, 0); // data_partitioned
+        w.put(1, 0); // newpred_enable
+        w.put(1, 0); // reduced_resolution_vop_enable
+        w.put(1, 0); // scalability
+        w.stuff();
+        w.into_bytes()
+    }
+
+    /// Four-point (perspective) GMC end to end: an I-VOP, then an S-VOP
+    /// whose 99 macroblocks are all not coded — each predicted by the warp
+    /// alone. The decoded picture must be the warp of the I-VOP, computed
+    /// here directly from 7.8.5's formulas (`Gmc`), for every macroblock.
+    #[test]
+    fn four_point_gmc_s_vop() {
+        let mut cfg = crate::EncoderConfig::new(176, 144, 25);
+        cfg.gop_size = 1;
+        let mut enc = crate::Encoder::new(cfg).unwrap();
+        let mut src = Frame::new(176, 144);
+        for (i, v) in src.data.iter_mut().enumerate() {
+            *v = ((i % 176) * 3 / 2 + (i / 176) % 144 + (i * 7) % 13) as u8;
+        }
+        let au = enc.encode(&src).unwrap();
+        let units = split_units(&au);
+        let vop = units.iter().find(|u| u.0 == sc::VOP).unwrap().1;
+        let mut stream = gmc4_vol();
+        stream.extend([0, 0, 1, sc::VOP]);
+        stream.extend(vop);
+        let traj = [(6, -4), (-10, 8), (12, 20), (-30, -18)];
+        let mut w = BitWriter::new();
+        w.put_bytes(&[0, 0, 1, sc::VOP]);
+        w.put(2, 3); // S-VOP
+        w.put(1, 0); // modulo_time_base
+        w.put(1, 1);
+        w.put(5, 1); // vop_time_increment
+        w.put(1, 1);
+        w.put(1, 1); // vop_coded
+        w.put(1, 0); // vop_rounding_type
+        w.put(3, 0); // intra_dc_vlc_thr
+        for &(du, dv) in &traj {
+            put_warping_code(&mut w, du);
+            w.put(1, 1);
+            put_warping_code(&mut w, dv);
+            w.put(1, 1);
+        }
+        w.put(5, 4); // vop_quant
+        w.put(3, 1); // vop_fcode_forward
+        for _ in 0..99 {
+            w.put(1, 1); // not_coded: GMC, no texture
+        }
+        w.stuff();
+        stream.extend(w.into_bytes());
+        let mut d = Decoder::new();
+        let mut frames = d.decode(&stream).unwrap();
+        frames.extend(d.flush());
+        assert_eq!(frames.len(), 2);
+        assert_eq!(d.stats().concealed_vops, 0, "{:?}", d.last_error());
+        assert_eq!(d.stats().misaligned_vops, 0);
+        assert_eq!(frames[1].vop_type, VopType::S);
+        let vol = d.vol().unwrap().clone();
+        assert_eq!(vol.sprite_warping_points, 4);
+        let g = crate::gmc::Gmc::new(&vol, &traj, false);
+        let reference = Pic::from_frame(&frames[0]);
+        let mut want = Pic::new(176, 144);
+        let mut px = vop::MbPix::new();
+        for mby in 0..9 {
+            for mbx in 0..11 {
+                g.predict_mb(&reference, mbx, mby, false, &mut px);
+                vop::write_mb(&mut want, mbx, mby, &px);
+            }
+        }
+        let want = want.to_frame(0, 25, VopType::S, 1);
+        assert_eq!(frames[1].data, want.data);
+        // And it is a real warp: far from a copy.
+        assert_ne!(frames[1].data, frames[0].data);
+    }
 }
