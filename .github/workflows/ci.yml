@@ -55,7 +55,7 @@ jobs:
       - run: tools/xvid-vectors.sh
       - name: Variants
         run: |
-          for v in 0 1 2 3; do echo "=== VARIANT $v"; MPEG4_QPEL_VARIANT=$v cargo test --release --test conformance xvid -- --nocapture 2>&1 | grep qpel || true; done
+          MPEG4_VERBOSE=1 cargo test --release --test conformance -- --nocapture 2>&1 | grep -E " (qpel|simple|qpel_4mv_b) [0-9]+:" || true
         env:
           MPEG4_REQUIRE_CONFORMANCE: "1"
 
