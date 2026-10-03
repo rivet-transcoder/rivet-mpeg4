@@ -56,9 +56,10 @@ VOP's stuffing begins). Header errors and unsupported tools are errors.
 
 ### Encoders that depart from the standard
 
-Each was found by one of the sample streams failing to parse, and each
-applies only where the standard's reading fails ([docs/SAMPLES.md](docs/SAMPLES.md)
-has the detail):
+Each was found by another encoder's stream failing to parse, and each
+applies only where the standard's reading fails ([docs/CONFORMANCE.md](docs/CONFORMANCE.md)
+has the detail; the streams that showed the first five are no longer
+fetched, so only the last is still checked by an external stream):
 
 - a VOL whose `vop_time_increment_resolution` does not match the
   increments its VOPs code (libavcodec 54) — the increment length is found
@@ -69,7 +70,9 @@ has the detail):
 - early Xvid's interlaced P-VOPs, which code `dct_type` in macroblocks
   without coded blocks;
 - padding after a VOP's stuffing (DivX 5's extra `0x7f`, runs of ones and
-  zeros) or no stuffing at all when the data ends byte aligned.
+  zeros) or no stuffing at all when the data ends byte aligned;
+- Xvid's resync markers in B-VOPs, a bit longer than 6.3.5.2's when both
+  `vop_fcode`s are 1.
 
 ## What it encodes
 
@@ -140,26 +143,35 @@ No other implementation is run, in tests or in CI.
   and about 20% smaller than IPPP; video packets of 300 bytes at CIF 43.4;
   odd sizes down to 1x1; bit-rate targets of 100, 300 and 700 kb/s at CIF
   land at 112, 332 and 765 kb/s.
-- **Real encoders' streams** (`tests/samples.rs`, fetched by
-  `tools/fetch-samples.sh`; CI fetches them): 23 streams from DivX 5.00,
-  5.01, 5.03 and 6.6, Xvid, OpenDivX, libavcodec and others — Simple and
-  Advanced Simple, B-VOPs, packed streams, quarter-sample, two- and
-  three-point GMC, interlaced field DCT, data partitioning, video packets,
-  the MPEG quantiser, the short video header, sizes that are not multiples
-  of 16. **Every VOP of every stream parses exactly to its stuffing**,
-  except where the file itself is cut short or damaged (two files cut off
-  mid-VOP, two damaged pictures in an H.263 call capture); pictures were
-  inspected for drift. There is no reference output for these streams, so
-  this checks syntax, VLCs and decisions exactly and reconstruction by eye.
-  [docs/SAMPLES.md](docs/SAMPLES.md) lists them, their sources, and what
-  each taught.
+- **Published conformance streams** (`tests/conformance.rs`, fetched by
+  `tools/fetch-conformance.sh` from ITU-T's and ISO's servers; CI fetches
+  them and requires them): baseline H.263 (the short video header) from
+  ITU-T's H.263 bitstream archive against its published decoded pictures —
+  **all 68 pictures within one sample** (the inverse DCTs' rounding), no
+  drift; an H.263 version 2 stream (PLUSPTYPE) and an ISO/IEC 14496-4
+  Simple Studio stream, refused by name. ISO's Simple and Advanced Simple
+  conformance streams are not publicly available.
+- **Xvid, as a black box** (`tools/xvid-vectors.sh` builds Xvid 1.3.7 from
+  its release tarball and runs its example encoder and decoder; CI runs
+  it): Xvid's streams for each Advanced Simple tool — B-VOPs, packed
+  B-VOPs, quarter-sample, GMC, interlaced (both field orders), the MPEG
+  quantiser, video packets, an odd size, quantisers 1 and 31 — decoded by
+  this decoder against Xvid's own decoder's pictures, and this crate's
+  encoder's streams decoded by Xvid's decoder against this decoder's. All
+  agree to a sample or two (the inverse DCTs' rounding, 50–62 dB) except
+  the quarter-sample streams, where Xvid's interpolation differs from this
+  decoder's reading of 7.6.2.1 at some positions (47–52 dB).
+  [docs/CONFORMANCE.md](docs/CONFORMANCE.md) has the figures, what the
+  comparison found, and what the sample streams used until 2026-10-03
+  covered that these do not.
 - **Malformed input**: property tests (`tests/fuzz.rs`, proptest; CI also
   runs them in a debug build, where overflow panics) feed arbitrary bytes,
   and valid streams with bits flipped, bytes cut and garbage spliced, to
-  every entry point, and the sample streams damaged likewise: errors or
-  concealment, never a panic.
+  every entry point, and the conformance and Xvid streams damaged likewise:
+  errors or concealment, never a panic.
 
-Single-threaded decode speed, release build, AMD Ryzen 9 9950X: 640x480
+Single-threaded decode speed, release build, AMD Ryzen 9 9950X, measured
+on other encoders' streams (2026-10-02): 640x480
 Main profile with the MPEG quantiser about 1450 frames/s; 720x480 Xvid with
 B-VOPs about 750; 640x408 DivX quarter-sample about 680; 856x472 Xvid GMC
 with quarter-sample about 440.
@@ -175,21 +187,24 @@ from the standard alone, this is what the code does and what decided it:
 - *Quarter-sample interpolation.* The 8-tap filter mirrors taps at the
   edge of the block's (N+1)-sample window repeating the edge sample; the
   diagonal quarter positions average four neighbours; chroma vectors halve
-  the luma vector (toward zero) before the half-sample rule. Every
-  quarter-sample stream above reconstructs without visible drift.
+  the luma vector (toward zero) before the half-sample rule. Xvid
+  interpolates the quarter positions between half-sample rows differently
+  (by one at about a third of those samples; docs/CONFORMANCE.md), so its
+  quarter-sample streams drift slightly here.
 - *GMC.* `du`, `dv` in half samples; the warp through virtual points at
   `W'`, `H'`; `///` rounding halves upward; a GMC macroblock's vector for
   prediction is the rounded mean of its luminance displacements, **clipped
   to the `vop_fcode` range** — without the clip, an Xvid zoom whose warp
   outruns that range wraps its neighbours' vectors into misplaced blocks
   (the stream is named for that artifact; with the clip it is clean). Two-
-  and three-point streams (DivX 5.01, Xvid) reconstruct cleanly.
+  and three-point streams (DivX 5.01, Xvid) reconstructed cleanly; Xvid's
+  GMC streams match Xvid's decoder to the IDCT's rounding.
 - *Running QP for `intra_dc_vlc_thr`*: the previous coded macroblock's
   quantiser, the current one's at the start of a VOP or packet.
 - *B-VOP over an S-VOP's not-coded macroblock*: coded normally, the GMC
   vector as the co-located one (the skipped reading misparses DivX 5).
 - *Resync marker length in B-VOPs*: 16 + max(`vop_fcode_forward`,
-  `vop_fcode_backward`) bits.
+  `vop_fcode_backward`) bits, and 18 where that gives 17 (Xvid's length).
 - *Field prediction* (unexercised by any sample: the interlaced stream
   above uses field DCT only): field vectors are predicted from the frame
   predictor with its vertical component halved (arithmetic shift), and
@@ -203,10 +218,11 @@ from the standard alone, this is what the code does and what decided it:
 Written from ISO/IEC 14496-2 and ITU-T H.263 and published literature
 (IEEE Std 1180-1990 for the IDCT test); **no MPEG-4 Part 2 or H.263
 implementation's source was read** — not FFmpeg's, Xvid, DivX, the MPEG-4
-reference software or any other — and no other decoder was run, in
-development or in tests. The VLC tables, scans and default matrices are the
-standard's data, transcribed. The sample streams are other encoders'
-output, used as data only.
+reference software or any other. The VLC tables, scans and default
+matrices are the standard's data, transcribed. Xvid's encoder and decoder
+are run in the tests as black boxes (built from the release tarball by
+`tools/xvid-vectors.sh`, never read); the conformance streams are ITU-T's
+and ISO's publications, used as data.
 
 **Patents.** MPEG-4 Visual may be subject to patent licensing in some
 jurisdictions; Via LA administers a licensing programme for it. Nothing

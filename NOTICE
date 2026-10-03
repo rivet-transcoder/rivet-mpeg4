@@ -18,11 +18,13 @@ Part 2 or H.263 encoder's or decoder's source; none was read. The normative
 tables (the variable length codes, the scans, the default quantiser
 matrices, the escape-mode limits) are the standard's data, transcribed.
 
-No other implementation was run, in development or in the tests. The
-decoder is checked against other encoders' streams used as data only: the
-sample bitstreams tools/fetch-samples.sh downloads from samples.ffmpeg.org
-and fate-suite.ffmpeg.org (listed with their sources in docs/SAMPLES.md),
-which are not redistributed with this crate.
+The decoder is checked against published conformance streams used as data
+only — ITU-T's H.263 bitstreams and an ISO/IEC 14496-4 stream, which
+tools/fetch-conformance.sh downloads from www.itu.int and standards.iso.org
+— and against Xvid, whose encoder and decoder tools/xvid-vectors.sh builds
+from the release tarball and runs as black boxes in the tests; none of
+Xvid's source was read. docs/CONFORMANCE.md lists them. None of these files
+is redistributed with this crate.
 
 ------------------------------------------------------------------------------
 Patents
