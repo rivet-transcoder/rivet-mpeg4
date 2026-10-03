@@ -66,9 +66,10 @@ pictures, worst picture's luma PSNR):
 | `interlaced_b` | interlaced, bottom field first, B-VOPs | 2 | 60.0 dB | 4, 52 dB |
 | `slices` | video packets in I-, P- and B-VOPs | 2 | 62.0 dB | 4, 52 dB |
 | `fine`, `coarse` | quantiser 1; quantiser 31 with B-VOPs | 3, 2 | 57.0, 60.4 dB | 4, 52 dB |
-| `qpel`, `qpel_b` | quarter-sample, without and with B-VOPs | 5, 4 | 47.1, 50.2 dB | 8, 44 dB |
-| `gmc_qpel_b` | GMC, quarter-sample, B-VOPs | 3 | 51.6 dB | 8, 44 dB |
-| `oddsize` | 200x150, quarter-sample, B-VOPs | 4 | 50.0 dB | 8, 44 dB |
+| `qpel` | quarter-sample, P-VOPs only | 5 | 50.7 dB | 6, 48 dB |
+| `qpel_b` | quarter-sample, B-VOPs | 3 | 56.5 dB | 4, 52 dB |
+| `gmc_qpel_b` | GMC, quarter-sample, B-VOPs | 3 | 58.7 dB | 4, 52 dB |
+| `oddsize` | 200x150, quarter-sample, B-VOPs | 3 | 56.4 dB | 4, 52 dB |
 
 What the comparison found:
 
@@ -80,18 +81,32 @@ What the comparison found:
   misread this crate's B-VOPs with video packets (17-bit markers) until the
   encoder used `vop_fcode` 2 or more in streams with both, where the two
   lengths agree.
-- **Quarter-sample interpolation.** Pictures predicted at quarter-sample
-  positions that lie between two half-sample rows or columns — a
-  horizontal quarter position combined with a vertical half or quarter one
-  — differ from Xvid's by one at about a third of their samples; every
-  other position agrees to the inverse DCTs' rounding. Xvid's predictions
-  there are what filtering the horizontally interpolated rows vertically
-  gives (checked by computing that variant: it removes the difference);
-  this decoder averages the neighbouring half-sample values as 7.6.2.1
-  describes the quarter positions. The decoder keeps its reading; the
-  difference drifts within a GOP to the figures above, and the gate for
-  the quarter-sample streams is set accordingly. Which reading other
-  decoders and encoders follow is not settled here.
+- **Quarter-sample interpolation.** Pictures predicted at a horizontal
+  quarter position combined with a vertical half or quarter one differed
+  from Xvid's by one at about a third of those samples, and the
+  quarter-sample streams drifted to 47.1 dB (`qpel`), 50.2 (`qpel_b`),
+  51.6 (`gmc_qpel_b`) and 50.0 (`oddsize`). This decoder averaged
+  half-sample values on a two-dimensional grid (a diagonal quarter
+  position from four of them); 7.6.2.2 interpolates in two passes, every
+  row horizontally (filter, then average) and then every column of those
+  values vertically, each pass rounded and clipped — which is what Xvid
+  does. With the decoder (and the encoder, which predicts through the
+  same function) changed to the two passes, the streams with B-VOPs agree
+  to the inverse DCTs' rounding (56.4–58.7 dB). `qpel`, P-VOPs only,
+  reads 50.7 dB at its worst, but its first P-VOP after each I-VOP agrees
+  as closely as a half-sample stream's (63.6 dB against 64.7) and it
+  falls by about a decibel a picture down each GOP: the 8-tap filter
+  passes the inverse DCTs' differences on where bilinear averaging smooths
+  them. Its gate is 6 and 48 dB. Taking `rounding_control` out of the
+  filter, the averages or both moves every quarter-sample stream further
+  from Xvid (49.5, 38.4, 38.0 dB for `qpel`), so the rounding is as
+  7.6.2.2 gives it. The chroma vectors agree (the largest difference
+  covers all three planes). No ISO conformance stream with
+  `quarter_sample` is publicly available; the two-pass reading is the
+  standard's text, and Xvid is the corroboration.
+- **This crate's encoder, quarter-sample** (`rivet-enc/qpel`,
+  `rivet-enc/qpel_4mv_b`): Xvid's decoder reads both, 49.6 dB (P-VOPs
+  only, the drift above) and 57.8 dB (four vectors and B-VOPs).
 
 ## What is no longer checked
 

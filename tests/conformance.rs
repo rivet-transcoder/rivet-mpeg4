@@ -213,10 +213,15 @@ fn check_set(sub: &str, ext: &str, limits: &[(&str, u8, f64)]) {
 ///
 /// The two inverse DCTs differ by the rounding 14496-2 allows (IEEE 1180),
 /// so pictures agree to a sample or two, drifting a little over each
-/// 12-picture GOP. The quarter-sample cases are held to the same: they
-/// once drifted to 47 dB, when this decoder averaged half-sample values on
-/// a two-dimensional grid where 7.6.2.2 interpolates horizontally and then
-/// vertically (docs/CONFORMANCE.md).
+/// 12-picture GOP. The quarter-sample streams with B-VOPs are held to the
+/// same. Quarter-sample streams of P-VOPs alone drift further, though
+/// their first P-VOP after each I-VOP agrees as closely as a half-sample
+/// one (63.6 dB against 64.7): the 8-tap filter passes the inverse DCTs'
+/// rounding differences on where bilinear averaging smooths them, and
+/// eleven P-VOPs in a chain carry them to about 50 dB. Until 2026-10-03
+/// they also differed systematically, when this decoder averaged
+/// half-sample values on a two-dimensional grid where 7.6.2.2 interpolates
+/// horizontally and then vertically (docs/CONFORMANCE.md).
 #[test]
 fn xvid() {
     check_set(
@@ -233,7 +238,7 @@ fn xvid() {
             ("slices", 4, 52.0),
             ("fine", 4, 52.0),
             ("coarse", 4, 52.0),
-            ("qpel", 4, 52.0),
+            ("qpel", 6, 48.0),
             ("qpel_b", 4, 52.0),
             ("gmc_qpel_b", 4, 52.0),
             ("oddsize", 4, 52.0),
@@ -260,7 +265,7 @@ fn rivet_encoder_in_xvid() {
             ("fine", 4, 52.0),
             ("coarse", 4, 52.0),
             ("bitrate", 4, 52.0),
-            ("qpel", 4, 52.0),
+            ("qpel", 6, 48.0),
             ("qpel_4mv_b", 4, 52.0),
         ],
     );

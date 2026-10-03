@@ -237,9 +237,9 @@ No other implementation is run, in tests or in CI.
   quantiser, video packets, an odd size, quantisers 1 and 31 — decoded by
   this decoder against Xvid's own decoder's pictures, and this crate's
   encoder's streams decoded by Xvid's decoder against this decoder's. All
-  agree to a sample or two (the inverse DCTs' rounding, 50–62 dB) except
-  the quarter-sample streams, where Xvid's interpolation differs from this
-  decoder's reading of 7.6.2.1 at some positions (47–52 dB).
+  agree to a sample or two (the inverse DCTs' rounding, 56–66 dB), and the
+  quarter-sample streams of P-VOPs alone to five (about 50 dB: the 8-tap
+  filter carries the rounding differences along a chain of P-VOPs).
   [docs/CONFORMANCE.md](docs/CONFORMANCE.md) has the figures, what the
   comparison found, and what the sample streams used until 2026-10-03
   covered that these do not.
@@ -263,13 +263,20 @@ from the standard alone, this is what the code does and what decided it:
 - *Reference padding.* Motion compensation repeats the edge of the decoded
   macroblock grid, not of the VOP's `width` x `height`. Decided by DivX 5
   streams of such sizes, which drift otherwise.
-- *Quarter-sample interpolation.* The 8-tap filter mirrors taps at the
-  edge of the block's (N+1)-sample window repeating the edge sample; the
-  diagonal quarter positions average four neighbours; chroma vectors halve
-  the luma vector (toward zero) before the half-sample rule. Xvid
-  interpolates the quarter positions between half-sample rows differently
-  (by one at about a third of those samples; docs/CONFORMANCE.md), so its
-  quarter-sample streams drift slightly here.
+- *Quarter-sample interpolation* (7.6.2.2). Two passes, each rounded
+  with `rounding_control` and clipped to eight bits before the next:
+  every row of the block's (N+1)-sample window interpolated horizontally
+  (the 8-tap filter for the half position, the average of the nearest
+  integer and half-sample values for a quarter one), then every column of
+  those values vertically the same way. The filter mirrors taps at the
+  edge of the window, repeating the edge sample. Chroma vectors halve the
+  luma vector (toward zero) before the half-sample rule. Until 2026-10-03
+  the decoder averaged half-sample values on a two-dimensional grid
+  instead (the diagonal quarter positions from four of them), which
+  differed from Xvid by one at about a third of the samples at a
+  horizontal quarter position combined with a vertical half or quarter
+  one; the two-pass reading is the standard's and Xvid's, and agrees with
+  Xvid to the inverse DCTs' rounding (docs/CONFORMANCE.md).
 - *GMC.* `du`, `dv` in half samples; the warp through virtual points at
   `W'`, `H'`; `///` rounding halves upward; a GMC macroblock's vector for
   prediction is the rounded mean of its luminance displacements, **clipped
