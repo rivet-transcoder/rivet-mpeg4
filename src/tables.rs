@@ -491,6 +491,197 @@ pub(crate) const DMV_LENGTH: [&str; 15] = [
     "1111 1111 1110",
 ];
 
+/// Reversible TCOEF codes (Table B-23), used for the texture of I-, P- and
+/// S-VOPs when the VOL sets `reversible_vlc` (with data partitioning):
+/// `(code, intra (last, run, |level|), inter (last, run, |level|))`, the
+/// sign bit after the code. Index order is the standard's, which is also
+/// ascending code order within each length.
+///
+/// The codes are built so that they can be read in either direction: each
+/// is a *core* followed by one free bit. A core that begins with `1` ends
+/// at its second `1` (`1 0^k 1`, a palindrome); one that begins with `0`
+/// ends at its third `0` (`0 1^a 0 1^b 0`). Neither rule depends on the
+/// direction of reading, so a reader going backwards — sign, free bit, then
+/// the core from its far end — finds the same boundaries.
+pub(crate) const RVLC_TCOEF: &[(&str, (u8, u8, u8), (u8, u8, u8))] = &[
+    ("110", (0, 0, 1), (0, 0, 1)),
+    ("111", (0, 0, 2), (0, 1, 1)),
+    ("0001", (0, 1, 1), (0, 0, 2)),
+    ("1010", (0, 0, 3), (0, 2, 1)),
+    ("1011", (1, 0, 1), (1, 0, 1)),
+    ("00100", (0, 2, 1), (0, 0, 3)),
+    ("00101", (0, 3, 1), (0, 3, 1)),
+    ("01000", (0, 1, 2), (0, 4, 1)),
+    ("01001", (0, 0, 4), (0, 5, 1)),
+    ("10010", (1, 1, 1), (1, 1, 1)),
+    ("10011", (1, 2, 1), (1, 2, 1)),
+    ("001100", (0, 4, 1), (0, 1, 2)),
+    ("001101", (0, 5, 1), (0, 6, 1)),
+    ("010100", (0, 0, 5), (0, 7, 1)),
+    ("010101", (0, 0, 6), (0, 8, 1)),
+    ("011000", (1, 3, 1), (1, 3, 1)),
+    ("011001", (1, 4, 1), (1, 4, 1)),
+    ("100010", (1, 5, 1), (1, 5, 1)),
+    ("100011", (1, 6, 1), (1, 6, 1)),
+    ("0011100", (0, 6, 1), (0, 0, 4)),
+    ("0011101", (0, 7, 1), (0, 2, 2)),
+    ("0101100", (0, 2, 2), (0, 9, 1)),
+    ("0101101", (0, 1, 3), (0, 10, 1)),
+    ("0110100", (0, 0, 7), (0, 11, 1)),
+    ("0110101", (1, 7, 1), (1, 7, 1)),
+    ("0111000", (1, 8, 1), (1, 8, 1)),
+    ("0111001", (1, 9, 1), (1, 9, 1)),
+    ("1000010", (1, 10, 1), (1, 10, 1)),
+    ("1000011", (1, 11, 1), (1, 11, 1)),
+    ("00111100", (0, 8, 1), (0, 0, 5)),
+    ("00111101", (0, 9, 1), (0, 0, 6)),
+    ("01011100", (0, 3, 2), (0, 1, 3)),
+    ("01011101", (0, 4, 2), (0, 3, 2)),
+    ("01101100", (0, 1, 4), (0, 4, 2)),
+    ("01101101", (0, 1, 5), (0, 12, 1)),
+    ("01110100", (0, 0, 8), (0, 13, 1)),
+    ("01110101", (0, 0, 9), (0, 14, 1)),
+    ("01111000", (1, 0, 2), (1, 0, 2)),
+    ("01111001", (1, 12, 1), (1, 12, 1)),
+    ("10000010", (1, 13, 1), (1, 13, 1)),
+    ("10000011", (1, 14, 1), (1, 14, 1)),
+    ("001111100", (0, 10, 1), (0, 0, 7)),
+    ("001111101", (0, 5, 2), (0, 1, 4)),
+    ("010111100", (0, 2, 3), (0, 2, 3)),
+    ("010111101", (0, 3, 3), (0, 5, 2)),
+    ("011011100", (0, 1, 6), (0, 15, 1)),
+    ("011011101", (0, 0, 10), (0, 16, 1)),
+    ("011101100", (0, 0, 11), (0, 17, 1)),
+    ("011101101", (1, 1, 2), (1, 1, 2)),
+    ("011110100", (1, 15, 1), (1, 15, 1)),
+    ("011110101", (1, 16, 1), (1, 16, 1)),
+    ("011111000", (1, 17, 1), (1, 17, 1)),
+    ("011111001", (1, 18, 1), (1, 18, 1)),
+    ("100000010", (1, 19, 1), (1, 19, 1)),
+    ("100000011", (1, 20, 1), (1, 20, 1)),
+    ("0011111100", (0, 11, 1), (0, 0, 8)),
+    ("0011111101", (0, 12, 1), (0, 0, 9)),
+    ("0101111100", (0, 6, 2), (0, 1, 5)),
+    ("0101111101", (0, 7, 2), (0, 3, 3)),
+    ("0110111100", (0, 8, 2), (0, 6, 2)),
+    ("0110111101", (0, 4, 3), (0, 7, 2)),
+    ("0111011100", (0, 2, 4), (0, 8, 2)),
+    ("0111011101", (0, 1, 7), (0, 9, 2)),
+    ("0111101100", (0, 0, 12), (0, 18, 1)),
+    ("0111101101", (0, 0, 13), (0, 19, 1)),
+    ("0111110100", (0, 0, 14), (0, 20, 1)),
+    ("0111110101", (1, 21, 1), (1, 21, 1)),
+    ("0111111000", (1, 22, 1), (1, 22, 1)),
+    ("0111111001", (1, 23, 1), (1, 23, 1)),
+    ("1000000010", (1, 24, 1), (1, 24, 1)),
+    ("1000000011", (1, 25, 1), (1, 25, 1)),
+    ("00111111100", (0, 13, 1), (0, 0, 10)),
+    ("00111111101", (0, 9, 2), (0, 0, 11)),
+    ("01011111100", (0, 5, 3), (0, 1, 6)),
+    ("01011111101", (0, 6, 3), (0, 2, 4)),
+    ("01101111100", (0, 7, 3), (0, 4, 3)),
+    ("01101111101", (0, 3, 4), (0, 5, 3)),
+    ("01110111100", (0, 2, 5), (0, 10, 2)),
+    ("01110111101", (0, 2, 6), (0, 21, 1)),
+    ("01111011100", (0, 1, 8), (0, 22, 1)),
+    ("01111011101", (0, 1, 9), (0, 23, 1)),
+    ("01111101100", (0, 0, 15), (0, 24, 1)),
+    ("01111101101", (0, 0, 16), (0, 25, 1)),
+    ("01111110100", (0, 0, 17), (0, 26, 1)),
+    ("01111110101", (1, 0, 3), (1, 0, 3)),
+    ("01111111000", (1, 2, 2), (1, 2, 2)),
+    ("01111111001", (1, 26, 1), (1, 26, 1)),
+    ("10000000010", (1, 27, 1), (1, 27, 1)),
+    ("10000000011", (1, 28, 1), (1, 28, 1)),
+    ("001111111100", (0, 10, 2), (0, 0, 12)),
+    ("001111111101", (0, 4, 4), (0, 1, 7)),
+    ("010111111100", (0, 5, 4), (0, 2, 5)),
+    ("010111111101", (0, 6, 4), (0, 3, 4)),
+    ("011011111100", (0, 3, 5), (0, 6, 3)),
+    ("011011111101", (0, 4, 5), (0, 7, 3)),
+    ("011101111100", (0, 1, 10), (0, 11, 2)),
+    ("011101111101", (0, 0, 18), (0, 27, 1)),
+    ("011110111100", (0, 0, 19), (0, 28, 1)),
+    ("011110111101", (0, 0, 22), (0, 29, 1)),
+    ("011111011100", (1, 1, 3), (1, 1, 3)),
+    ("011111011101", (1, 3, 2), (1, 3, 2)),
+    ("011111101100", (1, 4, 2), (1, 4, 2)),
+    ("011111101101", (1, 29, 1), (1, 29, 1)),
+    ("011111110100", (1, 30, 1), (1, 30, 1)),
+    ("011111110101", (1, 31, 1), (1, 31, 1)),
+    ("011111111000", (1, 32, 1), (1, 32, 1)),
+    ("011111111001", (1, 33, 1), (1, 33, 1)),
+    ("100000000010", (1, 34, 1), (1, 34, 1)),
+    ("100000000011", (1, 35, 1), (1, 35, 1)),
+    ("0011111111100", (0, 14, 1), (0, 0, 13)),
+    ("0011111111101", (0, 15, 1), (0, 0, 14)),
+    ("0101111111100", (0, 11, 2), (0, 0, 15)),
+    ("0101111111101", (0, 8, 3), (0, 0, 16)),
+    ("0110111111100", (0, 9, 3), (0, 1, 8)),
+    ("0110111111101", (0, 7, 4), (0, 3, 5)),
+    ("0111011111100", (0, 3, 6), (0, 4, 4)),
+    ("0111011111101", (0, 2, 7), (0, 5, 4)),
+    ("0111101111100", (0, 2, 8), (0, 8, 3)),
+    ("0111101111101", (0, 2, 9), (0, 12, 2)),
+    ("0111110111100", (0, 1, 11), (0, 30, 1)),
+    ("0111110111101", (0, 0, 20), (0, 31, 1)),
+    ("0111111011100", (0, 0, 21), (0, 32, 1)),
+    ("0111111011101", (0, 0, 23), (0, 33, 1)),
+    ("0111111101100", (1, 0, 4), (1, 0, 4)),
+    ("0111111101101", (1, 5, 2), (1, 5, 2)),
+    ("0111111110100", (1, 6, 2), (1, 6, 2)),
+    ("0111111110101", (1, 7, 2), (1, 7, 2)),
+    ("0111111111000", (1, 8, 2), (1, 8, 2)),
+    ("0111111111001", (1, 9, 2), (1, 9, 2)),
+    ("1000000000010", (1, 36, 1), (1, 36, 1)),
+    ("1000000000011", (1, 37, 1), (1, 37, 1)),
+    ("00111111111100", (0, 16, 1), (0, 0, 17)),
+    ("00111111111101", (0, 17, 1), (0, 0, 18)),
+    ("01011111111100", (0, 18, 1), (0, 1, 9)),
+    ("01011111111101", (0, 8, 4), (0, 1, 10)),
+    ("01101111111100", (0, 5, 5), (0, 2, 6)),
+    ("01101111111101", (0, 4, 6), (0, 2, 7)),
+    ("01110111111100", (0, 5, 6), (0, 3, 6)),
+    ("01110111111101", (0, 3, 7), (0, 6, 4)),
+    ("01111011111100", (0, 3, 8), (0, 9, 3)),
+    ("01111011111101", (0, 2, 10), (0, 13, 2)),
+    ("01111101111100", (0, 2, 11), (0, 14, 2)),
+    ("01111101111101", (0, 1, 12), (0, 15, 2)),
+    ("01111110111100", (0, 1, 13), (0, 16, 2)),
+    ("01111110111101", (0, 0, 24), (0, 34, 1)),
+    ("01111111011100", (0, 0, 25), (0, 35, 1)),
+    ("01111111011101", (0, 0, 26), (0, 36, 1)),
+    ("01111111101100", (1, 0, 5), (1, 0, 5)),
+    ("01111111101101", (1, 1, 4), (1, 1, 4)),
+    ("01111111110100", (1, 10, 2), (1, 10, 2)),
+    ("01111111110101", (1, 11, 2), (1, 11, 2)),
+    ("01111111111000", (1, 12, 2), (1, 12, 2)),
+    ("01111111111001", (1, 38, 1), (1, 38, 1)),
+    ("10000000000010", (1, 39, 1), (1, 39, 1)),
+    ("10000000000011", (1, 40, 1), (1, 40, 1)),
+    ("001111111111100", (0, 0, 27), (0, 0, 19)),
+    ("001111111111101", (0, 3, 9), (0, 3, 7)),
+    ("010111111111100", (0, 6, 5), (0, 4, 5)),
+    ("010111111111101", (0, 7, 5), (0, 7, 4)),
+    ("011011111111100", (0, 9, 4), (0, 17, 2)),
+    ("011011111111101", (0, 12, 2), (0, 37, 1)),
+    ("011101111111100", (0, 19, 1), (0, 38, 1)),
+    ("011101111111101", (1, 1, 5), (1, 1, 5)),
+    ("011110111111100", (1, 2, 3), (1, 2, 3)),
+    ("011110111111101", (1, 13, 2), (1, 13, 2)),
+    ("011111011111100", (1, 41, 1), (1, 41, 1)),
+    ("011111011111101", (1, 42, 1), (1, 42, 1)),
+    ("011111101111100", (1, 43, 1), (1, 43, 1)),
+    ("011111101111101", (1, 44, 1), (1, 44, 1)),
+];
+
+/// The reversible escape's code (the core `000` with free bit `0`), the
+/// fifth bit after it being the sign position of Table B-23's `0000s`. An
+/// escaped event is `0000 1`, `last`, a 6-bit `run`, a marker, an 11-bit
+/// `|level|` (1..=2047), a marker and `0000 s`: the leading code always ends
+/// in `1`, the trailing one carries the sign.
+pub(crate) const RVLC_ESCAPE: &str = "0000";
+
 /// Parses a codeword string into `(bits, length)`.
 pub(crate) fn code(s: &str) -> (u32, u32) {
     let mut v = 0u32;
@@ -684,5 +875,168 @@ mod tests {
         assert_eq!(c[23], 18);
         assert_eq!(c[24], 19);
         assert_eq!(c[30], 25);
+    }
+
+    /// The length of the RVLC core a bit string begins with: up to the
+    /// second `1` when it starts with `1`, the third `0` when it starts
+    /// with `0` (None when the string ends first).
+    fn rvlc_core_len(bits: &[u8]) -> Option<usize> {
+        let b = *bits.first()?;
+        let need = if b == 1 { 2 } else { 3 };
+        let mut seen = 0;
+        for (i, &x) in bits.iter().enumerate() {
+            if x == b {
+                seen += 1;
+                if seen == need {
+                    return Some(i + 1);
+                }
+            }
+        }
+        None
+    }
+
+    fn bits_of(s: &str) -> Vec<u8> {
+        s.bytes().filter(|&c| c != b' ').map(|c| c - b'0').collect()
+    }
+
+    /// Every core of a given length the construction allows, ascending.
+    fn rvlc_cores(len: usize) -> Vec<Vec<u8>> {
+        let mut v = Vec::new();
+        for n in 0u32..1 << len {
+            let bits: Vec<u8> = (0..len).rev().map(|i| (n >> i & 1) as u8).collect();
+            if rvlc_core_len(&bits) == Some(len) {
+                v.push(bits);
+            }
+        }
+        v
+    }
+
+    fn prefix_free(codes: &[Vec<u8>]) -> bool {
+        codes.iter().enumerate().all(|(i, a)| {
+            codes
+                .iter()
+                .enumerate()
+                .all(|(j, b)| i == j || !(b.len() >= a.len() && b[..a.len()] == a[..]))
+        })
+    }
+
+    /// Table B-23 checked against the construction it was built by: each
+    /// code is a core (the shortest prefix with two `1`s, for a leading
+    /// `1`, or three `0`s, for a leading `0`) plus exactly one free bit;
+    /// the `1` cores read the same both ways; within each length the codes
+    /// run through every core in ascending order with both free bits — the
+    /// escape `0000` taking `000` with free bit 0 — and only the longest
+    /// length (16 bits with the sign) stops part way.
+    #[test]
+    fn rvlc_codes_follow_their_construction() {
+        assert_eq!(RVLC_TCOEF.len(), 169);
+        let codes: Vec<Vec<u8>> = RVLC_TCOEF.iter().map(|e| bits_of(e.0)).collect();
+        for c in &codes {
+            let core = rvlc_core_len(c).expect("a core");
+            assert_eq!(core + 1, c.len(), "{c:?}: one free bit after the core");
+            if c[0] == 1 {
+                let k = &c[..core];
+                assert!(k.iter().eq(k.iter().rev()), "{c:?}: 1-cores are palindromes");
+            }
+        }
+        // The expected list, built from the construction alone.
+        let mut built: Vec<Vec<u8>> = Vec::new();
+        for core_len in 2..=14 {
+            for core in rvlc_cores(core_len) {
+                for x in [0u8, 1] {
+                    let mut c = core.clone();
+                    c.push(x);
+                    if c != bits_of(RVLC_ESCAPE) {
+                        built.push(c);
+                    }
+                }
+            }
+        }
+        assert_eq!(built[..codes.len()], codes[..], "codes in construction order");
+        // The last length is the only one cut short.
+        let last = codes.last().unwrap().len();
+        assert_eq!(last, 15);
+        assert!(built[..codes.len()].iter().all(|c| c.len() <= last));
+        assert!(built[codes.len()..].iter().all(|c| c.len() == last));
+    }
+
+    /// The code is instantaneous in both directions: the codes and escape
+    /// with their sign bit form a prefix-free set, and so do the same
+    /// codes reversed (what a reader going backwards sees).
+    #[test]
+    fn rvlc_is_prefix_free_both_ways() {
+        let mut fwd: Vec<Vec<u8>> = Vec::new();
+        for e in RVLC_TCOEF {
+            for s in [0u8, 1] {
+                let mut c = bits_of(e.0);
+                c.push(s);
+                fwd.push(c);
+            }
+        }
+        for s in [0u8, 1] {
+            let mut c = bits_of(RVLC_ESCAPE);
+            c.push(s);
+            fwd.push(c);
+        }
+        assert!(prefix_free(&fwd), "forward");
+        let bwd: Vec<Vec<u8>> = fwd
+            .iter()
+            .map(|c| c.iter().rev().copied().collect())
+            .collect();
+        assert!(prefix_free(&bwd), "backward");
+        // Without the sign the bodies are prefix-free and suffix-free too.
+        let mut bodies: Vec<Vec<u8>> = RVLC_TCOEF.iter().map(|e| bits_of(e.0)).collect();
+        bodies.push(bits_of(RVLC_ESCAPE));
+        assert!(prefix_free(&bodies));
+        let rev: Vec<Vec<u8>> = bodies
+            .iter()
+            .map(|c| c.iter().rev().copied().collect())
+            .collect();
+        assert!(prefix_free(&rev));
+        let kraft: f64 = bodies.iter().map(|c| 0.5f64.powi(c.len() as i32)).sum();
+        assert!(kraft < 1.0 && kraft > 0.99, "{kraft}");
+    }
+
+    /// Each column codes every event once; the intra and inter columns
+    /// code the same `last = 1` events (runs 0..=44 at level 1, and the
+    /// same higher levels), as Table B-23 prints them.
+    #[test]
+    fn rvlc_events() {
+        for intra in [true, false] {
+            let ev: Vec<(u8, u8, u8)> = RVLC_TCOEF
+                .iter()
+                .map(|e| if intra { e.1 } else { e.2 })
+                .collect();
+            let set: std::collections::HashSet<_> = ev.iter().copied().collect();
+            assert_eq!(set.len(), 169, "intra {intra}: an event coded twice");
+            assert!(ev.iter().all(|&(l, r, v)| l <= 1 && r < 64 && v >= 1));
+            // For each (last, run) the levels coded are 1..=max, no gaps.
+            for last in 0..=1u8 {
+                for run in 0..64u8 {
+                    let mut lv: Vec<u8> = ev
+                        .iter()
+                        .filter(|e| e.0 == last && e.1 == run)
+                        .map(|e| e.2)
+                        .collect();
+                    lv.sort();
+                    assert!(lv.iter().enumerate().all(|(i, &v)| v as usize == i + 1));
+                }
+            }
+        }
+        let l1 = |intra: bool| -> Vec<(u8, u8, u8)> {
+            let mut v: Vec<_> = RVLC_TCOEF
+                .iter()
+                .map(|e| if intra { e.1 } else { e.2 })
+                .filter(|e| e.0 == 1)
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(l1(true), l1(false));
+        assert_eq!(l1(true).iter().filter(|e| e.2 == 1).count(), 45);
+        // Spot entries.
+        assert_eq!(RVLC_TCOEF[0], ("110", (0, 0, 1), (0, 0, 1)));
+        assert_eq!(RVLC_TCOEF[155].1, (0, 0, 27));
+        assert_eq!(RVLC_TCOEF[168], ("011111101111101", (1, 44, 1), (1, 44, 1)));
     }
 }
