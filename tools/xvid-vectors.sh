@@ -30,10 +30,14 @@ if [ ! -x prefix/bin/xvid_decraw ]; then
     [ -f "$tgz" ] || curl -fsSL --retry 3 -o "$tgz" "https://downloads.xvid.com/downloads/$tgz"
     echo "$sum  $tgz" | sha256sum -c --quiet
     rm -rf xvidcore && tar xzf "$tgz"
-    (cd xvidcore/build/generic &&
-        ./configure --prefix="$work/prefix" --disable-assembly >/dev/null 2>&1 &&
-        make -j"$(nproc 2>/dev/null || echo 4)" >/dev/null 2>&1 &&
-        make install >/dev/null 2>&1)
+    # Quiet unless it fails; then the log says why.
+    if ! (cd xvidcore/build/generic &&
+        ./configure --prefix="$work/prefix" --disable-assembly &&
+        make -j"$(nproc 2>/dev/null || echo 4)" &&
+        make install) >"$work/build.log" 2>&1; then
+        tail -40 "$work/build.log"
+        exit 1
+    fi
     mkdir -p prefix/bin
     defs="-DARCH_IS_64BIT -DARCH_IS_GENERIC -DARCH_IS_LITTLE_ENDIAN"
     for tool in xvid_encraw xvid_decraw; do
