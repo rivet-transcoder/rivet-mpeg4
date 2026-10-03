@@ -29,7 +29,9 @@ if [ ! -x prefix/bin/xvid_decraw ]; then
     tgz=xvidcore-$ver.tar.gz
     [ -f "$tgz" ] || curl -fsSL --retry 3 -o "$tgz" "https://downloads.xvid.com/downloads/$tgz"
     echo "$sum  $tgz" | sha256sum -c --quiet
-    rm -rf xvidcore && tar xzf "$tgz"
+    # A partial prefix (a CI cache of target/ keeps the library and
+    # drops the programs) makes `make install` fail on its symlinks.
+    rm -rf xvidcore prefix && tar xzf "$tgz"
     # Quiet unless it fails; then the log says why.
     if ! (cd xvidcore/build/generic &&
         ./configure --prefix="$work/prefix" --disable-assembly &&
