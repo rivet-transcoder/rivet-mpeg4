@@ -153,8 +153,11 @@ pub(crate) fn qpel(
         }
         return;
     }
+    let variant: i32 = std::env::var("MPEG4_QPEL_VARIANT").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let rc = rounding as i32;
-    let avg = |a: u8, b: u8| ((a as u32 + b as u32 + 1 - rc as u32) >> 1) as u8;
+    let rca = if variant & 2 != 0 { 0 } else { rc };
+    let rc = if variant & 1 != 0 { 0 } else { rc };
+    let avg = |a: u8, b: u8| ((a as u32 + b as u32 + 1 - rca as u32) >> 1) as u8;
     // Pass 1: every window row at the horizontal position, `bw` wide.
     let mut hq = [0u8; 17 * 16];
     let mut half = [0u8; 16];
