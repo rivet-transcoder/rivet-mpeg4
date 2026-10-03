@@ -215,6 +215,14 @@ impl Encoder {
         let fcode = (1..=7u32)
             .find(|&f| 32 * (1 << (f - 1)) > need)
             .unwrap_or(7);
+        // With video packets in B-VOPs, at least 2: a B-VOP's resync marker
+        // is 16 + vop_fcode bits by 6.3.5.2, but with both codes 1 Xvid
+        // writes and expects 18. From 2 up the two agree.
+        let fcode = if cfg.b_frames > 0 && cfg.packet_bytes.is_some() {
+            fcode.max(2)
+        } else {
+            fcode
+        };
         let mbw = cfg.width.div_ceil(16) as usize;
         let mbh = cfg.height.div_ceil(16) as usize;
         let advanced = cfg.b_frames > 0;
