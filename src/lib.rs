@@ -56,7 +56,7 @@ pub(crate) mod tables;
 pub(crate) mod vlc;
 
 pub use dec::{Decoder, DecoderStats};
-pub use enc::{Encoder, EncoderConfig, RateControl};
+pub use enc::{Encoder, EncoderConfig, Quantiser, RateControl};
 pub use error::{Error, Result};
 pub use frame::{Frame, Plane, VopType};
 pub use headers::{ColourDescription, SpriteMode, VideoSignal, VolHeader};

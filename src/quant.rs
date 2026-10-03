@@ -112,6 +112,25 @@ pub(crate) fn quantise_h263(b: &mut [i16; 64], qp: u32, intra: bool) {
     }
 }
 
+/// Forward quantisation for the first (MPEG) method, the inverse of
+/// [`Quant::intra`] / [`Quant::inter`]: with `step = W QP / 8` per
+/// coefficient, intra AC levels are `|F| / step` rounded to the nearest,
+/// inter levels `|F| / step` truncated (the inverse puts them back at the
+/// middle of their interval), clipped to 2047. The intra DC is left to the
+/// caller.
+pub(crate) fn quantise_mpeg(b: &mut [i16; 64], qp: u32, intra: bool, matrix: &[u8; 64]) {
+    let qp = qp as i32;
+    let from = if intra { 1 } else { 0 };
+    for (v, &w) in b.iter_mut().zip(matrix).skip(from) {
+        let c = *v as i32;
+        let d = w as i32 * qp;
+        let a = 8 * c.abs();
+        let l = if intra { (a + d / 2) / d } else { a / d };
+        let l = l.min(2047);
+        *v = (if c < 0 { -l } else { l }) as i16;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +225,48 @@ mod tests {
                     "qp {qp} c {c} -> {}",
                     r[1]
                 );
+            }
+        }
+    }
+
+    /// The MPEG forward quantiser puts every coefficient back within half
+    /// a step (intra) or within a step (inter) through the inverse, before
+    /// mismatch control and saturation.
+    #[test]
+    fn mpeg_forward_quantiser_inverts() {
+        let q = Quant {
+            mpeg: true,
+            intra_matrix: crate::tables::DEFAULT_INTRA_MATRIX,
+            inter_matrix: crate::tables::DEFAULT_INTER_MATRIX,
+        };
+        for qp in [1u32, 4, 13, 31] {
+            for f in (-2000i32..2000).step_by(37) {
+                for intra in [true, false] {
+                    let m = if intra {
+                        &q.intra_matrix
+                    } else {
+                        &q.inter_matrix
+                    };
+                    let mut b = [0i16; 64];
+                    b[9] = f as i16;
+                    quantise_mpeg(&mut b, qp, intra, m);
+                    let mut r = b;
+                    // Undo mismatch control's toggle of the last coefficient.
+                    if intra {
+                        r[0] = 0;
+                        q.intra(&mut r, qp, 8);
+                    } else {
+                        q.inter(&mut r, qp);
+                    }
+                    let step = m[9] as i32 * qp as i32 / 8;
+                    let err = (r[9] as i32 - f).abs();
+                    let bound = if intra { step / 2 + 1 } else { step + 1 };
+                    assert!(
+                        err <= bound.max(1) || b[9] == 0,
+                        "qp {qp} f {f} intra {intra}: {} err {err}",
+                        r[9]
+                    );
+                }
             }
         }
     }

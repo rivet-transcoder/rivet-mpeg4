@@ -801,6 +801,24 @@ pub(crate) struct VolParams {
     pub data_partitioned: bool,
     pub reversible_vlc: bool,
     pub video_signal: Option<VideoSignal>,
+    pub quarter_sample: bool,
+    /// The MPEG quantiser and its intra and non-intra matrices (raster).
+    pub mpeg_quant: Option<([u8; 64], [u8; 64])>,
+}
+
+/// Writes a quantiser matrix: zigzag order, stopping with a zero after the
+/// last value that differs from the rest (which the reader repeats).
+fn write_matrix(w: &mut BitWriter, m: &[u8; 64]) {
+    let z: Vec<u8> = ZIGZAG.iter().map(|&i| m[i as usize]).collect();
+    let tail = z[63];
+    // Values up to and including the last one before the repeating tail.
+    let n = z.iter().rposition(|&v| v != tail).map_or(1, |i| i + 2);
+    for &v in &z[..n] {
+        w.put(8, v as u32);
+    }
+    if n < 64 {
+        w.put(8, 0);
+    }
 }
 
 /// Visual object sequence, visual object and video object layer headers:
@@ -835,7 +853,16 @@ pub(crate) fn write_config(p: &VolParams) -> Vec<u8> {
     w.put(1, 0); // random_accessible_vol
     // video_object_type_indication: Simple (1) or Advanced Simple (17).
     w.put(8, if p.advanced_simple { 0x11 } else { 1 });
-    w.put(1, 0); // is_object_layer_identifier
+    // Verid 2 when an Advanced Simple tool needs its fields
+    // (quarter_sample).
+    let verid2 = p.advanced_simple;
+    if verid2 {
+        w.put(1, 1); // is_object_layer_identifier
+        w.put(4, 2); // video_object_layer_verid
+        w.put(3, 1); // video_object_layer_priority
+    } else {
+        w.put(1, 0);
+    }
     w.put(4, 1); // aspect_ratio_info: square samples
     w.put(1, 1); // vol_control_parameters
     w.put(2, 1); // chroma_format 4:2:0
@@ -860,14 +887,37 @@ pub(crate) fn write_config(p: &VolParams) -> Vec<u8> {
     w.put(1, 1);
     w.put(1, 0); // interlaced
     w.put(1, 1); // obmc_disable
-    w.put(1, 0); // sprite_enable
+    w.put(if verid2 { 2 } else { 1 }, 0); // sprite_enable
     w.put(1, 0); // not_8_bit
-    w.put(1, 0); // quant_type: H.263
+    match &p.mpeg_quant {
+        None => w.put(1, 0), // quant_type: H.263
+        Some((intra, inter)) => {
+            w.put(1, 1);
+            for (m, default) in [
+                (intra, &DEFAULT_INTRA_MATRIX),
+                (inter, &DEFAULT_INTER_MATRIX),
+            ] {
+                if m == default {
+                    w.put(1, 0);
+                } else {
+                    w.put(1, 1);
+                    write_matrix(&mut w, m);
+                }
+            }
+        }
+    }
+    if verid2 {
+        w.put(1, p.quarter_sample as u32);
+    }
     w.put(1, 1); // complexity_estimation_disable
     w.put(1, !p.resync_markers as u32); // resync_marker_disable
     w.put(1, p.data_partitioned as u32);
     if p.data_partitioned {
         w.put(1, p.reversible_vlc as u32);
+    }
+    if verid2 {
+        w.put(1, 0); // newpred_enable
+        w.put(1, 0); // reduced_resolution_vop_enable
     }
     w.put(1, 0); // scalability
     w.stuff();
@@ -943,6 +993,8 @@ mod tests {
                 full_range: false,
                 colour: Some(ColourDescription::SMPTE170M),
             }),
+            quarter_sample: false,
+            mpeg_quant: None,
         };
         let b = write_config(&p);
         assert_eq!(&b[..5], &[0, 0, 1, 0xb0, 3]);
@@ -999,6 +1051,53 @@ mod tests {
             assert_eq!(&b[..4], &[0, 0, 1, sc::VOP]);
             let got = parse_vop(&mut BitReader::new(&b[4..]), &vol).unwrap();
             assert_eq!(got, h);
+        }
+    }
+
+    /// An Advanced Simple VOL with quarter-sample motion and the MPEG
+    /// quantiser with one custom matrix reads back as written.
+    #[test]
+    fn advanced_simple_config_round_trips() {
+        let mut inter = DEFAULT_INTER_MATRIX;
+        inter[5] = 99;
+        inter[63] = 40;
+        for (matrices, q) in [
+            ((DEFAULT_INTRA_MATRIX, DEFAULT_INTER_MATRIX), true),
+            ((DEFAULT_INTRA_MATRIX, inter), false),
+            ((DEFAULT_INTRA_MATRIX, [16; 64]), true),
+        ] {
+            let p = VolParams {
+                profile_and_level: 0xf3,
+                advanced_simple: true,
+                width: 352,
+                height: 288,
+                time_resolution: 25,
+                fixed_increment: Some(1),
+                resync_markers: false,
+                data_partitioned: true,
+                reversible_vlc: true,
+                video_signal: None,
+                quarter_sample: q,
+                mpeg_quant: Some(matrices),
+            };
+            let b = write_config(&p);
+            let mut vo = VisualObject::default();
+            let mut vol = None;
+            for (code, body) in crate::dec::split_units(&b) {
+                let mut r = BitReader::new(body);
+                match code {
+                    sc::VISUAL_OBJECT => vo = parse_visual_object(&mut r).unwrap(),
+                    sc::VOL_FIRST => vol = Some(parse_vol(&mut r, vo, None).unwrap()),
+                    _ => {}
+                }
+            }
+            let vol = vol.unwrap();
+            assert_eq!((vol.object_type, vol.verid), (0x11, 2));
+            assert!(vol.mpeg_quant);
+            assert_eq!((vol.intra_matrix, vol.inter_matrix), matrices);
+            assert_eq!(vol.quarter_sample, q);
+            assert!(vol.data_partitioned && vol.reversible_vlc);
+            assert!(!vol.newpred && !vol.reduced_resolution);
         }
     }
 

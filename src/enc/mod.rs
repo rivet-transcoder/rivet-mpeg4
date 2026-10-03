@@ -21,7 +21,7 @@ use crate::idct::{fdct, idct};
 use crate::mbstate::{Dir, IntraPred, MbKind, MbState, ac_pred_value, round_div};
 use crate::mc;
 use crate::picture::Pic;
-use crate::quant::{Quant, quantise_h263};
+use crate::quant::{Quant, quantise_h263, quantise_mpeg};
 use crate::tables::{ALT_HORIZONTAL, ALT_VERTICAL, ZIGZAG, code, dc_scaler};
 use syntax::{MbSyntax, write_partitioned};
 use write::*;
@@ -35,6 +35,33 @@ pub enum RateControl {
     /// A target bit rate in bits per second: one quantiser per VOP, raised
     /// and lowered to keep the running total near the target.
     Bitrate(u32),
+}
+
+/// The inverse quantisation the encoder declares (`quant_type`, 6.3.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Quantiser {
+    /// The second (H.263) method: one step size per macroblock.
+    H263,
+    /// The first (MPEG) method, with weighting matrices in raster order:
+    /// each 1..=255, the intra matrix's first entry 8 (it is not used: the
+    /// intra DC has its own scaler). An Advanced Simple Profile tool.
+    Mpeg {
+        /// Intra weighting matrix.
+        intra: [u8; 64],
+        /// Non-intra weighting matrix.
+        inter: [u8; 64],
+    },
+}
+
+impl Quantiser {
+    /// The MPEG method with the default matrices of 6.3.3 (which the VOL
+    /// then need not carry).
+    pub fn mpeg_default() -> Quantiser {
+        Quantiser::Mpeg {
+            intra: crate::tables::DEFAULT_INTRA_MATRIX,
+            inter: crate::tables::DEFAULT_INTER_MATRIX,
+        }
+    }
 }
 
 /// Encoder settings. [`EncoderConfig::new`] fills in the defaults.
@@ -62,6 +89,11 @@ pub struct EncoderConfig {
     pub search_range: u32,
     /// Let P-VOP macroblocks use four vectors where that predicts better.
     pub four_mv: bool,
+    /// Quarter-sample motion vectors (7.6.2.2's 8-tap interpolation), an
+    /// Advanced Simple Profile tool: the search refines to quarter samples.
+    pub quarter_sample: bool,
+    /// The quantiser: H.263 (the default) or MPEG with matrices.
+    pub quantiser: Quantiser,
     /// Start a new video packet (a resync marker) once the current one
     /// passes this many bytes; `None` codes each VOP as one packet with
     /// resync markers disabled in the VOL.
@@ -101,6 +133,8 @@ impl EncoderConfig {
             rate: RateControl::ConstantQuant(5),
             search_range: 15,
             four_mv: false,
+            quarter_sample: false,
+            quantiser: Quantiser::H263,
             packet_bytes: None,
             data_partitioning: false,
             reversible_vlc: false,
@@ -228,6 +262,13 @@ impl Encoder {
         {
             return Err(config(format!("video_format {} (0..=7)", v.video_format)));
         }
+        if let Quantiser::Mpeg { intra, inter } = &cfg.quantiser
+            && (intra[0] != 8 || intra.contains(&0) || inter.contains(&0))
+        {
+            return Err(config(
+                "quantiser matrices: every entry 1..=255, the intra matrix's first 8",
+            ));
+        }
         if cfg.reversible_vlc && !cfg.data_partitioning {
             return Err(config("reversible VLCs without data partitioning"));
         }
@@ -240,7 +281,8 @@ impl Encoder {
         }
         // The smallest f_code whose range [-32 f, 32 f - 1] half samples
         // holds every vector the search can return.
-        let need = 2 * cfg.search_range as i32 + 1;
+        let unit = if cfg.quarter_sample { 4 } else { 2 };
+        let need = unit * cfg.search_range as i32 + unit - 1;
         let fcode = (1..=7u32)
             .find(|&f| 32 * (1 << (f - 1)) > need)
             .unwrap_or(7);
@@ -254,7 +296,15 @@ impl Encoder {
         };
         let mbw = cfg.width.div_ceil(16) as usize;
         let mbh = cfg.height.div_ceil(16) as usize;
-        let advanced = cfg.b_frames > 0;
+        let mpeg = matches!(cfg.quantiser, Quantiser::Mpeg { .. });
+        let advanced = cfg.b_frames > 0 || cfg.quarter_sample || mpeg;
+        let (intra_matrix, inter_matrix) = match &cfg.quantiser {
+            Quantiser::Mpeg { intra, inter } => (*intra, *inter),
+            Quantiser::H263 => (
+                crate::tables::DEFAULT_INTRA_MATRIX,
+                crate::tables::DEFAULT_INTER_MATRIX,
+            ),
+        };
         let config_bytes = headers::write_config(&VolParams {
             profile_and_level: profile_level(mbw * mbh, advanced),
             advanced_simple: advanced,
@@ -266,6 +316,8 @@ impl Encoder {
             data_partitioned: cfg.data_partitioning,
             reversible_vlc: cfg.reversible_vlc,
             video_signal: cfg.video_signal,
+            quarter_sample: cfg.quarter_sample,
+            mpeg_quant: mpeg.then_some((intra_matrix, inter_matrix)),
         });
         let rc = match cfg.rate {
             RateControl::Bitrate(bps) => {
@@ -296,7 +348,11 @@ impl Encoder {
             last_ref_sec: 0,
             prev_ref_sec: 0,
             rounding: false,
-            quant: Quant::h263(),
+            quant: Quant {
+                mpeg,
+                intra_matrix,
+                inter_matrix,
+            },
             rc,
             recons: Vec::new(),
             force_intra: false,
@@ -684,7 +740,8 @@ impl Encoder {
         // estimate.
         let mut pf = MbPix::new();
         let mut pb = MbPix::new();
-        predict_mb(&past.pic, mbx, mby, &[mvf; 4], false, false, false, &mut pf);
+        let qpel = self.cfg.quarter_sample;
+        predict_mb(&past.pic, mbx, mby, &[mvf; 4], false, false, qpel, &mut pf);
         predict_mb(
             &future.pic,
             mbx,
@@ -692,7 +749,7 @@ impl Encoder {
             &[mvb; 4],
             false,
             false,
-            false,
+            qpel,
             &mut pb,
         );
         let mut pi = MbPix {
@@ -706,8 +763,8 @@ impl Encoder {
         let (dmf, dmb) = direct_vectors(&future.motion, mbx, mby, [0, 0], trb, trd);
         let mut pd = MbPix::new();
         let mut pdb = MbPix::new();
-        predict_mb(&past.pic, mbx, mby, &dmf, true, false, false, &mut pd);
-        predict_mb(&future.pic, mbx, mby, &dmb, true, false, false, &mut pdb);
+        predict_mb(&past.pic, mbx, mby, &dmf, true, false, qpel, &mut pd);
+        predict_mb(&future.pic, mbx, mby, &dmb, true, false, qpel, &mut pdb);
         mc::average(&mut pd.y, &pdb.y);
         mc::average(&mut pd.cb, &pdb.cb);
         mc::average(&mut pd.cr, &pdb.cr);
@@ -751,7 +808,7 @@ impl Encoder {
                 lv[i] = s[i] - p[i];
             }
             fdct(lv);
-            quantise_h263(lv, qp, false);
+            self.quantise(lv, qp, false);
             if lv.iter().any(|&v| v != 0) {
                 cbp |= 1 << (5 - k);
             }
@@ -821,7 +878,7 @@ impl Encoder {
             fdct(&mut b);
             let scaler = dc_scaler(qp, k < 4) as i32;
             let dc = round_div(b[0] as i32, scaler).clamp(0, 2047 / scaler);
-            quantise_h263(&mut b, qp, true);
+            self.quantise(&mut b, qp, true);
             b[0] = dc as i16;
             preds[k] = Some(self.st.intra_pred(mbx, mby, k, self.slice));
             self.st.store_intra(mb, k, dc * scaler, &b);
@@ -944,7 +1001,8 @@ impl Encoder {
             }
         }
         let mut px = MbPix::new();
-        predict_mb(rf, mbx, mby, &mvs, four, h.rounding, false, &mut px);
+        let qpel = self.cfg.quarter_sample;
+        predict_mb(rf, mbx, mby, &mvs, four, h.rounding, qpel, &mut px);
         let mut levels = [[0i16; 64]; 6];
         let mut cbp = 0u8;
         for (k, lv) in levels.iter_mut().enumerate() {
@@ -954,7 +1012,7 @@ impl Encoder {
                 lv[i] = s[i] - p[i];
             }
             fdct(lv);
-            quantise_h263(lv, qp, false);
+            self.quantise(lv, qp, false);
             if lv.iter().any(|&v| v != 0) {
                 cbp |= 1 << (5 - k);
             }
@@ -1002,6 +1060,25 @@ impl Encoder {
         ]
     }
 
+    /// Forward quantisation with the VOL's method.
+    fn quantise(&self, b: &mut [i16; 64], qp: u32, intra: bool) {
+        if self.quant.mpeg {
+            let m = if intra {
+                &self.quant.intra_matrix
+            } else {
+                &self.quant.inter_matrix
+            };
+            quantise_mpeg(b, qp, intra, m);
+        } else {
+            quantise_h263(b, qp, intra);
+        }
+    }
+
+    /// Vector units per sample: 2 (half samples) or 4 (quarter samples).
+    fn unit(&self) -> i32 {
+        if self.cfg.quarter_sample { 4 } else { 2 }
+    }
+
     fn put_mv(&self, w: &mut BitWriter, mv: [i32; 2], pred: [i32; 2]) {
         for j in 0..2 {
             put_mvd(w, wrap_diff(mv[j] - pred[j], self.fcode), self.fcode);
@@ -1025,7 +1102,7 @@ impl Encoder {
     }
 
     /// Sum of absolute differences of the luma of macroblock `(mbx, mby)`
-    /// against its prediction at `mv` (half samples), over block `k`
+    /// against its prediction at `mv` (half or quarter samples), over block `k`
     /// (an 8x8 quarter) or the whole macroblock (`None`).
     #[allow(clippy::too_many_arguments)]
     fn sad(
@@ -1045,18 +1122,33 @@ impl Encoder {
         let x = (mbx * 16 + bx) as i32;
         let y = (mby * 16 + by) as i32;
         let mut p = [0u8; 256];
-        mc::halfpel(
-            rf.ref_plane(0),
-            x,
-            y,
-            mv[0],
-            mv[1],
-            n,
-            n,
-            rounding,
-            &mut p,
-            16,
-        );
+        if self.cfg.quarter_sample {
+            mc::qpel(
+                rf.ref_plane(0),
+                x,
+                y,
+                mv[0],
+                mv[1],
+                n,
+                n,
+                rounding,
+                &mut p,
+                16,
+            );
+        } else {
+            mc::halfpel(
+                rf.ref_plane(0),
+                x,
+                y,
+                mv[0],
+                mv[1],
+                n,
+                n,
+                rounding,
+                &mut p,
+                16,
+            );
+        }
         let s = src.ystride();
         let mut sum = 0;
         for r in 0..n {
@@ -1070,7 +1162,7 @@ impl Encoder {
 
     /// Clamps a half-sample vector into the search window.
     fn clamp_mv(&self, v: [i32; 2]) -> [i32; 2] {
-        let r = 2 * self.cfg.search_range as i32;
+        let r = self.unit() * self.cfg.search_range as i32;
         [v[0].clamp(-r, r), v[1].clamp(-r, r)]
     }
 
@@ -1092,7 +1184,8 @@ impl Encoder {
     ) -> ([i32; 2], u32) {
         let lambda = qp;
         let cost = |v: [i32; 2], sad: u32| sad + lambda * self.mv_bits(v, pred);
-        let even = |v: [i32; 2]| [v[0] & !1, v[1] & !1];
+        let u = self.unit();
+        let even = |v: [i32; 2]| [v[0] & !(u - 1), v[1] & !(u - 1)];
         let mut best = [0, 0];
         let mut best_cost = u32::MAX;
         let mut best_sad = u32::MAX;
@@ -1107,7 +1200,7 @@ impl Encoder {
         // Small diamond in whole samples.
         for _ in 0..64 {
             let mut moved = false;
-            for d in [[2, 0], [-2, 0], [0, 2], [0, -2]] {
+            for d in [[u, 0], [-u, 0], [0, u], [0, -u]] {
                 let c = self.clamp_mv([best[0] + d[0], best[1] + d[1]]);
                 if c == best {
                     continue;
@@ -1123,20 +1216,25 @@ impl Encoder {
                 break;
             }
         }
-        // Half-sample refinement.
-        let centre = best;
-        for dy in -1..=1 {
-            for dx in -1..=1 {
-                if dx == 0 && dy == 0 {
-                    continue;
-                }
-                let c = self.clamp_mv([centre[0] + dx, centre[1] + dy]);
-                let s = self.sad(src, rf, mbx, mby, None, c, rounding);
-                let k = cost(c, s);
-                if k < best_cost {
-                    (best, best_cost, best_sad) = (c, k, s);
+        // Half-sample, then (quarter-sample motion) quarter-sample
+        // refinement.
+        let mut step = u / 2;
+        while step > 0 {
+            let centre = best;
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let c = self.clamp_mv([centre[0] + dx * step, centre[1] + dy * step]);
+                    let s = self.sad(src, rf, mbx, mby, None, c, rounding);
+                    let k = cost(c, s);
+                    if k < best_cost {
+                        (best, best_cost, best_sad) = (c, k, s);
+                    }
                 }
             }
+            step /= 2;
         }
         (best, best_sad)
     }
@@ -1155,7 +1253,8 @@ impl Encoder {
     ) -> ([i32; 2], u32) {
         let mut best = start;
         let mut best_sad = self.sad(src, rf, mbx, mby, Some(k), start, rounding);
-        for step in [2, 1] {
+        let u = self.unit();
+        for step in [u, u / 2, u / 4].into_iter().filter(|&s| s > 0) {
             for _ in 0..8 {
                 let mut moved = false;
                 for d in [[step, 0], [-step, 0], [0, step], [0, -step]] {

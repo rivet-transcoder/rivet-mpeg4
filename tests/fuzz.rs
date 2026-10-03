@@ -97,7 +97,10 @@ proptest! {
             1 => stream(2, false, true),
             2 => stream(0, true, true),
             3 => stream(1, true, false),
-            4 => stream_with(0, true, true, |c| c.data_partitioning = true),
+            4 => stream_with(0, true, true, |c| {
+                c.data_partitioning = true;
+                c.quarter_sample = true;
+            }),
             _ => stream_with(1, true, false, |c| {
                 c.data_partitioning = true;
                 c.reversible_vlc = true;
@@ -128,7 +131,7 @@ proptest! {
         b in 0u32..4, four in any::<bool>(), q in 1u8..32,
         packets in proptest::option::of(8u32..200),
         range in 1u32..64, gop in 0u32..5,
-        dp in 0u8..3,
+        dp in 0u8..3, qpel in any::<bool>(), mpeg in any::<bool>(),
     ) {
         let mut cfg = EncoderConfig::new(w, h, 30);
         cfg.b_frames = b;
@@ -139,6 +142,10 @@ proptest! {
         cfg.gop_size = gop;
         cfg.data_partitioning = dp > 0;
         cfg.reversible_vlc = dp > 1;
+        cfg.quarter_sample = qpel;
+        if mpeg {
+            cfg.quantiser = mpeg4::Quantiser::mpeg_default();
+        }
         cfg.keep_reconstructions = true;
         let mut enc = Encoder::new(cfg).unwrap();
         let mut dec = Decoder::new();

@@ -344,3 +344,71 @@ fn video_signal_type_is_signalled() {
     let dec = Decoder::with_config(enc.config()).unwrap();
     assert_eq!(dec.vol().unwrap().video_signal, None);
 }
+
+#[test]
+fn quarter_sample_motion() {
+    for b in [0u32, 2] {
+        let mut cfg = EncoderConfig::new(176, 144, 25);
+        cfg.quarter_sample = true;
+        cfg.b_frames = b;
+        cfg.four_mv = true;
+        let r = run(cfg, 16);
+        check(&r, 33.0, &format!("quarter-sample, {b} B-VOPs"));
+    }
+}
+
+#[test]
+fn mpeg_quantiser() {
+    let mut flat = [16u8; 64];
+    flat[0] = 8;
+    let mut steep = mpeg4::Quantiser::mpeg_default();
+    if let mpeg4::Quantiser::Mpeg { inter, .. } = &mut steep {
+        for (i, v) in inter.iter_mut().enumerate() {
+            *v = 12 + (i % 8 + i / 8) as u8 * 4;
+        }
+    }
+    for (name, q) in [
+        ("default matrices", mpeg4::Quantiser::mpeg_default()),
+        (
+            "flat matrices",
+            mpeg4::Quantiser::Mpeg {
+                intra: flat,
+                inter: [16; 64],
+            },
+        ),
+        ("steep inter matrix", steep),
+    ] {
+        for qp in [2u8, 5, 20] {
+            let mut cfg = EncoderConfig::new(176, 144, 25);
+            cfg.quantiser = q.clone();
+            cfg.rate = RateControl::ConstantQuant(qp);
+            cfg.gop_size = 8;
+            let r = run(cfg, 12);
+            let min = match qp {
+                2 => 40.0,
+                5 => 33.0,
+                _ => 26.0,
+            };
+            check(&r, min, &format!("MPEG quantiser, {name}, q{qp}"));
+        }
+    }
+}
+
+#[test]
+fn advanced_simple_tools_together() {
+    let mut cfg = EncoderConfig::new(352, 288, 25);
+    cfg.quarter_sample = true;
+    cfg.quantiser = mpeg4::Quantiser::mpeg_default();
+    cfg.b_frames = 2;
+    cfg.four_mv = true;
+    cfg.packet_bytes = Some(500);
+    cfg.data_partitioning = true;
+    cfg.reversible_vlc = true;
+    cfg.gop_size = 9;
+    let r = run(cfg, 18);
+    check(
+        &r,
+        33.0,
+        "quarter-sample, MPEG quantiser, B-VOPs, 4MV, packets, data partitioning, RVLC",
+    );
+}
