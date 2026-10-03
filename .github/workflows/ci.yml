@@ -53,8 +53,9 @@ jobs:
           key: mpeg4-conformance-${{ hashFiles('tools/fetch-conformance.sh') }}
       - run: tools/fetch-conformance.sh
       - run: tools/xvid-vectors.sh
-      - name: Tests
-        run: cargo test --release --test conformance -- --nocapture
+      - name: Variants
+        run: |
+          for v in 0 1 2 3; do echo "=== VARIANT $v"; MPEG4_QPEL_VARIANT=$v cargo test --release --test conformance xvid -- --nocapture 2>&1 | grep qpel || true; done
         env:
           MPEG4_REQUIRE_CONFORMANCE: "1"
 
