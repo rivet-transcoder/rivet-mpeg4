@@ -30,13 +30,16 @@ jobs:
       - name: Property tests with overflow checks (debug)
         run: cargo test --test fuzz
 
-  # The decoder is checked against other encoders' streams, used as data:
-  # tools/fetch-samples.sh downloads them (with their SHA-256) and the
-  # sample tests compare each one's decode counts with the recorded ones.
-  # Without the samples those tests skip, so this job fetches them and
+  # The decoder against pictures from outside this crate: the published
+  # conformance streams (ITU-T's H.263 set, an ISO/IEC 14496-4 stream),
+  # which tools/fetch-conformance.sh downloads with their SHA-256, and Xvid
+  # as a black box — tools/xvid-vectors.sh builds Xvid 1.3.7 from its
+  # release tarball, codes a synthetic source with it one tool at a time,
+  # and decodes those streams and this crate's encoder's with Xvid's
+  # decoder. Without the sets the tests skip, so this job makes them and
   # requires them.
-  samples:
-    name: sample bitstreams
+  conformance:
+    name: conformance streams and Xvid
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -44,13 +47,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: actions/cache@v4
         with:
-          path: tests/samples
-          key: mpeg4-samples-${{ hashFiles('tools/fetch-samples.sh') }}
-      - run: tools/fetch-samples.sh
+          path: tests/conformance/itu-h263
+          key: mpeg4-conformance-${{ hashFiles('tools/fetch-conformance.sh') }}
+      - run: tools/fetch-conformance.sh
+      - run: tools/xvid-vectors.sh
       - name: Tests
-        run: cargo test --release --test samples
+        run: cargo test --release --test conformance -- --nocapture
         env:
-          MPEG4_REQUIRE_SAMPLES: "1"
+          MPEG4_REQUIRE_CONFORMANCE: "1"
 
   msrv:
     name: MSRV (1.99)
