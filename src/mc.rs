@@ -1,6 +1,6 @@
 //! Motion compensation (clause 7.6.2): half-sample bilinear interpolation,
-//! quarter-sample interpolation (the 8-tap filter of 7.6.2.1 with block-edge
-//! mirroring), the chrominance vector derivations, and unrestricted motion
+//! quarter-sample interpolation (7.6.2.2: the 8-tap filter with block-edge
+//! mirroring, horizontally and then vertically), the chrominance vector derivations, and unrestricted motion
 //! vectors — every reference sample outside the reconstructed area takes
 //! the value of the nearest sample on its boundary (the padding of 7.6.4;
 //! see `Pic::ref_plane` for which boundary).
@@ -80,7 +80,7 @@ pub(crate) fn halfpel(
     }
 }
 
-/// The 8-tap half-sample filter of 7.6.2.1 over the `n + 1` samples
+/// The 8-tap half-sample filter of 7.6.2.2 over the `n + 1` samples
 /// `p[0..=n]`, writing the `n` values between neighbours to `out`. Taps
 /// beyond the block's samples are mirrored back into it, the edge sample
 /// repeated (`p[-1] = p[0]`, `p[-2] = p[1]`, `p[n + 1] = p[n]`, ...).
@@ -106,16 +106,28 @@ fn filter8(p: &[u8], n: usize, rc: i32, out: &mut [u8]) {
     }
 }
 
-/// Quarter-sample luminance prediction (7.6.2.1) of a `bw` x `bh` block
+/// Quarter-sample luminance prediction (7.6.2.2) of a `bw` x `bh` block
 /// (16x16 for one vector per macroblock, 8x8 for four, 16x8 for a field)
 /// displaced by `(mvx, mvy)` quarter samples.
 ///
-/// The half-sample values come from the 8-tap filter over the block's
-/// `(bw + 1)` x `(bh + 1)` window of integer samples (horizontal first;
-/// the centre position filters the horizontal half samples vertically);
-/// the quarter-sample values are the bilinear average of the nearest
-/// integer / half samples, with `rounding_control`. Only the half-sample
-/// planes the position reads are computed.
+/// Separable, in two passes over the block's `(bw + 1)` x `(bh + 1)`
+/// window of integer samples, each pass rounded (with `rounding_control`)
+/// and clipped to eight bits before the next reads it:
+///
+/// 1. horizontally, every window row: the half-sample values from the
+///    8-tap filter (taps mirrored at the window's edge), the quarter-sample
+///    values the average of the integer and half-sample values either side
+///    — giving each row at the vector's horizontal position;
+/// 2. vertically, every column of those values the same way: the filter
+///    for the half position, the average of the two nearest values for a
+///    quarter position.
+///
+/// A horizontal quarter position combined with a vertical half or quarter
+/// one is therefore the vertical filter (and average) of the horizontally
+/// *quarter*-interpolated rows — not an average of half-sample values on a
+/// two-dimensional grid. The two readings differ by one at about a third
+/// of those samples; the two-pass one is what the standard describes and
+/// what Xvid decodes (docs/CONFORMANCE.md).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qpel(
     src: Src,
@@ -142,71 +154,43 @@ pub(crate) fn qpel(
         return;
     }
     let rc = rounding as i32;
-    // Planes, each `nw` wide: integer samples `full` (nh rows); horizontal
-    // half samples `hp` (nh rows, bw used); vertical half samples `vp`
-    // (bh rows, nw used); centre half samples `cp` (bh rows, bw used).
-    let mut hp = [0u8; 17 * 17];
-    let mut vp = [0u8; 17 * 17];
-    let mut cp = [0u8; 17 * 17];
+    let avg = |a: u8, b: u8| ((a as u32 + b as u32 + 1 - rc as u32) >> 1) as u8;
+    // Pass 1: every window row at the horizontal position, `bw` wide.
+    let mut hq = [0u8; 17 * 16];
+    let mut half = [0u8; 16];
+    for r in 0..nh {
+        let row = &full[r * nw..r * nw + nw];
+        let o = &mut hq[r * bw..r * bw + bw];
+        match fx {
+            0 => o.copy_from_slice(&row[..bw]),
+            _ => {
+                filter8(row, bw, rc, &mut half);
+                for c in 0..bw {
+                    o[c] = match fx {
+                        1 => avg(row[c], half[c]),
+                        2 => half[c],
+                        _ => avg(half[c], row[c + 1]),
+                    };
+                }
+            }
+        }
+    }
+    // Pass 2: every column of those at the vertical position.
     let mut col = [0u8; 17];
-    let mut res = [0u8; 16];
-    if fx != 0 {
+    for c in 0..bw {
         for r in 0..nh {
-            filter8(
-                &full[r * nw..r * nw + nw],
-                bw,
-                rc,
-                &mut hp[r * nw..r * nw + bw],
-            );
+            col[r] = hq[r * bw + c];
         }
-    }
-    if fy != 0 && fx != 2 {
-        for c in 0..nw {
-            for r in 0..nh {
-                col[r] = full[r * nw + c];
-            }
-            filter8(&col, bh, rc, &mut res);
-            for r in 0..bh {
-                vp[r * nw + c] = res[r];
-            }
+        if fy != 0 {
+            filter8(&col, bh, rc, &mut half);
         }
-    }
-    if fx != 0 && fy != 0 {
-        for c in 0..bw {
-            for r in 0..nh {
-                col[r] = hp[r * nw + c];
-            }
-            filter8(&col, bh, rc, &mut res);
-            for r in 0..bh {
-                cp[r * nw + c] = res[r];
-            }
-        }
-    }
-    // The half-sample grid position (gx, gy): integer, horizontal,
-    // vertical or centre plane by parity.
-    let at = |gx: usize, gy: usize| -> u32 {
-        let (c, r) = (gx >> 1, gy >> 1);
-        (match (gx & 1, gy & 1) {
-            (0, 0) => full[r * nw + c],
-            (1, 0) => hp[r * nw + c],
-            (0, _) => vp[r * nw + c],
-            _ => cp[r * nw + c],
-        }) as u32
-    };
-    let rc = rc as u32;
-    for r in 0..bh {
-        let gy = 2 * r + fy / 2;
-        let o = &mut out[r * out_stride..r * out_stride + bw];
-        for (c, d) in o.iter_mut().enumerate() {
-            let gx = 2 * c + fx / 2;
-            let a = at(gx, gy);
-            let v = match (fx & 1, fy & 1) {
-                (0, 0) => a,
-                (1, 0) => (a + at(gx + 1, gy) + 1 - rc) >> 1,
-                (0, _) => (a + at(gx, gy + 1) + 1 - rc) >> 1,
-                _ => (a + at(gx + 1, gy) + at(gx, gy + 1) + at(gx + 1, gy + 1) + 2 - rc) >> 2,
+        for r in 0..bh {
+            out[r * out_stride + c] = match fy {
+                0 => col[r],
+                1 => avg(col[r], half[r]),
+                2 => half[r],
+                _ => avg(half[r], col[r + 1]),
             };
-            *d = v as u8;
         }
     }
 }
@@ -250,7 +234,7 @@ mod tests {
 
     // The straightforward implementation the fast one must match: every
     // half-sample plane over the whole window, each tap mirrored on the fly.
-    /// The 8-tap half-sample filter of 7.6.2.1 over `p[0..=n]`, giving the
+    /// The 8-tap half-sample filter of 7.6.2.2 over `p[0..=n]`, giving the
     /// value between `p[i]` and `p[i + 1]`. Taps beyond the block's `n + 1`
     /// samples are mirrored back into it, the edge sample repeated
     /// (`p[-1] = p[0]`, `p[-2] = p[1]`, `p[n + 1] = p[n]`, ...).
@@ -273,15 +257,11 @@ mod tests {
         ((v + 16 - rc) >> 5).clamp(0, 255) as u8
     }
 
-    /// Quarter-sample luminance prediction (7.6.2.1) of a `bw` x `bh` block
-    /// (16x16 for one vector per macroblock, 8x8 for four, 16x8 for a field)
-    /// displaced by `(mvx, mvy)` quarter samples.
-    ///
-    /// The half-sample values come from the 8-tap filter over the block's
-    /// `(bw + 1)` x `(bh + 1)` window of integer samples (horizontal first;
-    /// the centre position filters the horizontal half samples vertically);
-    /// the quarter-sample values are the bilinear average of the nearest
-    /// integer / half samples, with `rounding_control`.
+    /// Quarter-sample luminance prediction (7.6.2.2), sample by sample:
+    /// each output sample's row is first interpolated horizontally (the
+    /// 8-tap value at a half position, the average of the two nearest
+    /// integer / half values at a quarter one), then those values of the
+    /// window's rows are interpolated vertically the same way.
     #[allow(clippy::too_many_arguments)]
     fn qpel_ref(
         src: Src,
@@ -301,70 +281,25 @@ mod tests {
         let (nw, nh) = (bw + 1, bh + 1);
         let mut full = [0u8; 17 * 17];
         fetch(src, ix, iy, nw, nh, &mut full);
-        if fx == 0 && fy == 0 {
-            for r in 0..bh {
-                out[r * out_stride..r * out_stride + bw]
-                    .copy_from_slice(&full[r * nw..r * nw + bw]);
-            }
-            return;
-        }
         let rc = rounding as i32;
-        // The half-sample grid, (2bw + 1) x (2bh + 1): even/even integer
-        // samples, odd columns horizontal half samples, odd rows vertical ones.
-        let g = 2 * bw + 1;
-        let mut grid = [0u8; 33 * 33];
+        let avg = |a: u8, b: u8| ((a as i32 + b as i32 + 1 - rc) >> 1) as u8;
+        // One dimension: the value at fraction `f` (quarters) after sample
+        // `i` of the `n + 1` samples `p`.
+        let interp = |p: &[u8], n: usize, i: usize, f: usize| -> u8 {
+            match f {
+                0 => p[i],
+                1 => avg(p[i], tap8_ref(p, n, i, rc)),
+                2 => tap8_ref(p, n, i, rc),
+                _ => avg(tap8_ref(p, n, i, rc), p[i + 1]),
+            }
+        };
         let mut col = [0u8; 17];
-        // Horizontal half samples of every window row.
-        let mut hrows = [0u8; 17 * 16];
-        for r in 0..nh {
-            let row = &full[r * nw..r * nw + nw];
-            for c in 0..bw {
-                hrows[r * bw + c] = tap8_ref(row, bw, c, rc);
-            }
-            for c in 0..nw {
-                grid[2 * r * g + 2 * c] = row[c];
-            }
-            for c in 0..bw {
-                grid[2 * r * g + 2 * c + 1] = hrows[r * bw + c];
-            }
-        }
-        // Vertical half samples of every window column.
-        for c in 0..nw {
-            for r in 0..nh {
-                col[r] = full[r * nw + c];
-            }
-            for r in 0..bh {
-                grid[(2 * r + 1) * g + 2 * c] = tap8_ref(&col, bh, r, rc);
-            }
-        }
-        // Centre half samples: the horizontal ones, filtered vertically.
         for c in 0..bw {
-            for r in 0..nh {
-                col[r] = hrows[r * bw + c];
+            for (r, v) in col[..nh].iter_mut().enumerate() {
+                *v = interp(&full[r * nw..r * nw + nw], bw, c, fx);
             }
             for r in 0..bh {
-                grid[(2 * r + 1) * g + 2 * c + 1] = tap8_ref(&col, bh, r, rc);
-            }
-        }
-        let rc = rc as u32;
-        for r in 0..bh {
-            let gy = 2 * r + fy / 2;
-            for c in 0..bw {
-                let gx = 2 * c + fx / 2;
-                let a = grid[gy * g + gx] as u32;
-                let v = match (fx & 1, fy & 1) {
-                    (0, 0) => a,
-                    (1, 0) => (a + grid[gy * g + gx + 1] as u32 + 1 - rc) >> 1,
-                    (0, _) => (a + grid[(gy + 1) * g + gx] as u32 + 1 - rc) >> 1,
-                    _ => {
-                        let s = a
-                            + grid[gy * g + gx + 1] as u32
-                            + grid[(gy + 1) * g + gx] as u32
-                            + grid[(gy + 1) * g + gx + 1] as u32;
-                        (s + 2 - rc) >> 2
-                    }
-                };
-                out[r * out_stride + c] = v as u8;
+                out[r * out_stride + c] = interp(&col, bh, r, fy);
             }
         }
     }

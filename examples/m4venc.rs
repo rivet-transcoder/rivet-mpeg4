@@ -58,6 +58,16 @@ fn main() {
     c.rate = RateControl::Bitrate(400_000);
     c.b_frames = 2;
     cases.push(("bitrate", c, 40));
+    // Quarter-sample motion: every interpolation position (7.6.2.2) read
+    // by another decoder, with one vector, four, and B-VOPs.
+    let mut c = base(320, 240);
+    c.quarter_sample = true;
+    cases.push(("qpel", c, 30));
+    let mut c = base(320, 240);
+    c.quarter_sample = true;
+    c.four_mv = true;
+    c.b_frames = 2;
+    cases.push(("qpel_4mv_b", c, 30));
 
     for (name, cfg, n) in cases {
         let (w, h) = (cfg.width, cfg.height);

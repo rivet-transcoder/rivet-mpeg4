@@ -213,13 +213,10 @@ fn check_set(sub: &str, ext: &str, limits: &[(&str, u8, f64)]) {
 ///
 /// The two inverse DCTs differ by the rounding 14496-2 allows (IEEE 1180),
 /// so pictures agree to a sample or two, drifting a little over each
-/// 12-picture GOP. The quarter-sample cases drift further: Xvid computes
-/// the quarter positions that lie between two half-sample rows or
-/// columns (horizontal quarter with vertical half or quarter) by filtering
-/// the horizontally interpolated row, where this decoder averages the
-/// neighbouring half-sample values as 7.6.2.1 describes them; the
-/// predictions differ by one at about a third of those samples
-/// (docs/CONFORMANCE.md).
+/// 12-picture GOP. The quarter-sample cases are held to the same: they
+/// once drifted to 47 dB, when this decoder averaged half-sample values on
+/// a two-dimensional grid where 7.6.2.2 interpolates horizontally and then
+/// vertically (docs/CONFORMANCE.md).
 #[test]
 fn xvid() {
     check_set(
@@ -236,10 +233,10 @@ fn xvid() {
             ("slices", 4, 52.0),
             ("fine", 4, 52.0),
             ("coarse", 4, 52.0),
-            ("qpel", 8, 44.0),
-            ("qpel_b", 8, 44.0),
-            ("gmc_qpel_b", 8, 44.0),
-            ("oddsize", 8, 44.0),
+            ("qpel", 4, 52.0),
+            ("qpel_b", 4, 52.0),
+            ("gmc_qpel_b", 4, 52.0),
+            ("oddsize", 4, 52.0),
         ],
     );
 }
@@ -263,6 +260,8 @@ fn rivet_encoder_in_xvid() {
             ("fine", 4, 52.0),
             ("coarse", 4, 52.0),
             ("bitrate", 4, 52.0),
+            ("qpel", 4, 52.0),
+            ("qpel_4mv_b", 4, 52.0),
         ],
     );
 }
