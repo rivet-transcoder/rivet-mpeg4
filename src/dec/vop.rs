@@ -438,18 +438,36 @@ impl VopDec<'_> {
         }
     }
 
+    /// The length of the resync marker at the reader, if one is there.
+    ///
+    /// A B-VOP whose larger `vop_fcode` is 1 has a 17-bit marker by
+    /// 6.3.5.2, but Xvid writes 18 bits there (as though the `vop_fcode`
+    /// were at least 2). A one after the 17th zero-or-one position can
+    /// only be a marker, so both are accepted.
+    fn marker_len_at(&self, r: &BitReader) -> Option<usize> {
+        let len = self.resync_len();
+        if is_marker(r, len) {
+            Some(len)
+        } else if self.hdr.vop_type == VopType::B && len == 17 && is_marker(r, 18) {
+            Some(18)
+        } else {
+            None
+        }
+    }
+
     /// When stuffing then a resync marker follow, the marker's position.
     fn at_resync(&self, r: &BitReader) -> Option<usize> {
         let p = r.stuffing_end()?;
         let mut t = r.clone();
         t.set_pos(p);
-        is_marker(&t, self.resync_len()).then_some(p)
+        self.marker_len_at(&t).map(|_| p)
     }
 
     /// `video_packet_header()` from the resync marker on: the number of
     /// the packet's first macroblock.
     fn packet_header(&mut self, r: &mut BitReader) -> Result<usize> {
-        r.skip(self.resync_len())?;
+        let len = self.marker_len_at(r).unwrap_or_else(|| self.resync_len());
+        r.skip(len)?;
         let total = self.total();
         let bits = usize::BITS - (total - 1).leading_zeros();
         let mb = r.read(bits.max(1))? as usize;
@@ -490,7 +508,7 @@ impl VopDec<'_> {
         let len = self.resync_len();
         r.align();
         while r.left() >= len + 8 {
-            if is_marker(r, len) {
+            if self.marker_len_at(r).is_some() {
                 return true;
             }
             r.set_pos(r.pos() + 8);
@@ -548,7 +566,7 @@ impl VopDec<'_> {
     /// The `macroblock_number` of the video packet header at the reader.
     fn peek_packet_mb(&self, r: &BitReader) -> Option<usize> {
         let bits = (usize::BITS - (self.total() - 1).leading_zeros()).max(1);
-        let len = self.resync_len();
+        let len = self.marker_len_at(r).unwrap_or_else(|| self.resync_len());
         (r.left() >= len + bits as usize).then(|| r.peek_at(len, bits) as usize)
     }
 
