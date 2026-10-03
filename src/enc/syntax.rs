@@ -8,12 +8,16 @@ use crate::bits::BitWriter;
 use crate::dec::vop::{DC_MARKER, MOTION_MARKER};
 
 use super::write::{
-    put_cbpy, put_coeffs, put_coeffs_rvlc, put_dc_diff, put_mcbpc_i, put_mcbpc_p, put_mvd,
+    put_cbpy, put_coeffs, put_coeffs_rvlc, put_coeffs_short, put_dc_diff, put_mcbpc_i, put_mcbpc_p,
+    put_mvd,
 };
 
 /// One macroblock of an I- or P-VOP.
 #[derive(Clone)]
 pub(crate) struct MbSyntax {
+    /// The short video header's syntax (H.263 baseline): no `ac_pred_flag`,
+    /// `dc` holds 8-bit INTRADC codes, H.263's escape.
+    pub sh: bool,
     /// In a P-VOP (the `not_coded` bit and the P MCBPC table).
     pub p: bool,
     /// `not_coded` (P-VOPs): nothing else is written.
@@ -41,6 +45,7 @@ impl MbSyntax {
     /// A macroblock with nothing coded yet (inter, no blocks).
     pub fn new(p: bool, fcode: u32) -> MbSyntax {
         MbSyntax {
+            sh: false,
             p,
             not_coded: false,
             mb_type: 0,
@@ -97,7 +102,9 @@ impl MbSyntax {
         }
         let intra = self.intra();
         let start = intra as usize;
-        if rvlc {
+        if self.sh {
+            put_coeffs_short(w, &self.blocks[k], self.scans[k], start);
+        } else if rvlc {
             put_coeffs_rvlc(w, &self.blocks[k], self.scans[k], start, intra);
         } else {
             put_coeffs(w, &self.blocks[k], self.scans[k], start, intra);
@@ -113,14 +120,16 @@ impl MbSyntax {
             }
         }
         self.mcbpc(w);
-        if self.intra() {
+        if self.intra() && !self.sh {
             w.put(1, self.ac_pred as u32);
         }
         self.cbpy(w);
         self.dquant(w);
         self.mvs(w);
         for k in 0..6 {
-            if self.intra() {
+            if self.intra() && self.sh {
+                w.put(8, self.dc[k] as u32);
+            } else if self.intra() {
                 put_dc_diff(w, self.dc[k], k < 4);
             }
             self.block(w, k, false);

@@ -89,6 +89,15 @@ pub struct EncoderConfig {
     pub search_range: u32,
     /// Let P-VOP macroblocks use four vectors where that predicts better.
     pub four_mv: bool,
+    /// The short video header: H.263 baseline pictures (sub-QCIF, QCIF,
+    /// CIF, 4CIF or 16CIF only) that any H.263 decoder, and any 14496-2
+    /// decoder, takes: no configuration headers ([`Encoder::config`] is
+    /// empty), one vector per macroblock pointing inside the picture, no
+    /// AC / DC prediction, H.263's quantiser, timing in 1001/30000 s
+    /// ticks; with `packet_bytes`, GOB headers instead of video packets.
+    /// Incompatible with B-VOPs, quarter-sample motion, four vectors, the
+    /// MPEG quantiser and data partitioning.
+    pub short_header: bool,
     /// Quarter-sample motion vectors (7.6.2.2's 8-tap interpolation), an
     /// Advanced Simple Profile tool: the search refines to quarter samples.
     pub quarter_sample: bool,
@@ -133,6 +142,7 @@ impl EncoderConfig {
             rate: RateControl::ConstantQuant(5),
             search_range: 15,
             four_mv: false,
+            short_header: false,
             quarter_sample: false,
             quantiser: Quantiser::H263,
             packet_bytes: None,
@@ -269,6 +279,25 @@ impl Encoder {
                 "quantiser matrices: every entry 1..=255, the intra matrix's first 8",
             ));
         }
+        if cfg.short_header {
+            if headers::short_header_format(cfg.width, cfg.height).is_none() {
+                return Err(config(format!(
+                    "a {}x{} short-header picture (128x96, 176x144, 352x288, 704x576 or 1408x1152)",
+                    cfg.width, cfg.height
+                )));
+            }
+            if cfg.b_frames > 0
+                || cfg.quarter_sample
+                || cfg.four_mv
+                || cfg.data_partitioning
+                || cfg.quantiser != Quantiser::H263
+            {
+                return Err(config(
+                    "the short video header takes no B-VOPs, quarter-sample motion, four vectors, \
+                     MPEG quantiser or data partitioning",
+                ));
+            }
+        }
         if cfg.reversible_vlc && !cfg.data_partitioning {
             return Err(config("reversible VLCs without data partitioning"));
         }
@@ -282,6 +311,11 @@ impl Encoder {
         // The smallest f_code whose range [-32 f, 32 f - 1] half samples
         // holds every vector the search can return.
         let unit = if cfg.quarter_sample { 4 } else { 2 };
+        // The short header's vectors have f_code 1: [-32, 31] half samples.
+        let mut cfg = cfg;
+        if cfg.short_header {
+            cfg.search_range = cfg.search_range.min(15);
+        }
         let need = unit * cfg.search_range as i32 + unit - 1;
         let fcode = (1..=7u32)
             .find(|&f| 32 * (1 << (f - 1)) > need)
@@ -305,20 +339,24 @@ impl Encoder {
                 crate::tables::DEFAULT_INTER_MATRIX,
             ),
         };
-        let config_bytes = headers::write_config(&VolParams {
-            profile_and_level: profile_level(mbw * mbh, advanced),
-            advanced_simple: advanced,
-            width: cfg.width,
-            height: cfg.height,
-            time_resolution: cfg.time_base,
-            fixed_increment: (cfg.frame_duration < cfg.time_base).then_some(cfg.frame_duration),
-            resync_markers: cfg.packet_bytes.is_some(),
-            data_partitioned: cfg.data_partitioning,
-            reversible_vlc: cfg.reversible_vlc,
-            video_signal: cfg.video_signal,
-            quarter_sample: cfg.quarter_sample,
-            mpeg_quant: mpeg.then_some((intra_matrix, inter_matrix)),
-        });
+        let config_bytes = if cfg.short_header {
+            Vec::new()
+        } else {
+            headers::write_config(&VolParams {
+                profile_and_level: profile_level(mbw * mbh, advanced),
+                advanced_simple: advanced,
+                width: cfg.width,
+                height: cfg.height,
+                time_resolution: cfg.time_base,
+                fixed_increment: (cfg.frame_duration < cfg.time_base).then_some(cfg.frame_duration),
+                resync_markers: cfg.packet_bytes.is_some(),
+                data_partitioned: cfg.data_partitioning,
+                reversible_vlc: cfg.reversible_vlc,
+                video_signal: cfg.video_signal,
+                quarter_sample: cfg.quarter_sample,
+                mpeg_quant: mpeg.then_some((intra_matrix, inter_matrix)),
+            })
+        };
         let rc = match cfg.rate {
             RateControl::Bitrate(bps) => {
                 let target = bps as f64 * cfg.frame_duration as f64 / cfg.time_base as f64;
@@ -456,7 +494,7 @@ impl Encoder {
         let t = self.ticks(index);
         let res = self.cfg.time_base as i64;
         let sec = t / res;
-        if !intra {
+        if !intra && !self.cfg.short_header {
             self.rounding = !self.rounding;
         }
         let hdr = VopHeader {
@@ -477,10 +515,23 @@ impl Encoder {
         self.prev_ref_sec = self.last_ref_sec;
         self.last_ref_sec = sec;
         let start = w.len_bits();
-        headers::write_vop_header(w, self.time_bits, &hdr);
+        if self.cfg.short_header {
+            // TR: the frame's time in 1001/30000 s units (rounded), modulo
+            // 256.
+            let d = res as i128 * 1001;
+            let tr = ((t as i128 * 30000 * 2 + d) / (2 * d)) as u32;
+            let format = headers::short_header_format(self.cfg.width, self.cfg.height).unwrap();
+            headers::write_short_header(w, tr, format, !intra, qp);
+        } else {
+            headers::write_vop_header(w, self.time_bits, &hdr);
+        }
         let mut recon = Pic::new(self.cfg.width, self.cfg.height);
         self.code_ip(w, src, &mut recon, &hdr);
-        w.stuff();
+        if self.cfg.short_header {
+            w.align_zero();
+        } else {
+            w.stuff();
+        }
         self.rate_update(w.len_bits() - start, intra);
         self.prev_mv.clone_from(&self.st.mv);
         let motion = if intra {
@@ -582,8 +633,26 @@ impl Encoder {
         let reference = self.future.take();
         let mut packet: Vec<MbSyntax> = Vec::new();
         let mut packet_bits = 0;
+        let sh = self.cfg.short_header;
+        // GOBs of the short video header: one macroblock row up to CIF,
+        // two at 4CIF, four at 16CIF.
+        let gob_rows = match self.cfg.height {
+            0..=288 => 1,
+            289..=576 => 2,
+            _ => 4,
+        };
         for mb in 0..mbw * mbh {
-            if self.packet_due(mb, packet_bits) {
+            if sh {
+                if mb > 0 && mb % (mbw * gob_rows) == 0 && self.packet_due(mb, packet_bits) {
+                    // GOB header: GBSC, GN, GFID, GQUANT.
+                    w.put(17, 1);
+                    w.put(5, (mb / (mbw * gob_rows)) as u32);
+                    w.put(2, 0);
+                    w.put(5, h.quant);
+                    self.new_slice();
+                    packet_bits = 0;
+                }
+            } else if self.packet_due(mb, packet_bits) {
                 if dp {
                     write_partitioned(w, &packet, i_vop, self.cfg.reversible_vlc);
                     packet.clear();
@@ -596,6 +665,7 @@ impl Encoder {
             self.st.qp[mb] = h.quant as u8;
             let syn = match (&reference, h.vop_type) {
                 (Some(rf), VopType::P) => self.code_p_mb(src, &rf.pic, recon, mbx, mby, h),
+                _ if sh => self.code_intra_mb_short(src, recon, mbx, mby, h.quant, !i_vop),
                 _ => self.code_intra_mb(src, recon, mbx, mby, h.quant, !i_vop),
             };
             let mut t = BitWriter::new();
@@ -945,6 +1015,47 @@ impl Encoder {
         }
     }
 
+    /// An intra macroblock of a short-header picture: INTRADC (the DC over
+    /// 8, 1..=254, 128 coded as 255) and AC levels (H.263's quantiser,
+    /// clipped to what its escape codes) with no prediction.
+    fn code_intra_mb_short(
+        &mut self,
+        src: &Pic,
+        recon: &mut Pic,
+        mbx: usize,
+        mby: usize,
+        qp: u32,
+        in_p: bool,
+    ) -> MbSyntax {
+        let mb = mby * self.st.mbw + mbx;
+        self.st.kind[mb] = MbKind::Intra;
+        self.st.set_mb_mv(mbx, mby, [0, 0]);
+        let mut syn = MbSyntax::new(in_p, self.fcode);
+        syn.sh = true;
+        syn.mb_type = 3;
+        for k in 0..6 {
+            let mut b = source_block(src, mbx, mby, k);
+            fdct(&mut b);
+            let dc = round_div(b[0] as i32, 8).clamp(1, 254);
+            quantise_h263(&mut b, qp, true);
+            for v in &mut b[1..] {
+                *v = (*v).clamp(-127, 127);
+            }
+            syn.dc[k] = if dc == 128 { 255 } else { dc };
+            b[0] = 0;
+            if b.iter().any(|&v| v != 0) {
+                syn.cbp |= 1 << (5 - k);
+            }
+            let mut rec = b;
+            rec[0] = dc as i16;
+            self.quant.intra(&mut rec, qp, 8);
+            idct(&mut rec);
+            put_block(recon, mbx, mby, k, &rec, false);
+            syn.blocks[k] = b;
+        }
+        syn
+    }
+
     /// A P-VOP macroblock: motion search, then intra, skipped, one- or
     /// four-vector inter coding.
     #[allow(clippy::too_many_arguments)]
@@ -983,6 +1094,9 @@ impl Encoder {
             .map(|&v| (v as i32 - mean as i32).unsigned_abs())
             .sum();
         if dev + 500 < sad16 {
+            if self.cfg.short_header {
+                return self.code_intra_mb_short(src, recon, mbx, mby, qp, true);
+            }
             return self.code_intra_mb(src, recon, mbx, mby, qp, true);
         }
         let mut mvs = [mv; 4];
@@ -1019,6 +1133,16 @@ impl Encoder {
         }
         write_mb(recon, mbx, mby, &px);
         let mut syn = MbSyntax::new(true, self.fcode);
+        syn.sh = self.cfg.short_header;
+        if syn.sh {
+            // H.263's escape codes levels up to 127; reconstruct what is
+            // coded.
+            for lv in levels.iter_mut() {
+                for v in lv.iter_mut() {
+                    *v = (*v).clamp(-127, 127);
+                }
+            }
+        }
         if !four && mv == [0, 0] && cbp == 0 {
             self.st.kind[mb] = MbKind::Skipped;
             self.st.set_mb_mv(mbx, mby, [0, 0]);
@@ -1160,10 +1284,30 @@ impl Encoder {
         sum
     }
 
-    /// Clamps a half-sample vector into the search window.
+    /// Clamps a vector into the search window.
     fn clamp_mv(&self, v: [i32; 2]) -> [i32; 2] {
         let r = self.unit() * self.cfg.search_range as i32;
         [v[0].clamp(-r, r), v[1].clamp(-r, r)]
+    }
+
+    /// Clamps a half-sample vector of macroblock `(mbx, mby)` so that
+    /// every sample it predicts from lies inside the picture, as H.263's
+    /// baseline (no unrestricted vectors) requires of the short header.
+    fn inside(&self, mbx: usize, mby: usize, v: [i32; 2]) -> [i32; 2] {
+        if !self.cfg.short_header {
+            return v;
+        }
+        let lim = |pos: usize, size: u32, m: i32| -> i32 {
+            // Integer position pos + (m >> 1) >= 0, and the 16 samples (17
+            // with a half-sample offset) end inside.
+            let lo = -2 * pos as i32;
+            let hi = 2 * (size as i32 - 16 - pos as i32);
+            m.clamp(lo, hi)
+        };
+        [
+            lim(mbx * 16, self.cfg.width, v[0]),
+            lim(mby * 16, self.cfg.height, v[1]),
+        ]
     }
 
     /// Predictive diamond search over whole samples from the best of the
@@ -1190,7 +1334,7 @@ impl Encoder {
         let mut best_cost = u32::MAX;
         let mut best_sad = u32::MAX;
         for &c in [[0, 0], pred].iter().chain(extra) {
-            let c = even(self.clamp_mv(c));
+            let c = self.inside(mbx, mby, even(self.clamp_mv(c)));
             let s = self.sad(src, rf, mbx, mby, None, c, rounding);
             let k = cost(c, s);
             if k < best_cost {
@@ -1201,7 +1345,7 @@ impl Encoder {
         for _ in 0..64 {
             let mut moved = false;
             for d in [[u, 0], [-u, 0], [0, u], [0, -u]] {
-                let c = self.clamp_mv([best[0] + d[0], best[1] + d[1]]);
+                let c = self.inside(mbx, mby, self.clamp_mv([best[0] + d[0], best[1] + d[1]]));
                 if c == best {
                     continue;
                 }
@@ -1226,7 +1370,11 @@ impl Encoder {
                     if dx == 0 && dy == 0 {
                         continue;
                     }
-                    let c = self.clamp_mv([centre[0] + dx * step, centre[1] + dy * step]);
+                    let c = self.inside(
+                        mbx,
+                        mby,
+                        self.clamp_mv([centre[0] + dx * step, centre[1] + dy * step]),
+                    );
                     let s = self.sad(src, rf, mbx, mby, None, c, rounding);
                     let k = cost(c, s);
                     if k < best_cost {

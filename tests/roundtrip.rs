@@ -45,7 +45,8 @@ fn run(mut cfg: EncoderConfig, n: u32) -> Run {
     assert_eq!(
         (st.concealed_vops, st.misaligned_vops),
         (0, 0),
-        "every VOP decodes cleanly to its stuffing"
+        "every VOP decodes cleanly to its stuffing: {:?}",
+        dec.last_error()
     );
     // Reconstructions come in decode order, frames in display order.
     recon.sort_by_key(|f| f.timestamp);
@@ -411,4 +412,38 @@ fn advanced_simple_tools_together() {
         33.0,
         "quarter-sample, MPEG quantiser, B-VOPs, 4MV, packets, data partitioning, RVLC",
     );
+}
+
+#[test]
+fn short_video_header() {
+    for (w, h, packets) in [(128, 96, None), (176, 144, None), (352, 288, Some(400))] {
+        let mut cfg = EncoderConfig::new(w, h, 30);
+        cfg.short_header = true;
+        cfg.packet_bytes = packets;
+        cfg.gop_size = 10;
+        cfg.search_range = 31; // capped at 15 for f_code 1
+        let r = run(cfg.clone(), 14);
+        check(
+            &r,
+            32.0,
+            &format!("short header {w}x{h}, GOB headers {packets:?}"),
+        );
+        assert!(r.frames.iter().all(|f| f.time_base == 30000));
+        // 30 frames a second: 1001 ticks apart, TR 1 apart.
+        assert!(
+            r.frames
+                .windows(2)
+                .all(|p| p[1].timestamp - p[0].timestamp == 1001)
+        );
+        let enc = Encoder::new(cfg).unwrap();
+        assert!(enc.config().is_empty());
+    }
+    // Other sizes and the Advanced Simple tools are refused.
+    let mut cfg = EncoderConfig::new(160, 120, 30);
+    cfg.short_header = true;
+    assert!(Encoder::new(cfg.clone()).is_err());
+    cfg.width = 176;
+    cfg.height = 144;
+    cfg.b_frames = 1;
+    assert!(Encoder::new(cfg).is_err());
 }

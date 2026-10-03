@@ -153,6 +153,46 @@ pub(crate) fn put_coeffs(
     true
 }
 
+/// [`put_coeffs`] for the short video header (H.263 baseline): Table
+/// B-17 for intra and inter blocks alike, and H.263's escape — `last`, a
+/// 6-bit run and an 8-bit level, which must lie in -127..=127 (the caller
+/// clips).
+pub(crate) fn put_coeffs_short(
+    w: &mut BitWriter,
+    levels: &[i16; 64],
+    scan: &[u8; 64],
+    start: usize,
+) -> bool {
+    let mut events: Vec<(u32, i32)> = Vec::with_capacity(16);
+    let mut run = 0;
+    for &z in &scan[start..] {
+        let v = levels[z as usize];
+        if v == 0 {
+            run += 1;
+        } else {
+            events.push((run, v as i32));
+            run = 0;
+        }
+    }
+    let enc = tcoef_enc(false);
+    let n = events.len();
+    for (i, &(run, level)) in events.iter().enumerate() {
+        let last = i + 1 == n;
+        let level = level.clamp(-127, 127);
+        let a = level.unsigned_abs();
+        if let Some((c, l)) = enc.get(last, run, a) {
+            w.put(l, c);
+            w.put(1, (level < 0) as u32);
+        } else {
+            put_code(w, tables::TCOEF_ESCAPE);
+            w.put(1, last as u32);
+            w.put(6, run);
+            w.put(8, (level as u32) & 0xff);
+        }
+    }
+    n > 0
+}
+
 /// One TCOEF event with the reversible table (Table B-23): its code and
 /// sign, or the reversible escape `0000 1`, `last`, `run`, marker, 11-bit
 /// `|level|`, marker, `0000 s`. Levels beyond 2047 are clipped.

@@ -46,6 +46,18 @@ fn stream_with(
     aus
 }
 
+/// A short-header (H.263 baseline) stream, sub-QCIF, with GOB headers.
+fn short_stream() -> Vec<Vec<u8>> {
+    let mut cfg = EncoderConfig::new(128, 96, 30);
+    cfg.short_header = true;
+    cfg.packet_bytes = Some(60);
+    cfg.gop_size = 4;
+    let mut enc = Encoder::new(cfg).unwrap();
+    (0..6)
+        .map(|t| enc.encode(&common::synth(128, 96, t)).unwrap())
+        .collect()
+}
+
 /// Every access unit through one decoder, then a flush.
 fn decode_all(aus: &[Vec<u8>]) {
     let mut d = Decoder::new();
@@ -87,7 +99,7 @@ proptest! {
 
     #[test]
     fn damaged_streams(
-        kind in 0usize..6,
+        kind in 0usize..7,
         flips in proptest::collection::vec((any::<usize>(), 0u8..8), 1..12),
         cut in any::<usize>(),
         splice in proptest::collection::vec(any::<u8>(), 0..32),
@@ -101,10 +113,11 @@ proptest! {
                 c.data_partitioning = true;
                 c.quarter_sample = true;
             }),
-            _ => stream_with(1, true, false, |c| {
+            5 => stream_with(1, true, false, |c| {
                 c.data_partitioning = true;
                 c.reversible_vlc = true;
             }),
+            _ => short_stream(),
         };
         let count = aus.len();
         for (pos, bit) in &flips {

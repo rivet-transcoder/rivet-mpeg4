@@ -924,6 +924,36 @@ pub(crate) fn write_config(p: &VolParams) -> Vec<u8> {
     w.into_bytes()
 }
 
+/// The short video header's source formats (H.263 Table 6 / 14496-2
+/// Table 6-25): `source_format` for a picture size, if it is one of them.
+pub(crate) fn short_header_format(width: u32, height: u32) -> Option<u32> {
+    match (width, height) {
+        (128, 96) => Some(1),
+        (176, 144) => Some(2),
+        (352, 288) => Some(3),
+        (704, 576) => Some(4),
+        (1408, 1152) => Some(5),
+        _ => None,
+    }
+}
+
+/// `short_video_start_marker` and the rest of the H.263 picture header
+/// (6.2.7.1; H.263 5.1): TR, PTYPE with no optional modes, PQUANT, no CPM,
+/// no PEI.
+pub(crate) fn write_short_header(w: &mut BitWriter, tr: u32, format: u32, p: bool, quant: u32) {
+    w.put(22, 0x20);
+    w.put(8, tr & 0xff);
+    w.put(1, 1); // marker
+    w.put(1, 0); // zero_bit
+    w.put(3, 0); // split screen, document camera, full picture freeze release
+    w.put(3, format);
+    w.put(1, p as u32);
+    w.put(4, 0); // four_reserved_zero_bits: no UMV, SAC, AP, PB
+    w.put(5, quant);
+    w.put(1, 0); // zero_bit (CPM)
+    w.put(1, 0); // pei
+}
+
 /// A VOP header up to the first macroblock.
 pub(crate) fn write_vop_header(w: &mut BitWriter, time_increment_bits: u32, h: &VopHeader) {
     put_start_code(w, sc::VOP);
