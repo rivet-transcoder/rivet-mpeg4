@@ -41,6 +41,12 @@ fn run(mut cfg: EncoderConfig, n: u32) -> Run {
     recon.extend(enc.take_reconstructions());
     frames.extend(dec.decode(&tail).unwrap());
     frames.extend(dec.flush());
+    let st = dec.stats();
+    assert_eq!(
+        (st.concealed_vops, st.misaligned_vops),
+        (0, 0),
+        "every VOP decodes cleanly to its stuffing"
+    );
     // Reconstructions come in decode order, frames in display order.
     recon.sort_by_key(|f| f.timestamp);
     Run {
@@ -259,4 +265,27 @@ fn b_frames_compress() {
     let b = run(cfg, 24);
     println!("IPPP {} bytes, IBBP {} bytes", p.bytes, b.bytes);
     assert!(b.bytes < p.bytes * 11 / 10);
+}
+
+#[test]
+fn data_partitioning() {
+    for (rvlc, packets) in [
+        (false, None),
+        (false, Some(300)),
+        (true, None),
+        (true, Some(300)),
+    ] {
+        let mut cfg = EncoderConfig::new(352, 288, 25);
+        cfg.data_partitioning = true;
+        cfg.reversible_vlc = rvlc;
+        cfg.packet_bytes = packets;
+        cfg.four_mv = true;
+        cfg.gop_size = 6;
+        let r = run(cfg, 12);
+        check(
+            &r,
+            33.0,
+            &format!("data partitioned, RVLC {rvlc}, packets {packets:?}"),
+        );
+    }
 }

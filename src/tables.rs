@@ -491,6 +491,9 @@ pub(crate) const DMV_LENGTH: [&str; 15] = [
     "1111 1111 1110",
 ];
 
+/// A TCOEF event: `(last, run, |level|)`.
+pub(crate) type Event = (u8, u8, u8);
+
 /// Reversible TCOEF codes (Table B-23), used for the texture of I-, P- and
 /// S-VOPs when the VOL sets `reversible_vlc` (with data partitioning):
 /// `(code, intra (last, run, |level|), inter (last, run, |level|))`, the
@@ -503,7 +506,7 @@ pub(crate) const DMV_LENGTH: [&str; 15] = [
 /// ends at its third `0` (`0 1^a 0 1^b 0`). Neither rule depends on the
 /// direction of reading, so a reader going backwards — sign, free bit, then
 /// the core from its far end — finds the same boundaries.
-pub(crate) const RVLC_TCOEF: &[(&str, (u8, u8, u8), (u8, u8, u8))] = &[
+pub(crate) const RVLC_TCOEF: &[(&str, Event, Event)] = &[
     ("110", (0, 0, 1), (0, 0, 1)),
     ("111", (0, 0, 2), (0, 1, 1)),
     ("0001", (0, 1, 1), (0, 0, 2)),
@@ -936,7 +939,10 @@ mod tests {
             assert_eq!(core + 1, c.len(), "{c:?}: one free bit after the core");
             if c[0] == 1 {
                 let k = &c[..core];
-                assert!(k.iter().eq(k.iter().rev()), "{c:?}: 1-cores are palindromes");
+                assert!(
+                    k.iter().eq(k.iter().rev()),
+                    "{c:?}: 1-cores are palindromes"
+                );
             }
         }
         // The expected list, built from the construction alone.
@@ -952,7 +958,11 @@ mod tests {
                 }
             }
         }
-        assert_eq!(built[..codes.len()], codes[..], "codes in construction order");
+        assert_eq!(
+            built[..codes.len()],
+            codes[..],
+            "codes in construction order"
+        );
         // The last length is the only one cut short.
         let last = codes.last().unwrap().len();
         assert_eq!(last, 15);

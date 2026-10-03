@@ -148,6 +148,12 @@ pub struct DecoderStats {
     /// VOPs that produced no frame: not-coded placeholders after packed
     /// B-VOPs, B-VOPs or P-VOPs whose references were never decoded.
     pub dropped_vops: u64,
+    /// Reversible VLCs: macroblocks of damaged video packets whose texture
+    /// was recovered by decoding backwards from the packet's end.
+    pub rvlc_backward_mbs: u64,
+    /// Reversible VLCs: macroblocks of damaged video packets whose texture
+    /// was discarded (Annex E.1.4.4.2) and concealed.
+    pub rvlc_discarded_mbs: u64,
 }
 
 impl Default for Decoder {
@@ -550,6 +556,8 @@ impl Decoder {
             error: None,
             tail_ok: false,
             dct_type_always: self.dct_type_always,
+            rvlc_backward_mbs: 0,
+            rvlc_discarded_mbs: 0,
         };
         d.run(r);
         if d.error.is_some() && vol.interlaced && !self.dct_type_always {
@@ -569,6 +577,8 @@ impl Decoder {
             }
         }
         let error = d.error.take();
+        self.stats.rvlc_backward_mbs += d.rvlc_backward_mbs;
+        self.stats.rvlc_discarded_mbs += d.rvlc_discarded_mbs;
         let concealed = error.is_some();
         self.stats.vops += 1;
         if concealed {
@@ -729,7 +739,9 @@ impl VolHeader {
 
 #[cfg(test)]
 pub(crate) mod texture_for_tests {
-    pub(crate) use super::texture::{read_coeffs, read_dc_diff};
+    pub(crate) use super::texture::{
+        read_coeffs, read_dc_diff, read_rvlc_event, read_rvlc_event_back,
+    };
     pub(crate) use super::vop::read_mvd;
 }
 

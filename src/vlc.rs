@@ -3,7 +3,7 @@
 
 use std::sync::OnceLock;
 
-use crate::bits::BitReader;
+use crate::bits::{BackReader, BitReader};
 use crate::error::{Result, invalid};
 use crate::tables::{self, code};
 
@@ -39,6 +39,18 @@ impl Vlc {
             return Err(invalid(format!("no {} codeword matches", self.name)));
         }
         r.skip(len as usize)?;
+        Ok(v)
+    }
+
+    /// Decodes one codeword going backwards (the table must hold the
+    /// codewords reversed).
+    #[inline]
+    pub fn decode_back(&self, r: &mut BackReader) -> Result<u32> {
+        let (v, len) = self.table[r.peek_rev(self.bits) as usize];
+        if len == 0 || len as usize > r.left() {
+            return Err(invalid(format!("no {} codeword matches", self.name)));
+        }
+        r.skip_back(len as usize)?;
         Ok(v)
     }
 }
@@ -184,6 +196,47 @@ pub(crate) fn tcoef_enc(intra: bool) -> &'static TcoefEnc {
     cell.get_or_init(|| {
         let mut codes = vec![(0, 0); 2 * 64 * 32];
         for &(s, last, run, level) in t {
+            codes[(last as usize * 64 + run as usize) * 32 + level as usize] = code(s);
+        }
+        TcoefEnc { codes }
+    })
+}
+
+/// Reversible TCOEF (Table B-23), the codes without their sign bit, read
+/// forwards (`backward` false) or backwards (the codes reversed). Values as
+/// [`tcoef`]: `last << 16 | run << 8 | level`, or [`ESCAPE`] for `0000`.
+pub(crate) fn rvlc(intra: bool, backward: bool) -> &'static Vlc {
+    static T: [OnceLock<Vlc>; 4] = [const { OnceLock::new() }; 4];
+    T[intra as usize * 2 + backward as usize].get_or_init(|| {
+        let rev = |(b, l): (u32, u32)| -> (u32, u32) {
+            if backward {
+                (b.reverse_bits() >> (32 - l), l)
+            } else {
+                (b, l)
+            }
+        };
+        let esc = rev(code(tables::RVLC_ESCAPE));
+        Vlc::new(
+            "reversible TCOEF",
+            tables::RVLC_TCOEF
+                .iter()
+                .map(|&(s, i, p)| {
+                    let (last, run, level) = if intra { i } else { p };
+                    let (b, l) = rev(code(s));
+                    (b, l, (last as u32) << 16 | (run as u32) << 8 | level as u32)
+                })
+                .chain(std::iter::once((esc.0, esc.1, ESCAPE))),
+        )
+    })
+}
+
+/// Encoder lookup for the reversible table, as [`tcoef_enc`].
+pub(crate) fn rvlc_enc(intra: bool) -> &'static TcoefEnc {
+    static T: [OnceLock<TcoefEnc>; 2] = [const { OnceLock::new() }; 2];
+    T[intra as usize].get_or_init(|| {
+        let mut codes = vec![(0, 0); 2 * 64 * 32];
+        for &(s, i, p) in tables::RVLC_TCOEF {
+            let (last, run, level) = if intra { i } else { p };
             codes[(last as usize * 64 + run as usize) * 32 + level as usize] = code(s);
         }
         TcoefEnc { codes }

@@ -4,7 +4,7 @@
 
 use crate::bits::BitWriter;
 use crate::tables::{self, code, lmax, rmax};
-use crate::vlc::tcoef_enc;
+use crate::vlc::{rvlc_enc, tcoef_enc};
 
 /// Writes a codeword given as the standard prints it.
 #[inline]
@@ -153,6 +153,53 @@ pub(crate) fn put_coeffs(
     true
 }
 
+/// One TCOEF event with the reversible table (Table B-23): its code and
+/// sign, or the reversible escape `0000 1`, `last`, `run`, marker, 11-bit
+/// `|level|`, marker, `0000 s`. Levels beyond 2047 are clipped.
+pub(crate) fn put_rvlc_event(w: &mut BitWriter, last: bool, run: u32, level: i32, intra: bool) {
+    let a = level.unsigned_abs().min(2047);
+    let sign = (level < 0) as u32;
+    if let Some((c, l)) = rvlc_enc(intra).get(last, run, a) {
+        w.put(l, c);
+        w.put(1, sign);
+        return;
+    }
+    w.put(5, 0b00001);
+    w.put(1, last as u32);
+    w.put(6, run);
+    w.put(1, 1);
+    w.put(11, a);
+    w.put(1, 1);
+    w.put(4, 0);
+    w.put(1, sign);
+}
+
+/// [`put_coeffs`] with the reversible table.
+pub(crate) fn put_coeffs_rvlc(
+    w: &mut BitWriter,
+    levels: &[i16; 64],
+    scan: &[u8; 64],
+    start: usize,
+    intra_table: bool,
+) -> bool {
+    let mut events: Vec<(u32, i32)> = Vec::with_capacity(16);
+    let mut run = 0;
+    for &z in &scan[start..] {
+        let v = levels[z as usize];
+        if v == 0 {
+            run += 1;
+        } else {
+            events.push((run, v as i32));
+            run = 0;
+        }
+    }
+    let n = events.len();
+    for (i, &(run, level)) in events.iter().enumerate() {
+        put_rvlc_event(w, i + 1 == n, run, level, intra_table);
+    }
+    n > 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +262,95 @@ mod tests {
                     .unwrap();
                 assert_eq!(v, d, "fcode {fcode}");
             }
+        }
+    }
+
+    /// Every event of every reversible table, and escaped ones (long runs,
+    /// large levels, both signs, last or not), read back the same forwards
+    /// and backwards, and the backward reader ends exactly where the
+    /// event began.
+    #[test]
+    fn reversible_events_read_the_same_both_ways() {
+        use crate::bits::BackReader;
+        use crate::dec::texture_for_tests::{read_rvlc_event, read_rvlc_event_back};
+        let mut events = Vec::new();
+        for &(_, i, p) in crate::tables::RVLC_TCOEF {
+            for e in [i, p] {
+                events.push((e.0 == 1, e.1 as u32, e.2 as i32));
+                events.push((e.0 == 1, e.1 as u32, -(e.2 as i32)));
+            }
+        }
+        for last in [false, true] {
+            for (run, level) in [(0, 28), (0, 2047), (63, 1), (45, -1), (20, -300), (9, 3)] {
+                events.push((last, run, level));
+            }
+        }
+        for intra in [true, false] {
+            let mut w = BitWriter::new();
+            let mut ends = Vec::new();
+            for &(last, run, level) in &events {
+                put_rvlc_event(&mut w, last, run, level, intra);
+                ends.push(w.len_bits());
+            }
+            let n = w.len_bits();
+            let b = w.into_bytes();
+            let mut r = BitReader::new(&b);
+            let mut got = Vec::new();
+            for _ in &events {
+                got.push(read_rvlc_event(&mut r, intra).unwrap());
+            }
+            assert_eq!(got, events, "forwards, intra {intra}");
+            assert_eq!(r.pos(), n);
+            let mut br = BackReader::new(&b, n, 0);
+            let mut back = Vec::new();
+            for k in (0..events.len()).rev() {
+                assert_eq!(br.pos(), ends[k]);
+                back.push(read_rvlc_event_back(&mut br, intra).unwrap());
+            }
+            back.reverse();
+            assert_eq!(back, events, "backwards, intra {intra}");
+            assert_eq!(br.pos(), 0);
+        }
+    }
+
+    /// The escape forms Annex E.1.4.4.1 calls illegal are refused in both
+    /// directions: level 0, an event the table codes, a leading `0000 0`, a
+    /// missing marker.
+    #[test]
+    fn illegal_reversible_escapes() {
+        use crate::bits::BackReader;
+        use crate::dec::texture_for_tests::{read_rvlc_event, read_rvlc_event_back};
+        let esc = |lead: u32, last: u32, run: u32, m1: u32, level: u32, m2: u32| {
+            let mut w = BitWriter::new();
+            w.put(5, lead);
+            w.put(1, last);
+            w.put(6, run);
+            w.put(1, m1);
+            w.put(11, level);
+            w.put(1, m2);
+            w.put(5, 0b00001);
+            (w.len_bits(), w.into_bytes())
+        };
+        // A legal one first: (0, 0, -40) inter.
+        let (n, b) = esc(1, 0, 0, 1, 40, 1);
+        assert_eq!(
+            read_rvlc_event(&mut BitReader::new(&b), false).unwrap(),
+            (false, 0, -40)
+        );
+        assert_eq!(
+            read_rvlc_event_back(&mut BackReader::new(&b, n, 0), false).unwrap(),
+            (false, 0, -40)
+        );
+        for (lead, last, run, m1, level, m2) in [
+            (1, 0, 0, 1, 0, 1),  // level 0
+            (1, 0, 0, 1, 1, 1),  // (0, 0, 1) has a code
+            (0, 0, 0, 1, 40, 1), // leading 0000 0
+            (1, 0, 0, 0, 40, 1), // marker
+            (1, 0, 0, 1, 40, 0), // marker
+        ] {
+            let (n, b) = esc(lead, last, run, m1, level, m2);
+            assert!(read_rvlc_event(&mut BitReader::new(&b), false).is_err());
+            assert!(read_rvlc_event_back(&mut BackReader::new(&b, n, 0), false).is_err());
         }
     }
 }

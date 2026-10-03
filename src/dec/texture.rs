@@ -1,7 +1,7 @@
 //! Block texture decoding: the intra DC differential (6.3.8) and the TCOEF
 //! run / level events with the three escape modes (7.4.1).
 
-use crate::bits::BitReader;
+use crate::bits::{BackReader, BitReader};
 use crate::error::{Result, invalid};
 use crate::tables::{lmax, rmax};
 use crate::vlc::{self, ESCAPE};
@@ -97,6 +97,96 @@ pub(crate) fn read_coeffs(
             }
             (last, run, level)
         };
+        i += run as usize;
+        if i >= 64 {
+            return Err(invalid("coefficients run past the end of the block"));
+        }
+        blk[scan[i] as usize] = level as i16;
+        i += 1;
+        if last {
+            return Ok(());
+        }
+    }
+}
+
+/// A reversible escape's fixed-length part as read, checked as Annex
+/// E.1.4.4.1 lists: a nonzero level, an event the table has no code for.
+fn rvlc_escaped(intra: bool, last: u32, run: u32, level: u32) -> Result<(bool, u32, u32)> {
+    if level == 0 {
+        return Err(invalid("reversible escape with level 0"));
+    }
+    if vlc::rvlc_enc(intra).get(last != 0, run, level).is_some() {
+        return Err(invalid("reversible escape of an event the table codes"));
+    }
+    Ok((last != 0, run, level))
+}
+
+/// One TCOEF event of the reversible table (Table B-23), read forwards:
+/// `(last, run, level)`. The escape is `0000 1`, `last`, `run` (6),
+/// marker, `|level|` (11), marker, `0000 s`.
+pub(crate) fn read_rvlc_event(r: &mut BitReader, intra: bool) -> Result<(bool, u32, i32)> {
+    let v = vlc::rvlc(intra, false).decode(r)?;
+    if v != ESCAPE {
+        let (last, run, level) = unpack(v);
+        let neg = r.read_bit()?;
+        return Ok((last, run, if neg { -(level as i32) } else { level as i32 }));
+    }
+    if !r.read_bit()? {
+        return Err(invalid("reversible escape begins 0000 0"));
+    }
+    let last = r.read(1)?;
+    let run = r.read(6)?;
+    r.marker("before a reversible escape's level")?;
+    let level = r.read(11)?;
+    r.marker("after a reversible escape's level")?;
+    if r.read(4)? != 0 {
+        return Err(invalid("reversible escape without its closing 0000"));
+    }
+    let neg = r.read_bit()?;
+    let (last, run, level) = rvlc_escaped(intra, last, run, level)?;
+    Ok((last, run, if neg { -(level as i32) } else { level as i32 }))
+}
+
+/// One reversible TCOEF event read backwards, from its sign bit to its
+/// first bit: the same `(last, run, level)` [`read_rvlc_event`] reads.
+pub(crate) fn read_rvlc_event_back(r: &mut BackReader, intra: bool) -> Result<(bool, u32, i32)> {
+    let neg = r.read_back(1)? != 0;
+    let v = vlc::rvlc(intra, true).decode_back(r)?;
+    if v != ESCAPE {
+        let (last, run, level) = unpack(v);
+        return Ok((last, run, if neg { -(level as i32) } else { level as i32 }));
+    }
+    if r.read_back(1)? != 1 {
+        return Err(invalid(
+            "marker bit missing after a reversible escape's level",
+        ));
+    }
+    let level = r.read_back(11)?;
+    if r.read_back(1)? != 1 {
+        return Err(invalid(
+            "marker bit missing before a reversible escape's level",
+        ));
+    }
+    let run = r.read_back(6)?;
+    let last = r.read_back(1)?;
+    if r.read_back(5)? != 0b00001 {
+        return Err(invalid("reversible escape does not begin 0000 1"));
+    }
+    let (last, run, level) = rvlc_escaped(intra, last, run, level)?;
+    Ok((last, run, if neg { -(level as i32) } else { level as i32 }))
+}
+
+/// [`read_coeffs`] for the reversible table, read forwards.
+pub(crate) fn read_coeffs_rvlc(
+    r: &mut BitReader,
+    blk: &mut [i16; 64],
+    scan: &[u8; 64],
+    start: usize,
+    intra: bool,
+) -> Result<()> {
+    let mut i = start;
+    loop {
+        let (last, run, level) = read_rvlc_event(r, intra)?;
         i += run as usize;
         if i >= 64 {
             return Err(invalid("coefficients run past the end of the block"));

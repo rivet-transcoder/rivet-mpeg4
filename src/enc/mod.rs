@@ -7,6 +7,7 @@
 //! (prediction, inverse quantisation, IDCT, motion compensation), so its
 //! reference pictures are the ones any conforming decoder builds.
 
+mod syntax;
 mod write;
 
 use std::collections::VecDeque;
@@ -22,6 +23,7 @@ use crate::mc;
 use crate::picture::Pic;
 use crate::quant::{Quant, quantise_h263};
 use crate::tables::{ALT_HORIZONTAL, ALT_VERTICAL, ZIGZAG, code, dc_scaler};
+use syntax::{MbSyntax, write_partitioned};
 use write::*;
 
 /// How the encoder picks its quantiser.
@@ -64,6 +66,16 @@ pub struct EncoderConfig {
     /// passes this many bytes; `None` codes each VOP as one packet with
     /// resync markers disabled in the VOL.
     pub packet_bytes: Option<u32>,
+    /// Data partitioning (6.2.5.2): each video packet's macroblock headers
+    /// and vectors (or, in I-VOPs, DC coefficients) ahead of a marker, then
+    /// the rest of their syntax, then their texture — so damage to the
+    /// texture leaves the motion usable. Applies to I- and P-VOPs; B-VOPs
+    /// are not partitioned.
+    pub data_partitioning: bool,
+    /// Reversible VLCs (Table B-23) for the texture of data-partitioned
+    /// VOPs, which a decoder can read backwards from the next resync
+    /// marker after damage. Requires `data_partitioning`.
+    pub reversible_vlc: bool,
     /// Keep the reconstruction of every coded VOP for
     /// [`Encoder::take_reconstructions`] (for measuring quality; costs a
     /// copy of every frame).
@@ -86,6 +98,8 @@ impl EncoderConfig {
             search_range: 15,
             four_mv: false,
             packet_bytes: None,
+            data_partitioning: false,
+            reversible_vlc: false,
             keep_reconstructions: false,
         }
     }
@@ -202,6 +216,9 @@ impl Encoder {
                 cfg.b_frames
             )));
         }
+        if cfg.reversible_vlc && !cfg.data_partitioning {
+            return Err(config("reversible VLCs without data partitioning"));
+        }
         match cfg.rate {
             RateControl::ConstantQuant(q) if !(1..=31).contains(&q) => {
                 return Err(config(format!("quantiser {q} (1..=31)")));
@@ -234,6 +251,8 @@ impl Encoder {
             time_resolution: cfg.time_base,
             fixed_increment: (cfg.frame_duration < cfg.time_base).then_some(cfg.frame_duration),
             resync_markers: cfg.packet_bytes.is_some(),
+            data_partitioned: cfg.data_partitioning,
+            reversible_vlc: cfg.reversible_vlc,
         });
         let rc = match cfg.rate {
             RateControl::Bitrate(bps) => {
@@ -442,12 +461,24 @@ impl Encoder {
         mb: usize,
         h: &VopHeader,
     ) -> bool {
-        let Some(limit) = self.cfg.packet_bytes else {
-            return false;
-        };
-        if mb == 0 || w.len_bits() - *packet_start <= limit as usize * 8 {
+        if !self.packet_due(mb, w.len_bits() - *packet_start) {
             return false;
         }
+        self.put_packet_header(w, mb, h);
+        *packet_start = w.len_bits();
+        true
+    }
+
+    /// Whether a packet of `bits` so far should end before macroblock `mb`.
+    fn packet_due(&self, mb: usize, bits: usize) -> bool {
+        self.cfg
+            .packet_bytes
+            .is_some_and(|limit| mb > 0 && bits > limit as usize * 8)
+    }
+
+    /// Stuffing, a resync marker and `video_packet_header()` for a packet
+    /// starting at macroblock `mb`, which opens a new slice.
+    fn put_packet_header(&mut self, w: &mut BitWriter, mb: usize, h: &VopHeader) {
         let total = self.st.mbw * self.st.mbh;
         let mb_bits = (usize::BITS - (total - 1).leading_zeros()).max(1);
         w.stuff();
@@ -460,25 +491,44 @@ impl Encoder {
         w.put(mb_bits, mb as u32);
         w.put(5, h.quant);
         w.put(1, 0); // header_extension_code
-        *packet_start = w.len_bits();
         self.new_slice();
-        true
     }
 
     fn code_ip(&mut self, w: &mut BitWriter, src: &Pic, recon: &mut Pic, h: &VopHeader) {
         let (mbw, mbh) = (self.st.mbw, self.st.mbh);
         self.new_slice();
-        let mut packet_start = w.len_bits();
+        let dp = self.cfg.data_partitioning;
+        let i_vop = h.vop_type == VopType::I;
         let reference = self.future.take();
+        let mut packet: Vec<MbSyntax> = Vec::new();
+        let mut packet_bits = 0;
         for mb in 0..mbw * mbh {
-            self.maybe_packet(w, &mut packet_start, mb, h);
+            if self.packet_due(mb, packet_bits) {
+                if dp {
+                    write_partitioned(w, &packet, i_vop, self.cfg.reversible_vlc);
+                    packet.clear();
+                }
+                self.put_packet_header(w, mb, h);
+                packet_bits = 0;
+            }
             let (mbx, mby) = (mb % mbw, mb / mbw);
             self.st.slice[mb] = self.slice;
             self.st.qp[mb] = h.quant as u8;
-            match (&reference, h.vop_type) {
-                (Some(rf), VopType::P) => self.code_p_mb(w, src, &rf.pic, recon, mbx, mby, h),
-                _ => self.code_intra_mb(w, src, recon, mbx, mby, h.quant, false),
+            let syn = match (&reference, h.vop_type) {
+                (Some(rf), VopType::P) => self.code_p_mb(src, &rf.pic, recon, mbx, mby, h),
+                _ => self.code_intra_mb(src, recon, mbx, mby, h.quant, !i_vop),
+            };
+            let mut t = BitWriter::new();
+            syn.write(&mut t);
+            packet_bits += t.len_bits();
+            if dp {
+                packet.push(syn);
+            } else {
+                w.append(&t);
             }
+        }
+        if dp {
+            write_partitioned(w, &packet, i_vop, self.cfg.reversible_vlc);
         }
         self.future = reference;
     }
@@ -730,14 +780,13 @@ impl Encoder {
     #[allow(clippy::too_many_arguments)]
     fn code_intra_mb(
         &mut self,
-        w: &mut BitWriter,
         src: &Pic,
         recon: &mut Pic,
         mbx: usize,
         mby: usize,
         qp: u32,
         in_p: bool,
-    ) {
+    ) -> MbSyntax {
         let mb = mby * self.st.mbw + mbx;
         self.st.kind[mb] = MbKind::Intra;
         self.st.set_mb_mv(mbx, mby, [0, 0]);
@@ -798,25 +847,20 @@ impl Encoder {
                 cbp |= 1 << (5 - k);
             }
         }
-        if in_p {
-            w.put(1, 0); // not_coded
-            put_mcbpc_p(w, 3, cbp & 3);
-        } else {
-            put_mcbpc_i(w, 3, cbp & 3);
-        }
-        w.put(1, ac_pred as u32);
-        put_cbpy(w, cbp >> 2);
-        for k in 0..6 {
-            put_dc_diff(w, dc_diff[k], k < 4);
-            if cbp >> (5 - k) & 1 != 0 {
-                put_coeffs(w, &coded[k], scans[k], 1, true);
-            }
-        }
         for (k, lv) in levels.iter().enumerate() {
             let mut rec = *lv;
             self.quant.intra(&mut rec, qp, dc_scaler(qp, k < 4));
             idct(&mut rec);
             put_block(recon, mbx, mby, k, &rec, false);
+        }
+        MbSyntax {
+            mb_type: 3,
+            cbp,
+            ac_pred,
+            dc: dc_diff,
+            blocks: coded,
+            scans,
+            ..MbSyntax::new(in_p, self.fcode)
         }
     }
 
@@ -825,14 +869,13 @@ impl Encoder {
     #[allow(clippy::too_many_arguments)]
     fn code_p_mb(
         &mut self,
-        w: &mut BitWriter,
         src: &Pic,
         rf: &Pic,
         recon: &mut Pic,
         mbx: usize,
         mby: usize,
         h: &VopHeader,
-    ) {
+    ) -> MbSyntax {
         let qp = h.quant;
         let mb = mby * self.st.mbw + mbx;
         let pred0 = self.st.mv_pred(mbx, mby, 0, self.slice);
@@ -859,8 +902,7 @@ impl Encoder {
             .map(|&v| (v as i32 - mean as i32).unsigned_abs())
             .sum();
         if dev + 500 < sad16 {
-            self.code_intra_mb(w, src, recon, mbx, mby, qp, true);
-            return;
+            return self.code_intra_mb(src, recon, mbx, mby, qp, true);
         }
         let mut mvs = [mv; 4];
         let mut four = false;
@@ -894,36 +936,46 @@ impl Encoder {
             }
         }
         write_mb(recon, mbx, mby, &px);
+        let mut syn = MbSyntax::new(true, self.fcode);
         if !four && mv == [0, 0] && cbp == 0 {
-            w.put(1, 1); // not_coded
             self.st.kind[mb] = MbKind::Skipped;
             self.st.set_mb_mv(mbx, mby, [0, 0]);
-            return;
+            syn.not_coded = true;
+            return syn;
         }
         self.st.kind[mb] = MbKind::Inter;
-        w.put(1, 0);
-        put_mcbpc_p(w, if four { 2 } else { 0 }, cbp & 3);
-        put_cbpy(w, 15 - (cbp >> 2));
+        syn.mb_type = if four { 2 } else { 0 };
+        syn.cbp = cbp;
         if four {
             for (k, v) in mvs.iter().enumerate() {
                 let p = self.st.mv_pred(mbx, mby, k, self.slice);
-                self.put_mv(w, *v, p);
+                syn.mvd.push(self.mv_diff(*v, p));
                 self.st.set_mv(mbx, mby, k, *v);
             }
         } else {
-            self.put_mv(w, mv, pred0);
+            syn.mvd.push(self.mv_diff(mv, pred0));
             self.st.set_mb_mv(mbx, mby, mv);
         }
         for (k, lv) in levels.iter().enumerate() {
             if cbp >> (5 - k) & 1 == 0 {
                 continue;
             }
-            put_coeffs(w, lv, &ZIGZAG, 0, false);
             let mut rec = *lv;
             self.quant.inter(&mut rec, qp);
             idct(&mut rec);
             add_block(recon, mbx, mby, k, &rec, false);
         }
+        syn.blocks = levels;
+        syn
+    }
+
+    /// A vector's difference from its predictor, wrapped into the range
+    /// `vop_fcode` codes.
+    fn mv_diff(&self, mv: [i32; 2], pred: [i32; 2]) -> [i32; 2] {
+        [
+            wrap_diff(mv[0] - pred[0], self.fcode),
+            wrap_diff(mv[1] - pred[1], self.fcode),
+        ]
     }
 
     fn put_mv(&self, w: &mut BitWriter, mv: [i32; 2], pred: [i32; 2]) {

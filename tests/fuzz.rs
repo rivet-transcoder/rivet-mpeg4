@@ -12,6 +12,16 @@ use proptest::prelude::*;
 /// A short valid stream: configuration headers, then the VOPs one access
 /// unit each.
 fn stream(b_frames: u32, packets: bool, four_mv: bool) -> Vec<Vec<u8>> {
+    stream_with(b_frames, packets, four_mv, |_| {})
+}
+
+/// [`stream`] with further settings.
+fn stream_with(
+    b_frames: u32,
+    packets: bool,
+    four_mv: bool,
+    f: impl Fn(&mut EncoderConfig),
+) -> Vec<Vec<u8>> {
     let mut cfg = EncoderConfig::new(48, 32, 25);
     cfg.b_frames = b_frames;
     cfg.four_mv = four_mv;
@@ -20,6 +30,7 @@ fn stream(b_frames: u32, packets: bool, four_mv: bool) -> Vec<Vec<u8>> {
     if packets {
         cfg.packet_bytes = Some(40);
     }
+    f(&mut cfg);
     let mut enc = Encoder::new(cfg).unwrap();
     let mut aus = Vec::new();
     for t in 0..8 {
@@ -76,7 +87,7 @@ proptest! {
 
     #[test]
     fn damaged_streams(
-        kind in 0usize..4,
+        kind in 0usize..6,
         flips in proptest::collection::vec((any::<usize>(), 0u8..8), 1..12),
         cut in any::<usize>(),
         splice in proptest::collection::vec(any::<u8>(), 0..32),
@@ -85,7 +96,12 @@ proptest! {
             0 => stream(0, false, false),
             1 => stream(2, false, true),
             2 => stream(0, true, true),
-            _ => stream(1, true, false),
+            3 => stream(1, true, false),
+            4 => stream_with(0, true, true, |c| c.data_partitioning = true),
+            _ => stream_with(1, true, false, |c| {
+                c.data_partitioning = true;
+                c.reversible_vlc = true;
+            }),
         };
         let count = aus.len();
         for (pos, bit) in &flips {
@@ -112,6 +128,7 @@ proptest! {
         b in 0u32..4, four in any::<bool>(), q in 1u8..32,
         packets in proptest::option::of(8u32..200),
         range in 1u32..64, gop in 0u32..5,
+        dp in 0u8..3,
     ) {
         let mut cfg = EncoderConfig::new(w, h, 30);
         cfg.b_frames = b;
@@ -120,6 +137,8 @@ proptest! {
         cfg.packet_bytes = packets;
         cfg.search_range = range;
         cfg.gop_size = gop;
+        cfg.data_partitioning = dp > 0;
+        cfg.reversible_vlc = dp > 1;
         cfg.keep_reconstructions = true;
         let mut enc = Encoder::new(cfg).unwrap();
         let mut dec = Decoder::new();

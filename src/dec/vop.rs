@@ -14,7 +14,8 @@ use crate::quant::Quant;
 use crate::tables::{ALT_HORIZONTAL, ALT_VERTICAL, MB_STUFFING, ZIGZAG, dc_scaler};
 use crate::vlc;
 
-use super::texture::{read_coeffs, read_dc_diff};
+use super::texture::{read_coeffs, read_coeffs_rvlc, read_dc_diff, read_rvlc_event_back};
+use crate::bits::BackReader;
 
 /// What a B-VOP needs of its backward reference: how each macroblock was
 /// coded and its vectors (direct mode, 7.6.9.5; skipping, 6.3.6.2).
@@ -338,6 +339,21 @@ struct MbHdr {
     field_mvs: [[i32; 2]; 2],
 }
 
+/// A macroblock's six blocks of coefficients in scan order (index `i` is
+/// the `i`-th coefficient of the block's scan), as the reversible-VLC
+/// path reads them ahead of reconstruction.
+pub(crate) type Coefs = [[i16; 64]; 6];
+
+/// Places scan-order coefficients into a raster block.
+#[inline]
+fn unscan(c: &[i16; 64], scan: &[u8; 64], blk: &mut [i16; 64]) {
+    for (i, &v) in c.iter().enumerate() {
+        if v != 0 {
+            blk[scan[i] as usize] = v;
+        }
+    }
+}
+
 /// B-VOP macroblock types (Table 6-26).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum BType {
@@ -347,8 +363,8 @@ enum BType {
     Forward,
 }
 
-const DC_MARKER: u32 = 0b110_1011_0000_0000_0001;
-const MOTION_MARKER: u32 = 0b1_1111_0000_0000_0001;
+pub(crate) const DC_MARKER: u32 = 0b110_1011_0000_0000_0001;
+pub(crate) const MOTION_MARKER: u32 = 0b1_1111_0000_0000_0001;
 
 /// Decodes the data of one VOP into `cur`.
 pub(crate) struct VopDec<'a> {
@@ -383,6 +399,10 @@ pub(crate) struct VopDec<'a> {
     /// Interlaced: read `dct_type` for every coded P/S-VOP macroblock, not
     /// only for intra ones and those with coded blocks (early Xvid).
     pub dct_type_always: bool,
+    /// Reversible VLCs: macroblocks whose texture was recovered by
+    /// decoding backwards, and macroblocks whose texture was discarded.
+    pub rvlc_backward_mbs: u64,
+    pub rvlc_discarded_mbs: u64,
 }
 
 impl VopDec<'_> {
@@ -617,7 +637,7 @@ impl VopDec<'_> {
         let Some(h) = self.mb_header(r, mbx, mby, false)? else {
             return Ok(false);
         };
-        self.mb_texture(r, mbx, mby, &h)?;
+        self.mb_texture(r, mbx, mby, &h, None)?;
         Ok(true)
     }
 
@@ -815,15 +835,218 @@ impl VopDec<'_> {
             }
         }
         // Third partition.
+        if self.vol.reversible_vlc {
+            self.rvlc_texture(r, &hdrs);
+            return Ok(mb);
+        }
         for (mb, h) in &hdrs {
             let (mbx, mby) = self.mb_xy(*mb);
-            self.mb_texture(r, mbx, mby, h)?;
+            self.mb_texture(r, mbx, mby, h, None)?;
         }
         Ok(mb)
     }
 
+    /// The texture partition of a data-partitioned packet coded with
+    /// reversible VLCs (Annex E.1.4.4). It is read forwards first; when
+    /// that fails — an illegal code, an illegal escape, more than 64
+    /// coefficients, or a partition that does not end at the stuffing
+    /// before the next resync marker (or the VOP's end) — it is read again
+    /// backwards from that end, and the macroblocks each direction
+    /// recovered are kept as the strategies of E.1.4.4.2.1 decide. The
+    /// rest are concealed: inter macroblocks with their (intact) motion and
+    /// no residual; intra macroblocks of an I-VOP from their DC (in the
+    /// first partition when `intra_dc_vlc` codes it) with no AC; and, as
+    /// E.1.4.4.2.2 says, every intra macroblock of a damaged packet in a
+    /// P- or S-VOP is copied from the reference rather than shown.
+    fn rvlc_texture(&mut self, r: &mut BitReader, hdrs: &[(usize, MbHdr)]) {
+        let n = hdrs.len();
+        let t0 = r.pos();
+        // (macroblock in the packet, block, first coefficient, intra table)
+        let mut blocks: Vec<(usize, usize, usize, bool)> = Vec::new();
+        for (j, (_, h)) in hdrs.iter().enumerate() {
+            for k in 0..6 {
+                if h.kind == MbKind::Skipped || h.cbp >> (5 - k) & 1 == 0 {
+                    continue;
+                }
+                let intra = h.kind == MbKind::Intra;
+                blocks.push((j, k, (intra && h.use_dc_vlc) as usize, intra));
+            }
+        }
+        let has_bits = |j: usize| blocks.iter().any(|b| b.0 == j);
+        let mut fwd = vec![[[0i16; 64]; 6]; n];
+        let mut fstart = Vec::with_capacity(n);
+        let mut n1 = 0;
+        let mut err = None;
+        let mut bi = 0;
+        'fwd: for (j, c) in fwd.iter_mut().enumerate() {
+            fstart.push(r.pos() - t0);
+            while bi < blocks.len() && blocks[bi].0 == j {
+                let (_, k, start, intra) = blocks[bi];
+                if let Err(e) = read_coeffs_rvlc(r, &mut c[k], &IDENTITY_SCAN, start, intra) {
+                    err = Some(e);
+                    break 'fwd;
+                }
+                bi += 1;
+            }
+            n1 = j + 1;
+        }
+        let fend = r.pos();
+        let end = self.texture_end(r, t0);
+        if err.is_none() {
+            match end {
+                Some(e) if e != fend => {
+                    err = Some(invalid(
+                        "a reversible-VLC texture partition does not end at the stuffing",
+                    ));
+                }
+                _ => {
+                    for (j, (mb, h)) in hdrs.iter().enumerate() {
+                        let (mbx, mby) = self.mb_xy(*mb);
+                        // Cannot fail: the coefficients are all read.
+                        let _ = self.mb_texture(r, mbx, mby, h, Some(&fwd[j]));
+                    }
+                    return;
+                }
+            }
+        }
+        // Two-way decoding.
+        let (l, l1) = match end {
+            Some(e) => (e - t0, fend.min(e) - t0),
+            None => (fend - t0 + 1, fend - t0),
+        };
+        let mut bwd = vec![[[0i16; 64]; 6]; n];
+        let mut bend = vec![None; n];
+        let mut n2 = 0;
+        let mut l2 = 0;
+        if let Some(e) = end {
+            let mut br = BackReader::new(r.data(), e, t0);
+            let mut bi = blocks.len();
+            let mut ok = true;
+            'bwd: for j in (0..n).rev() {
+                bend[j] = Some(e - br.pos());
+                while bi > 0 && blocks[bi - 1].0 == j {
+                    let (_, k, start, intra) = blocks[bi - 1];
+                    match read_block_back(&mut br, start, intra, bi == 1) {
+                        Ok(c) => bwd[j][k] = c,
+                        Err(_) => {
+                            ok = false;
+                            break 'bwd;
+                        }
+                    }
+                    bi -= 1;
+                }
+                n2 += 1;
+            }
+            if ok && br.left() != 0 {
+                n2 = n2.min(n.saturating_sub(1));
+            }
+            l2 = e - br.pos();
+        }
+        let f_mb = |sb: i64| -> usize {
+            fstart
+                .iter()
+                .enumerate()
+                .filter(|&(j, &st)| (st as i64) < sb || (!has_bits(j) && st as i64 <= sb))
+                .count()
+        };
+        let b_mb = |sb: i64| -> usize {
+            bend.iter()
+                .enumerate()
+                .filter(|&(j, b)| {
+                    b.is_some_and(|b| (b as i64) < sb || (!has_bits(j) && b as i64 <= sb))
+                })
+                .count()
+        };
+        let (front, back) = rvlc_strategy(l, n, l1, l2, n1, n2, f_mb, b_mb);
+        let front = front.min(n1);
+        let back = back.min(n2).min(n - front);
+        let p_vop = self.hdr.vop_type != VopType::I;
+        let zeros = [[0i16; 64]; 6];
+        for (j, (mb, h)) in hdrs.iter().enumerate() {
+            let (mbx, mby) = self.mb_xy(*mb);
+            let coefs = if j < front {
+                Some(&fwd[j])
+            } else if j >= n - back {
+                Some(&bwd[j])
+            } else {
+                None
+            };
+            if p_vop && h.kind == MbKind::Intra {
+                self.rvlc_discarded_mbs += 1;
+                self.copy_from_reference(mbx, mby);
+                continue;
+            }
+            if j >= n - back && j >= front {
+                self.rvlc_backward_mbs += has_bits(j) as u64;
+            }
+            let _ = match (coefs, h.kind) {
+                (Some(c), _) => self.mb_texture(r, mbx, mby, h, Some(c)),
+                (None, MbKind::Inter) => {
+                    self.rvlc_discarded_mbs += has_bits(j) as u64;
+                    let h = MbHdr { cbp: 0, ..*h };
+                    self.mb_texture(r, mbx, mby, &h, Some(&zeros))
+                }
+                (None, MbKind::Intra) => {
+                    self.rvlc_discarded_mbs += 1;
+                    self.mb_texture(r, mbx, mby, h, Some(&zeros))
+                }
+                (None, MbKind::Skipped) => self.mb_texture(r, mbx, mby, h, None),
+            };
+        }
+        self.record(err.unwrap_or_else(|| invalid("reversible-VLC texture damaged")));
+        r.set_pos(end.unwrap_or(fend));
+    }
+
+    /// The co-located macroblock of the reference, pixels only (the
+    /// macroblock's syntax state, which later VOPs read, is kept).
+    fn copy_from_reference(&mut self, mbx: usize, mby: usize) {
+        if let Some(src) = self.fwd {
+            let mut px = MbPix::new();
+            predict_mb(src, mbx, mby, &[[0, 0]; 4], false, false, false, &mut px);
+            write_mb(self.cur, mbx, mby, &px);
+        }
+    }
+
+    /// Where the texture partition that starts at `t0` ends: before the
+    /// stuffing (a zero, then up to seven ones) that precedes the next
+    /// resync marker or the end of the VOP's data. `None` when that
+    /// stuffing is not there.
+    fn texture_end(&self, r: &BitReader, t0: usize) -> Option<usize> {
+        let mut t = r.clone();
+        t.set_pos(t0);
+        let p = if self.resync_enabled() && self.find_resync(&mut t) {
+            t.pos()
+        } else {
+            let d = r.data();
+            d.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1) * 8
+        };
+        let bit = |i: usize| {
+            let mut t = r.clone();
+            t.set_pos(i);
+            t.peek(1)
+        };
+        let mut q = p;
+        while q > t0 && bit(q - 1) == 1 {
+            q -= 1;
+            if p - q > 7 {
+                return None;
+            }
+        }
+        (q > t0 && bit(q - 1) == 0).then_some(q - 1)
+    }
+
     /// Texture and reconstruction of an I-, P- or S-VOP macroblock.
-    fn mb_texture(&mut self, r: &mut BitReader, mbx: usize, mby: usize, h: &MbHdr) -> Result<()> {
+    /// `pre`: the blocks' coefficients already read (scan order), for the
+    /// reversible-VLC path, which reads a packet's texture before any of it
+    /// is reconstructed.
+    fn mb_texture(
+        &mut self,
+        r: &mut BitReader,
+        mbx: usize,
+        mby: usize,
+        h: &MbHdr,
+        pre: Option<&Coefs>,
+    ) -> Result<()> {
         match h.kind {
             MbKind::Skipped => {
                 let src = self
@@ -836,7 +1059,7 @@ impl VopDec<'_> {
             }
             MbKind::Intra => {
                 for k in 0..6 {
-                    self.intra_block(r, mbx, mby, k, h)?;
+                    self.intra_block(r, mbx, mby, k, h, pre.map(|p| &p[k]))?;
                 }
                 Ok(())
             }
@@ -869,12 +1092,13 @@ impl VopDec<'_> {
                     ),
                 }
                 write_mb(self.cur, mbx, mby, &px);
-                self.residual(r, mbx, mby, h.cbp, h.qp, h.field_dct)
+                self.residual(r, mbx, mby, h.cbp, h.qp, h.field_dct, pre)
             }
         }
     }
 
     /// The coded inter blocks of a macroblock, added to its prediction.
+    #[allow(clippy::too_many_arguments)]
     fn residual(
         &mut self,
         r: &mut BitReader,
@@ -883,6 +1107,7 @@ impl VopDec<'_> {
         cbp: u8,
         qp: u32,
         field_dct: bool,
+        pre: Option<&Coefs>,
     ) -> Result<()> {
         // alternate_vertical_scan_flag puts every block on that scan.
         let scan = if self.hdr.alternate_vertical_scan {
@@ -895,7 +1120,10 @@ impl VopDec<'_> {
                 continue;
             }
             let mut blk = [0i16; 64];
-            read_coeffs(r, &mut blk, scan, 0, false, self.sh)?;
+            match pre {
+                Some(p) => unscan(&p[k], scan, &mut blk),
+                None => read_coeffs(r, &mut blk, scan, 0, false, self.sh)?,
+            }
             self.quant.inter(&mut blk, qp);
             idct(&mut blk);
             add_block(self.cur, mbx, mby, k, &blk, field_dct);
@@ -911,6 +1139,7 @@ impl VopDec<'_> {
         mby: usize,
         k: usize,
         h: &MbHdr,
+        pre: Option<&[i16; 64]>,
     ) -> Result<()> {
         let luma = k < 4;
         let coded = h.cbp >> (5 - k) & 1 != 0;
@@ -943,7 +1172,9 @@ impl VopDec<'_> {
             } else {
                 0
             };
-            if coded {
+            if let Some(p) = pre {
+                unscan(p, scan, &mut blk);
+            } else if coded {
                 read_coeffs(
                     r,
                     &mut blk,
@@ -1118,7 +1349,7 @@ impl VopDec<'_> {
             }
         }
         write_mb(self.cur, mbx, mby, &px);
-        self.residual(r, mbx, mby, cbp, self.qp, field_dct)
+        self.residual(r, mbx, mby, cbp, self.qp, field_dct, None)
     }
 
     /// The GOB layer of a short-header picture (6.2.7.1; H.263 5.2): GOBs
@@ -1261,6 +1492,108 @@ pub(crate) fn direct_vectors(
         }
     }
     (f, b)
+}
+
+/// The identity scan: coefficients kept in scan order.
+const IDENTITY_SCAN: [u8; 64] = {
+    let mut s = [0u8; 64];
+    let mut i = 0;
+    while i < 64 {
+        s[i] = i as u8;
+        i += 1;
+    }
+    s
+};
+
+/// One block of reversible TCOEF events read backwards (Annex E.1.3):
+/// from its `last` event back to the event before which the previous
+/// block's `last` event (or, for the packet's first block, the partition
+/// start) lies. Returns the coefficients in scan order from `start`.
+fn read_block_back(
+    br: &mut BackReader,
+    start: usize,
+    intra: bool,
+    first: bool,
+) -> Result<[i16; 64]> {
+    let mut ev = Vec::with_capacity(16);
+    let (last, run, level) = read_rvlc_event_back(br, intra)?;
+    if !last {
+        return Err(invalid("a block read backwards does not end with last"));
+    }
+    ev.push((run, level));
+    while br.left() > 0 {
+        let save = br.clone();
+        let (last, run, level) = read_rvlc_event_back(br, intra)?;
+        if last {
+            if first {
+                return Err(invalid("data before a packet's first block"));
+            }
+            *br = save;
+            break;
+        }
+        ev.push((run, level));
+        if ev.len() > 64 {
+            return Err(invalid("more than 64 coefficients in a block"));
+        }
+    }
+    if first && br.left() > 0 {
+        return Err(invalid("data before a packet's first block"));
+    }
+    let mut c = [0i16; 64];
+    let mut i = start;
+    for &(run, level) in ev.iter().rev() {
+        i += run as usize;
+        if i >= 64 {
+            return Err(invalid("coefficients run past the end of the block"));
+        }
+        c[i] = level as i16;
+        i += 1;
+    }
+    Ok(c)
+}
+
+/// The threshold `T` of Annex E.1.4.4.2: bits next to a detected error
+/// that are not trusted.
+const RVLC_T: i64 = 90;
+
+/// The strategies of Annex E.1.4.4.2.1: how many macroblocks of a packet
+/// to keep from its beginning (decoded forwards) and from its end (decoded
+/// backwards), given the partition's `l` bits and `n` macroblocks, the
+/// bits (`l1`, `l2`) and whole macroblocks (`n1`, `n2`) each direction
+/// decoded before its error, and `f_mb` / `b_mb`, the macroblocks with at
+/// least one bit among the first / last `S` bits.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rvlc_strategy(
+    l: usize,
+    n: usize,
+    l1: usize,
+    l2: usize,
+    n1: usize,
+    n2: usize,
+    f_mb: impl Fn(i64) -> usize,
+    b_mb: impl Fn(i64) -> usize,
+) -> (usize, usize) {
+    let (n, l) = (n as i64, l as i64);
+    let (l1, l2) = (l1 as i64, l2 as i64);
+    let (n1, n2) = ((n1 as i64).min(n - 1), (n2 as i64).min(n - 1));
+    let f = |s| f_mb(s) as i64;
+    let b = |s| b_mb(s) as i64;
+    let (front, back) = if l1 + l2 < l {
+        if n1 + n2 < n {
+            // Strategy 1.
+            (f(l1 - RVLC_T), b(l2 - RVLC_T))
+        } else {
+            // Strategy 2.
+            (n - n2 - 1, n - n1 - 1)
+        }
+    } else if n1 + n2 < n {
+        // Strategy 3.
+        (n - b(l2), n - f(l1))
+    } else {
+        // Strategy 4.
+        ((n - b(l2)).min(n - n2 - 1), (n - f(l1)).min(n - n1 - 1))
+    };
+    (front.clamp(0, n) as usize, back.clamp(0, n) as usize)
 }
 
 /// Whether what follows the last macroblock is the stuffing that should
@@ -1486,5 +1819,33 @@ mod tests {
         assert_eq!(wrap_mv(-33, 1), 31);
         // f_code 3: [-128, 127].
         assert_eq!(wrap_mv(130, 3), -126);
+    }
+
+    /// The four strategies of Annex E.1.4.4.2.1 by hand, on a packet of 10
+    /// macroblocks of 100 bits each (so `f_mb(S)` = `b_mb(S)` = S / 100
+    /// rounded up: a macroblock counts once one of its bits is in).
+    #[test]
+    fn rvlc_strategies() {
+        let mbs = |s: i64| {
+            if s <= 0 {
+                0
+            } else {
+                (s as usize).div_ceil(100)
+            }
+        };
+        // 1: L1 + L2 < L, N1 + N2 < N: f_mb(L1 - T), b_mb(L2 - T).
+        assert_eq!(rvlc_strategy(1000, 10, 300, 400, 3, 4, mbs, mbs), (3, 4));
+        assert_eq!(rvlc_strategy(1000, 10, 250, 395, 2, 3, mbs, mbs), (2, 4));
+        // 2: L1 + L2 < L, N1 + N2 >= N: N - N2 - 1, N - N1 - 1.
+        assert_eq!(rvlc_strategy(1000, 10, 300, 400, 5, 6, mbs, mbs), (3, 4));
+        // 3: L1 + L2 >= L, N1 + N2 < N: N - b_mb(L2), N - f_mb(L1).
+        assert_eq!(rvlc_strategy(1000, 10, 600, 500, 3, 4, mbs, mbs), (5, 4));
+        // 4: both: the smaller of the two each way.
+        assert_eq!(rvlc_strategy(1000, 10, 600, 500, 6, 5, mbs, mbs), (4, 3));
+        // N1 and N2 count at most N - 1.
+        assert_eq!(
+            rvlc_strategy(1000, 10, 1000, 1000, 10, 10, mbs, mbs),
+            (0, 0)
+        );
     }
 }

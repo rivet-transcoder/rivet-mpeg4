@@ -17,6 +17,11 @@ impl<'a> BitReader<'a> {
         BitReader { data, pos: 0 }
     }
 
+    /// The whole buffer.
+    pub fn data(&self) -> &'a [u8] {
+        self.data
+    }
+
     /// Bit position from the start of the buffer.
     #[inline]
     pub fn pos(&self) -> usize {
@@ -134,6 +139,76 @@ impl<'a> BitReader<'a> {
     }
 }
 
+/// Reads bits backwards from an end position toward a floor, for the
+/// reversible VLCs (Annex E.1.3): `read_back` returns the `n` bits just
+/// before the position in their forward order, `peek_rev` the bits in the
+/// order a backward reader meets them.
+#[derive(Clone)]
+pub(crate) struct BackReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+    floor: usize,
+}
+
+impl<'a> BackReader<'a> {
+    /// A reader at bit `end`, which may go back as far as bit `floor`.
+    pub fn new(data: &'a [u8], end: usize, floor: usize) -> Self {
+        BackReader {
+            data,
+            pos: end.min(data.len() * 8),
+            floor,
+        }
+    }
+
+    #[inline]
+    fn bit(&self, i: usize) -> u32 {
+        (self.data[i >> 3] >> (7 - (i & 7)) & 1) as u32
+    }
+
+    /// Bit position (exclusive end of what is still unread).
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+
+    /// Bits left before the floor.
+    pub fn left(&self) -> usize {
+        self.pos.saturating_sub(self.floor)
+    }
+
+    /// The next `n` bits (0..=32) going backwards, the nearest first (as
+    /// the MSB); zeros past the floor.
+    pub fn peek_rev(&self, n: u32) -> u32 {
+        let mut v = 0;
+        for k in 0..n as usize {
+            let b = if self.pos > self.floor + k {
+                self.bit(self.pos - 1 - k)
+            } else {
+                0
+            };
+            v = v << 1 | b;
+        }
+        v
+    }
+
+    pub fn skip_back(&mut self, n: usize) -> Result<()> {
+        if n > self.left() {
+            return Err(invalid("backward decoding runs past the partition start"));
+        }
+        self.pos -= n;
+        Ok(())
+    }
+
+    /// The `n` bits (0..=32) just before the position, in forward order.
+    pub fn read_back(&mut self, n: u32) -> Result<u32> {
+        self.skip_back(n as usize)?;
+        let mut v = 0;
+        for k in 0..n as usize {
+            v = v << 1 | self.bit(self.pos + k);
+        }
+        Ok(v)
+    }
+}
+
 /// Writes bits MSB first into a growing byte vector.
 #[derive(Default, Clone)]
 pub(crate) struct BitWriter {
@@ -196,6 +271,20 @@ impl BitWriter {
         self.out.extend_from_slice(b);
     }
 
+    /// Appends everything `o` holds, bit for bit.
+    pub fn append(&mut self, o: &BitWriter) {
+        if self.is_aligned() {
+            self.out.extend_from_slice(&o.out);
+        } else {
+            for &b in &o.out {
+                self.put(8, b as u32);
+            }
+        }
+        if o.nbits > 0 {
+            self.put(o.nbits, o.acc as u32);
+        }
+    }
+
     pub fn into_bytes(mut self) -> Vec<u8> {
         self.align_zero();
         self.out
@@ -239,5 +328,28 @@ mod tests {
         w.put(8, 0xaa);
         w.stuff();
         assert_eq!(w.into_bytes(), [0xaa, 0x7f]);
+    }
+
+    #[test]
+    fn append_and_read_backwards() {
+        let mut a = BitWriter::new();
+        a.put(3, 0b101);
+        let mut b = BitWriter::new();
+        b.put(13, 0x1abc);
+        a.append(&b);
+        a.append(&BitWriter::new());
+        a.put(4, 0b0110);
+        assert_eq!(a.len_bits(), 20);
+        let bytes = a.into_bytes();
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(r.read(3).unwrap(), 0b101);
+        assert_eq!(r.read(13).unwrap(), 0x1abc);
+        assert_eq!(r.read(4).unwrap(), 0b0110);
+        let mut br = BackReader::new(&bytes, 20, 3);
+        assert_eq!(br.peek_rev(4), 0b0110);
+        assert_eq!(br.read_back(4).unwrap(), 0b0110);
+        assert_eq!(br.read_back(13).unwrap(), 0x1abc);
+        assert_eq!(br.left(), 0);
+        assert!(br.read_back(1).is_err());
     }
 }

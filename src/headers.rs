@@ -247,9 +247,6 @@ impl VolHeader {
         if self.sprite == SpriteMode::Gmc && self.sprite_brightness_change {
             return Err(unsupported("sprite brightness change"));
         }
-        if self.reversible_vlc {
-            return Err(unsupported("reversible VLCs"));
-        }
         if self.newpred {
             return Err(unsupported("NEWPRED"));
         }
@@ -729,6 +726,8 @@ pub(crate) struct VolParams {
     pub time_resolution: u32,
     pub fixed_increment: Option<u32>,
     pub resync_markers: bool,
+    pub data_partitioned: bool,
+    pub reversible_vlc: bool,
 }
 
 /// Visual object sequence, visual object and video object layer headers:
@@ -777,7 +776,10 @@ pub(crate) fn write_config(p: &VolParams) -> Vec<u8> {
     w.put(1, 0); // quant_type: H.263
     w.put(1, 1); // complexity_estimation_disable
     w.put(1, !p.resync_markers as u32); // resync_marker_disable
-    w.put(1, 0); // data_partitioned
+    w.put(1, p.data_partitioned as u32);
+    if p.data_partitioned {
+        w.put(1, p.reversible_vlc as u32);
+    }
     w.put(1, 0); // scalability
     w.stuff();
     w.into_bytes()
@@ -845,6 +847,8 @@ mod tests {
             time_resolution: 30000,
             fixed_increment: Some(1001),
             resync_markers: true,
+            data_partitioned: false,
+            reversible_vlc: false,
         };
         let b = write_config(&p);
         assert_eq!(&b[..5], &[0, 0, 1, 0xb0, 3]);
