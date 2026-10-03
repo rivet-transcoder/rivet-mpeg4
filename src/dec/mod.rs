@@ -167,7 +167,10 @@ impl Decoder {
     /// the stream, or a short video header).
     pub fn new() -> Decoder {
         Decoder {
-            vo: VisualObject { verid: 1 },
+            vo: VisualObject {
+                verid: 1,
+                video_signal: None,
+            },
             profile_and_level: None,
             vol: None,
             quant: Quant::h263(),
@@ -732,6 +735,7 @@ impl VolHeader {
             reduced_resolution: false,
             scalability: false,
             time_increment_bits: 15,
+            video_signal: None,
             complexity: None,
         }
     }

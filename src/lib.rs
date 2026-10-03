@@ -59,4 +59,4 @@ pub use dec::{Decoder, DecoderStats};
 pub use enc::{Encoder, EncoderConfig, RateControl};
 pub use error::{Error, Result};
 pub use frame::{Frame, Plane, VopType};
-pub use headers::{SpriteMode, VolHeader};
+pub use headers::{ColourDescription, SpriteMode, VideoSignal, VolHeader};

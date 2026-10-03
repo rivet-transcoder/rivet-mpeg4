@@ -289,3 +289,58 @@ fn data_partitioning() {
         );
     }
 }
+
+#[test]
+fn forced_keyframes() {
+    for b in [0u32, 2] {
+        let mut cfg = EncoderConfig::new(96, 64, 25);
+        cfg.gop_size = 0;
+        cfg.b_frames = b;
+        cfg.keep_reconstructions = true;
+        let mut enc = Encoder::new(cfg).unwrap();
+        let mut dec = Decoder::new();
+        let mut frames = Vec::new();
+        let mut recon = Vec::new();
+        for t in 0..12 {
+            if t == 5 || t == 9 {
+                enc.force_keyframe();
+            }
+            let au = enc.encode(&synth(96, 64, t)).unwrap();
+            frames.extend(dec.decode(&au).unwrap());
+            recon.extend(enc.take_reconstructions());
+        }
+        frames.extend(dec.decode(&enc.finish().unwrap()).unwrap());
+        recon.extend(enc.take_reconstructions());
+        frames.extend(dec.flush());
+        recon.sort_by_key(|f| f.timestamp);
+        assert_eq!(frames.len(), 12);
+        let intra: Vec<i64> = frames
+            .iter()
+            .filter(|f| f.vop_type == VopType::I)
+            .map(|f| f.timestamp)
+            .collect();
+        assert_eq!(intra, [0, 5, 9], "{b} B-VOPs");
+        for (d, e) in frames.iter().zip(&recon) {
+            assert_eq!(d.data, e.data);
+        }
+    }
+}
+
+#[test]
+fn video_signal_type_is_signalled() {
+    use mpeg4::{ColourDescription, VideoSignal};
+    let mut cfg = EncoderConfig::new(64, 48, 25);
+    let vs = VideoSignal {
+        video_format: 5,
+        full_range: true,
+        colour: Some(ColourDescription::BT709),
+    };
+    cfg.video_signal = Some(vs);
+    let enc = Encoder::new(cfg.clone()).unwrap();
+    let dec = Decoder::with_config(enc.config()).unwrap();
+    assert_eq!(dec.vol().unwrap().video_signal, Some(vs));
+    cfg.video_signal = None;
+    let enc = Encoder::new(cfg).unwrap();
+    let dec = Decoder::with_config(enc.config()).unwrap();
+    assert_eq!(dec.vol().unwrap().video_signal, None);
+}

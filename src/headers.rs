@@ -156,6 +156,59 @@ impl Complexity {
     }
 }
 
+/// `video_signal_type()` of the visual object header (6.2.2, 6.3.2): how
+/// the pictures were represented before coding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoSignal {
+    /// `video_format` (Table 6-6): 0 component, 1 PAL, 2 NTSC, 3 SECAM,
+    /// 4 MAC, 5 unspecified.
+    pub video_format: u8,
+    /// `video_range`: true when luminance and chrominance use the full
+    /// 0..=255 range, false for 16..=235 (Y) and 16..=240 (Cb, Cr).
+    pub full_range: bool,
+    /// `colour_description`, when present.
+    pub colour: Option<ColourDescription>,
+}
+
+impl Default for VideoSignal {
+    /// Unspecified format, video range, no colour description.
+    fn default() -> Self {
+        VideoSignal {
+            video_format: 5,
+            full_range: false,
+            colour: None,
+        }
+    }
+}
+
+/// `colour_primaries`, `transfer_characteristics` and
+/// `matrix_coefficients` (Tables 6-7 to 6-9; the values are those of
+/// ITU-T H.273, e.g. 1 for BT.709 throughout, 6 for SMPTE 170M).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColourDescription {
+    /// `colour_primaries` (Table 6-7).
+    pub colour_primaries: u8,
+    /// `transfer_characteristics` (Table 6-8).
+    pub transfer_characteristics: u8,
+    /// `matrix_coefficients` (Table 6-9).
+    pub matrix_coefficients: u8,
+}
+
+impl ColourDescription {
+    /// BT.709 primaries, transfer and matrix (1, 1, 1).
+    pub const BT709: ColourDescription = ColourDescription {
+        colour_primaries: 1,
+        transfer_characteristics: 1,
+        matrix_coefficients: 1,
+    };
+    /// SMPTE 170M (BT.601 525-line) primaries, transfer and matrix (6, 6, 6).
+    pub const SMPTE170M: ColourDescription = ColourDescription {
+        colour_primaries: 6,
+        transfer_characteristics: 6,
+        matrix_coefficients: 6,
+    };
+}
+
 /// What a video object layer header says about the stream: the decoder
 /// configuration ("decoder specific info" in an MP4 `esds`, or in-band).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,6 +267,8 @@ pub struct VolHeader {
     pub scalability: bool,
     /// Bits of `vop_time_increment`.
     pub time_increment_bits: u32,
+    /// The visual object header's `video_signal_type()`, when it had one.
+    pub video_signal: Option<VideoSignal>,
     pub(crate) complexity: Option<Complexity>,
 }
 
@@ -294,6 +349,7 @@ fn read_matrix(r: &mut BitReader) -> Result<[u8; 64]> {
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct VisualObject {
     pub verid: u8,
+    pub video_signal: Option<VideoSignal>,
 }
 
 /// `VisualObject()` after its start code.
@@ -309,15 +365,30 @@ pub(crate) fn parse_visual_object(r: &mut BitReader) -> Result<VisualObject> {
             "visual object type {ty} (only video, 1)"
         )));
     }
-    if r.read_bit()? {
-        // video_signal_type
-        r.read(3)?; // video_format
-        r.read(1)?; // video_range
-        if r.read_bit()? {
-            r.read(24)?; // colour_primaries, transfer_characteristics, matrix_coefficients
-        }
-    }
-    Ok(VisualObject { verid })
+    let video_signal = if r.read_bit()? {
+        let video_format = r.read(3)? as u8;
+        let full_range = r.read_bit()?;
+        let colour = if r.read_bit()? {
+            Some(ColourDescription {
+                colour_primaries: r.read(8)? as u8,
+                transfer_characteristics: r.read(8)? as u8,
+                matrix_coefficients: r.read(8)? as u8,
+            })
+        } else {
+            None
+        };
+        Some(VideoSignal {
+            video_format,
+            full_range,
+            colour,
+        })
+    } else {
+        None
+    };
+    Ok(VisualObject {
+        verid,
+        video_signal,
+    })
 }
 
 /// `VideoObjectLayer()` after its start code.
@@ -524,6 +595,7 @@ pub(crate) fn parse_vol(r: &mut BitReader, vo: VisualObject, pl: Option<u8>) -> 
         reduced_resolution,
         scalability,
         time_increment_bits: bits,
+        video_signal: vo.video_signal,
         complexity,
     })
 }
@@ -728,6 +800,7 @@ pub(crate) struct VolParams {
     pub resync_markers: bool,
     pub data_partitioned: bool,
     pub reversible_vlc: bool,
+    pub video_signal: Option<VideoSignal>,
 }
 
 /// Visual object sequence, visual object and video object layer headers:
@@ -739,7 +812,23 @@ pub(crate) fn write_config(p: &VolParams) -> Vec<u8> {
     put_start_code(&mut w, sc::VISUAL_OBJECT);
     w.put(1, 0); // is_visual_object_identifier
     w.put(4, 1); // visual_object_type: video
-    w.put(1, 0); // video_signal_type
+    match p.video_signal {
+        None => w.put(1, 0),
+        Some(v) => {
+            w.put(1, 1);
+            w.put(3, v.video_format as u32);
+            w.put(1, v.full_range as u32);
+            match v.colour {
+                None => w.put(1, 0),
+                Some(c) => {
+                    w.put(1, 1);
+                    w.put(8, c.colour_primaries as u32);
+                    w.put(8, c.transfer_characteristics as u32);
+                    w.put(8, c.matrix_coefficients as u32);
+                }
+            }
+        }
+    }
     w.stuff();
     put_start_code(&mut w, sc::VO_FIRST);
     put_start_code(&mut w, sc::VOL_FIRST);
@@ -849,6 +938,11 @@ mod tests {
             resync_markers: true,
             data_partitioned: false,
             reversible_vlc: false,
+            video_signal: Some(VideoSignal {
+                video_format: 2,
+                full_range: false,
+                colour: Some(ColourDescription::SMPTE170M),
+            }),
         };
         let b = write_config(&p);
         assert_eq!(&b[..5], &[0, 0, 1, 0xb0, 3]);
@@ -871,6 +965,7 @@ mod tests {
         assert!(!vol.resync_marker_disable);
         assert!(!vol.mpeg_quant);
         assert_eq!(vol.object_type, 1);
+        assert_eq!(vol.video_signal, p.video_signal);
         vol.check_supported().unwrap();
     }
 

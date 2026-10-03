@@ -16,7 +16,7 @@ use crate::bits::BitWriter;
 use crate::dec::vop::{MbPix, Motion, add_block, direct_vectors, predict_mb, put_block, write_mb};
 use crate::error::{Result, config};
 use crate::frame::{Frame, VopType};
-use crate::headers::{self, VolParams, VopHeader, time_increment_bits};
+use crate::headers::{self, VideoSignal, VolParams, VopHeader, time_increment_bits};
 use crate::idct::{fdct, idct};
 use crate::mbstate::{Dir, IntraPred, MbKind, MbState, ac_pred_value, round_div};
 use crate::mc;
@@ -76,6 +76,10 @@ pub struct EncoderConfig {
     /// VOPs, which a decoder can read backwards from the next resync
     /// marker after damage. Requires `data_partitioning`.
     pub reversible_vlc: bool,
+    /// `video_signal_type()` for the visual object header: the video
+    /// format, range and colour description a decoder (or a player) is
+    /// told the pictures use; `None` writes none (unspecified).
+    pub video_signal: Option<VideoSignal>,
     /// Keep the reconstruction of every coded VOP for
     /// [`Encoder::take_reconstructions`] (for measuring quality; costs a
     /// copy of every frame).
@@ -100,6 +104,7 @@ impl EncoderConfig {
             packet_bytes: None,
             data_partitioning: false,
             reversible_vlc: false,
+            video_signal: None,
             keep_reconstructions: false,
         }
     }
@@ -186,6 +191,8 @@ pub struct Encoder {
     quant: Quant,
     rc: Option<Rc>,
     recons: Vec<Frame>,
+    /// The next frame is to be an I-VOP.
+    force_intra: bool,
 }
 
 impl Encoder {
@@ -215,6 +222,11 @@ impl Encoder {
                 "{} consecutive B-VOPs (0..=8)",
                 cfg.b_frames
             )));
+        }
+        if let Some(v) = cfg.video_signal
+            && v.video_format > 7
+        {
+            return Err(config(format!("video_format {} (0..=7)", v.video_format)));
         }
         if cfg.reversible_vlc && !cfg.data_partitioning {
             return Err(config("reversible VLCs without data partitioning"));
@@ -253,6 +265,7 @@ impl Encoder {
             resync_markers: cfg.packet_bytes.is_some(),
             data_partitioned: cfg.data_partitioning,
             reversible_vlc: cfg.reversible_vlc,
+            video_signal: cfg.video_signal,
         });
         let rc = match cfg.rate {
             RateControl::Bitrate(bps) => {
@@ -286,6 +299,7 @@ impl Encoder {
             quant: Quant::h263(),
             rc,
             recons: Vec::new(),
+            force_intra: false,
             cfg,
         })
     }
@@ -310,7 +324,9 @@ impl Encoder {
         let index = self.n;
         self.n += 1;
         let gop = self.cfg.gop_size as u64;
-        let intra = self.future.is_none() || (gop > 0 && index.is_multiple_of(gop));
+        let intra =
+            self.force_intra || self.future.is_none() || (gop > 0 && index.is_multiple_of(gop));
+        self.force_intra = false;
         let due = self
             .last_ref_index
             .is_none_or(|l| index - l > self.cfg.b_frames as u64);
@@ -323,6 +339,14 @@ impl Encoder {
             self.pending.push_back((index, pic));
         }
         Ok(w.into_bytes())
+    }
+
+    /// Makes the next frame given to [`Encoder::encode`] an I-VOP (a
+    /// random access point), coded at once: B-VOPs still waiting are coded
+    /// after it, predicted from it. The I-VOP period
+    /// ([`EncoderConfig::gop_size`]) carries on counting frames as before.
+    pub fn force_keyframe(&mut self) {
+        self.force_intra = true;
     }
 
     /// Codes the frames still waiting: the last as a P-VOP, the others as
