@@ -533,3 +533,33 @@ fn interlaced_compresses_interlaced_content() {
         "field tools should pay on interlaced content"
     );
 }
+
+#[test]
+fn overlapped_block_motion_compensation() {
+    for (four, qpel, packets) in [
+        (false, false, None),
+        (true, false, Some(300)),
+        (true, true, None),
+    ] {
+        let mut cfg = EncoderConfig::new(176, 144, 25);
+        cfg.obmc = true;
+        cfg.four_mv = four;
+        cfg.quarter_sample = qpel;
+        cfg.packet_bytes = packets;
+        let r = run(cfg, 14);
+        check(
+            &r,
+            33.0,
+            &format!("OBMC, 4MV {four}, quarter-sample {qpel}, packets {packets:?}"),
+        );
+    }
+    // H.263 Advanced Prediction through the short header path.
+    for four in [false, true] {
+        let mut cfg = EncoderConfig::new(176, 144, 30);
+        cfg.short_header = true;
+        cfg.obmc = true;
+        cfg.four_mv = four;
+        let r = run(cfg, 14);
+        check(&r, 32.0, &format!("H.263 Advanced Prediction, 4MV {four}"));
+    }
+}

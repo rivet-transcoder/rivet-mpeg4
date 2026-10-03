@@ -426,6 +426,24 @@ pub(crate) struct VopDec<'a> {
     pub rvlc_discarded_mbs: u64,
     /// B-VOP macroblocks predicted in field direct mode.
     pub field_direct_mbs: u64,
+    /// Overlapped block motion compensation in this P- or S-VOP
+    /// (`obmc_disable` 0, or H.263's Advanced Prediction mode).
+    pub obmc: bool,
+    /// OBMC: the inter macroblocks whose prediction waits for their right
+    /// neighbour's vectors, with their residual.
+    pub obmc_pending: Vec<Option<Box<ObmcMb>>>,
+    /// S-VOPs: which macroblocks GMC predicts (OBMC does not cross the
+    /// boundary between those and the others).
+    pub mcsel: Vec<bool>,
+}
+
+/// An inter macroblock waiting for its overlapped prediction.
+pub(crate) struct ObmcMb {
+    /// The residual of each block, after the IDCT (zero where not coded).
+    res: [[i16; 64]; 6],
+    cbp: u8,
+    field_dct: bool,
+    four: bool,
 }
 
 impl VopDec<'_> {
@@ -455,6 +473,9 @@ impl VopDec<'_> {
             self.st.slice[mb] = 0;
             self.st.kind[mb] = MbKind::Skipped;
             self.st.set_mb_mv(mbx, mby, [0, 0]);
+            if let Some(p) = self.obmc_pending.get_mut(mb) {
+                *p = None;
+            }
             if let Some(src) = src {
                 predict_mb(src, mbx, mby, &[[0, 0]; 4], false, false, false, &mut px);
                 write_mb(self.cur, mbx, mby, &px);
@@ -564,7 +585,16 @@ impl VopDec<'_> {
     /// found are copied from the reference, and the error is kept in
     /// `self.error`.
     pub fn run(&mut self, r: &mut BitReader) {
+        if self.obmc {
+            self.obmc_pending.clear();
+            self.obmc_pending.resize_with(self.total(), || None);
+            self.mcsel.clear();
+            self.mcsel.resize(self.total(), false);
+        }
         self.run_inner(r);
+        if self.obmc {
+            self.obmc_finish();
+        }
         if self.error.is_none() {
             self.tail_ok = tail_ok(r, self.sh);
         }
@@ -683,6 +713,9 @@ impl VopDec<'_> {
             // not_coded
             if let Some(g) = self.gmc {
                 // In an S-VOP, a GMC macroblock without texture.
+                if let Some(m) = self.mcsel.get_mut(mb) {
+                    *m = true;
+                }
                 let v = self.gmc_vector(g, mbx, mby);
                 self.st.kind[mb] = MbKind::Inter;
                 self.st.field[mb] = false;
@@ -712,10 +745,15 @@ impl VopDec<'_> {
             return Ok(None);
         }
         let intra = mb_type >= 3;
-        if self.sh && mb_type == 2 {
-            return Err(invalid("INTER4V in a short-header picture"));
+        if self.sh && mb_type == 2 && !self.obmc {
+            return Err(invalid(
+                "INTER4V in a short-header picture without Advanced Prediction",
+            ));
         }
         let mcsel = self.gmc.is_some() && mb_type < 2 && r.read_bit()?;
+        if let Some(m) = self.mcsel.get_mut(mb) {
+            *m = mcsel;
+        }
         let mut h = MbHdr {
             kind: if intra { MbKind::Intra } else { MbKind::Inter },
             mb_type,
@@ -1079,6 +1117,15 @@ impl VopDec<'_> {
                 let src = self
                     .fwd
                     .ok_or_else(|| invalid("a P-VOP without a reference"))?;
+                if self.obmc {
+                    self.obmc_pending[mby * self.st.mbw + mbx] = Some(Box::new(ObmcMb {
+                        res: [[0; 64]; 6],
+                        cbp: 0,
+                        field_dct: false,
+                        four: false,
+                    }));
+                    return Ok(());
+                }
                 let mut px = MbPix::new();
                 predict_mb(src, mbx, mby, &[[0, 0]; 4], false, false, false, &mut px);
                 write_mb(self.cur, mbx, mby, &px);
@@ -1094,6 +1141,17 @@ impl VopDec<'_> {
                 let src = self
                     .fwd
                     .ok_or_else(|| invalid("a P-VOP without a reference"))?;
+                if self.obmc && !h.gmc && !h.field_pred {
+                    // The prediction waits for the right neighbour's vectors.
+                    let res = self.residual_blocks(r, h.cbp, h.qp, pre)?;
+                    self.obmc_pending[mby * self.st.mbw + mbx] = Some(Box::new(ObmcMb {
+                        res,
+                        cbp: h.cbp,
+                        field_dct: h.field_dct,
+                        four: h.four,
+                    }));
+                    return Ok(());
+                }
                 let mut px = MbPix::new();
                 match self.gmc.filter(|_| h.gmc) {
                     Some(g) => g.predict_mb(src, mbx, mby, self.hdr.rounding, &mut px),
@@ -1136,26 +1194,94 @@ impl VopDec<'_> {
         field_dct: bool,
         pre: Option<&Coefs>,
     ) -> Result<()> {
+        let res = self.residual_blocks(r, cbp, qp, pre)?;
+        for (k, blk) in res.iter().enumerate() {
+            if cbp >> (5 - k) & 1 != 0 {
+                add_block(self.cur, mbx, mby, k, blk, field_dct);
+            }
+        }
+        Ok(())
+    }
+
+    /// The coded inter blocks of a macroblock, read (or taken from `pre`),
+    /// dequantised and transformed; zero where not coded.
+    fn residual_blocks(
+        &mut self,
+        r: &mut BitReader,
+        cbp: u8,
+        qp: u32,
+        pre: Option<&Coefs>,
+    ) -> Result<[[i16; 64]; 6]> {
         // alternate_vertical_scan_flag puts every block on that scan.
         let scan = if self.hdr.alternate_vertical_scan {
             &ALT_VERTICAL
         } else {
             &ZIGZAG
         };
-        for k in 0..6 {
+        let mut out = [[0i16; 64]; 6];
+        for (k, blk) in out.iter_mut().enumerate() {
             if cbp >> (5 - k) & 1 == 0 {
                 continue;
             }
-            let mut blk = [0i16; 64];
             match pre {
-                Some(p) => unscan(&p[k], scan, &mut blk),
-                None => read_coeffs(r, &mut blk, scan, 0, false, self.sh)?,
+                Some(p) => unscan(&p[k], scan, blk),
+                None => read_coeffs(r, blk, scan, 0, false, self.sh)?,
             }
-            self.quant.inter(&mut blk, qp);
-            idct(&mut blk);
-            add_block(self.cur, mbx, mby, k, &blk, field_dct);
+            self.quant.inter(blk, qp);
+            idct(blk);
         }
-        Ok(())
+        Ok(out)
+    }
+
+    /// Overlapped prediction of every macroblock left waiting, now that
+    /// all the VOP's vectors are known, and its residual added.
+    fn obmc_finish(&mut self) {
+        let Some(src) = self.fwd else {
+            return;
+        };
+        let mbw = self.st.mbw;
+        let pending = std::mem::take(&mut self.obmc_pending);
+        for (mb, p) in pending.iter().enumerate() {
+            let Some(p) = p else {
+                continue;
+            };
+            let (mbx, mby) = (mb % mbw, mb / mbw);
+            let own: [[i32; 2]; 4] = std::array::from_fn(|k| self.st.get_mv(mbx, mby, k));
+            let cur_gmc = self.mcsel.get(mb).copied().unwrap_or(false);
+            let mcsel = &self.mcsel;
+            let remote = crate::obmc::remote_vectors(self.st, mbx, mby, &own, |i| {
+                mcsel.get(i).copied().unwrap_or(false) != cur_gmc
+            });
+            let mut px = MbPix::new();
+            // Chrominance as without OBMC.
+            predict_mb(
+                src,
+                mbx,
+                mby,
+                &own,
+                p.four,
+                self.hdr.rounding,
+                self.vol.quarter_sample,
+                &mut px,
+            );
+            crate::obmc::predict_luma(
+                src,
+                mbx,
+                mby,
+                &own,
+                &remote,
+                self.hdr.rounding,
+                self.vol.quarter_sample,
+                &mut px.y,
+            );
+            write_mb(self.cur, mbx, mby, &px);
+            for (k, blk) in p.res.iter().enumerate() {
+                if p.cbp >> (5 - k) & 1 != 0 {
+                    add_block(self.cur, mbx, mby, k, blk, p.field_dct);
+                }
+            }
+        }
+        self.obmc_pending = pending;
     }
 
     /// One intra block: DC, AC, prediction, dequantisation, IDCT.

@@ -50,6 +50,7 @@ mod headers;
 pub(crate) mod idct;
 pub(crate) mod mbstate;
 pub(crate) mod mc;
+pub(crate) mod obmc;
 pub(crate) mod picture;
 pub(crate) mod quant;
 pub(crate) mod tables;

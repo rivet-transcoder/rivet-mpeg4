@@ -440,7 +440,7 @@ impl Decoder {
         if !h.coded {
             return self.not_coded(&h, time, index);
         }
-        self.decode_vop(&vol, &h, &mut r, time, index, false)
+        self.decode_vop(&vol, &h, &mut r, time, index, false, !vol.obmc_disable)
     }
 
     /// The VOP header, with the VOL's `vop_time_increment` length or, when
@@ -503,6 +503,7 @@ impl Decoder {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn decode_vop(
         &mut self,
         vol: &VolHeader,
@@ -511,6 +512,7 @@ impl Decoder {
         time: i64,
         index: u64,
         sh: bool,
+        obmc: bool,
     ) -> Result<()> {
         let is_b = h.vop_type == VopType::B;
         if h.vop_type != VopType::I && self.future.is_none() {
@@ -575,6 +577,9 @@ impl Decoder {
             rvlc_backward_mbs: 0,
             rvlc_discarded_mbs: 0,
             field_direct_mbs: 0,
+            obmc: obmc && matches!(h.vop_type, VopType::P | VopType::S),
+            obmc_pending: Vec::new(),
+            mcsel: Vec::new(),
         };
         d.run(r);
         if d.error.is_some() && vol.interlaced && !self.dct_type_always {
@@ -664,11 +669,15 @@ impl Decoder {
             f => return Err(invalid(format!("source_format {f}"))),
         };
         let p = r.read_bit()?;
-        if r.read(4)? != 0 {
+        // PTYPE bits 10-13: Unrestricted Motion Vector, Syntax-based
+        // Arithmetic Coding, Advanced Prediction, PB-frames.
+        let modes = r.read(4)?;
+        if modes & 0b1101 != 0 {
             return Err(unsupported(
-                "H.263 optional modes (UMV, SAC, AP or PB-frames)",
+                "H.263 optional modes (Unrestricted Motion Vector, Syntax-based Arithmetic Coding or PB-frames)",
             ));
         }
+        let advanced_prediction = modes & 0b0010 != 0;
         let quant = r.read(5)?;
         if quant == 0 {
             return Err(invalid("vop_quant is zero"));
@@ -711,7 +720,15 @@ impl Decoder {
         };
         let index = self.decode_index;
         self.decode_index += 1;
-        self.decode_vop(&vol, &hdr, &mut r, t * 1001, index, true)
+        self.decode_vop(
+            &vol,
+            &hdr,
+            &mut r,
+            t * 1001,
+            index,
+            true,
+            advanced_prediction,
+        )
     }
 }
 

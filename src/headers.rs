@@ -288,9 +288,6 @@ impl VolHeader {
         if self.interlaced && self.data_partitioned {
             return Err(unsupported("interlaced coding with data partitioning"));
         }
-        if !self.obmc_disable {
-            return Err(unsupported("overlapped block motion compensation"));
-        }
         if self.sprite == SpriteMode::Static {
             return Err(unsupported("static sprites"));
         }
@@ -798,6 +795,7 @@ pub(crate) struct VolParams {
     pub video_signal: Option<VideoSignal>,
     pub quarter_sample: bool,
     pub interlaced: bool,
+    pub obmc: bool,
     /// The MPEG quantiser and its intra and non-intra matrices (raster).
     pub mpeg_quant: Option<([u8; 64], [u8; 64])>,
 }
@@ -882,7 +880,7 @@ pub(crate) fn write_config(p: &VolParams) -> Vec<u8> {
     w.put(13, p.height);
     w.put(1, 1);
     w.put(1, p.interlaced as u32);
-    w.put(1, 1); // obmc_disable
+    w.put(1, !p.obmc as u32); // obmc_disable
     w.put(if verid2 { 2 } else { 1 }, 0); // sprite_enable
     w.put(1, 0); // not_8_bit
     match &p.mpeg_quant {
@@ -936,7 +934,14 @@ pub(crate) fn short_header_format(width: u32, height: u32) -> Option<u32> {
 /// `short_video_start_marker` and the rest of the H.263 picture header
 /// (6.2.7.1; H.263 5.1): TR, PTYPE with no optional modes, PQUANT, no CPM,
 /// no PEI.
-pub(crate) fn write_short_header(w: &mut BitWriter, tr: u32, format: u32, p: bool, quant: u32) {
+pub(crate) fn write_short_header(
+    w: &mut BitWriter,
+    tr: u32,
+    format: u32,
+    p: bool,
+    quant: u32,
+    advanced_prediction: bool,
+) {
     w.put(22, 0x20);
     w.put(8, tr & 0xff);
     w.put(1, 1); // marker
@@ -944,7 +949,8 @@ pub(crate) fn write_short_header(w: &mut BitWriter, tr: u32, format: u32, p: boo
     w.put(3, 0); // split screen, document camera, full picture freeze release
     w.put(3, format);
     w.put(1, p as u32);
-    w.put(4, 0); // four_reserved_zero_bits: no UMV, SAC, AP, PB
+    // four_reserved_zero_bits — in H.263, the UMV, SAC, AP and PB flags.
+    w.put(4, if advanced_prediction { 0b0010 } else { 0 });
     w.put(5, quant);
     w.put(1, 0); // zero_bit (CPM)
     w.put(1, 0); // pei
@@ -1030,6 +1036,7 @@ mod tests {
             }),
             quarter_sample: false,
             interlaced: false,
+            obmc: false,
             mpeg_quant: None,
         };
         let b = write_config(&p);
@@ -1115,6 +1122,7 @@ mod tests {
                 video_signal: None,
                 quarter_sample: q,
                 interlaced: false,
+                obmc: false,
                 mpeg_quant: Some(matrices),
             };
             let b = write_config(&p);

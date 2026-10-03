@@ -101,6 +101,13 @@ pub struct EncoderConfig {
     /// Incompatible with B-VOPs, quarter-sample motion, four vectors, the
     /// MPEG quantiser and data partitioning.
     pub short_header: bool,
+    /// Overlapped block motion compensation for P-VOPs: in an MPEG-4
+    /// stream, `obmc_disable` 0 (7.6.6 — a tool no profile of 14496-2
+    /// Annex N includes, so such streams claim a profile they exceed); with
+    /// the short video header, H.263's Advanced Prediction mode (Annex F,
+    /// which also allows four vectors), making the stream H.263 rather
+    /// than 14496-2's short-header subset.
+    pub obmc: bool,
     /// Interlaced coding (an Advanced Simple tool): each macroblock picks
     /// frame or field DCT, P-VOP macroblocks frame or field prediction (a
     /// vector per field, from either reference field), and B-VOP direct
@@ -155,6 +162,7 @@ impl EncoderConfig {
             search_range: 15,
             four_mv: false,
             short_header: false,
+            obmc: false,
             interlaced: false,
             top_field_first: true,
             quarter_sample: false,
@@ -202,6 +210,19 @@ struct Ref {
     motion: Motion,
     /// Display time in ticks.
     time: i64,
+}
+
+/// What motion estimation decided for a P-VOP macroblock.
+#[derive(Clone, Copy)]
+struct Plan {
+    intra: bool,
+    /// The one vector (and the search's starting point for the others).
+    mv: [i32; 2],
+    /// Four vectors, or `mv` four times.
+    mvs: [[i32; 2]; 4],
+    four: bool,
+    /// Interlaced field prediction: the field vectors and reference fields.
+    field: Option<([[i32; 2]; 2], [bool; 2])>,
 }
 
 /// B-VOP macroblock modes.
@@ -305,7 +326,7 @@ impl Encoder {
             }
             if cfg.b_frames > 0
                 || cfg.quarter_sample
-                || cfg.four_mv
+                || (cfg.four_mv && !cfg.obmc)
                 || cfg.data_partitioning
                 || cfg.quantiser != Quantiser::H263
             {
@@ -377,6 +398,7 @@ impl Encoder {
                 video_signal: cfg.video_signal,
                 quarter_sample: cfg.quarter_sample,
                 interlaced: cfg.interlaced,
+                obmc: cfg.obmc,
                 mpeg_quant: mpeg.then_some((intra_matrix, inter_matrix)),
             })
         };
@@ -545,7 +567,7 @@ impl Encoder {
             let d = res as i128 * 1001;
             let tr = ((t as i128 * 30000 * 2 + d) / (2 * d)) as u32;
             let format = headers::short_header_format(self.cfg.width, self.cfg.height).unwrap();
-            headers::write_short_header(w, tr, format, !intra, qp);
+            headers::write_short_header(w, tr, format, !intra, qp, self.cfg.obmc);
         } else {
             headers::write_vop_header(w, self.time_bits, &hdr, self.cfg.interlaced);
         }
@@ -660,6 +682,32 @@ impl Encoder {
             289..=576 => 2,
             _ => 4,
         };
+        // With OBMC a macroblock's prediction needs its right neighbour's
+        // vectors: plan every macroblock's motion first.
+        let mut plans = Vec::new();
+        if self.cfg.obmc
+            && h.vop_type == VopType::P
+            && let Some(rf) = &reference
+        {
+            for mb in 0..mbw * mbh {
+                let (mbx, mby) = (mb % mbw, mb / mbw);
+                self.st.slice[mb] = self.slice;
+                let p = self.plan_p_mb(src, &rf.pic, mbx, mby, h);
+                self.st.kind[mb] = if p.intra {
+                    MbKind::Intra
+                } else {
+                    MbKind::Inter
+                };
+                if let Some((fmv, _)) = p.field {
+                    self.st.set_mb_mv(mbx, mby, field_to_frame(fmv[0], fmv[1]));
+                } else {
+                    for k in 0..4 {
+                        self.st.set_mv(mbx, mby, k, p.mvs[k]);
+                    }
+                }
+                plans.push(p);
+            }
+        }
         for mb in 0..mbw * mbh {
             if sh {
                 if mb > 0 && mb % (mbw * gob_rows) == 0 && self.packet_due(mb, packet_bits) {
@@ -683,6 +731,9 @@ impl Encoder {
             self.st.slice[mb] = self.slice;
             self.st.qp[mb] = h.quant as u8;
             let syn = match (&reference, h.vop_type) {
+                (Some(rf), VopType::P) if !plans.is_empty() => {
+                    self.finish_p_mb(plans[mb], src, &rf.pic, recon, mbx, mby, h)
+                }
                 (Some(rf), VopType::P) => self.code_p_mb(src, &rf.pic, recon, mbx, mby, h),
                 _ if sh => self.code_intra_mb_short(src, recon, mbx, mby, h.quant, !i_vop),
                 _ => self.code_intra_mb(src, recon, mbx, mby, h.quant, !i_vop),
@@ -1117,7 +1168,7 @@ impl Encoder {
     }
 
     /// A P-VOP macroblock: motion search, then intra, skipped, one- or
-    /// four-vector inter coding.
+    /// four-vector (or field) inter coding.
     #[allow(clippy::too_many_arguments)]
     fn code_p_mb(
         &mut self,
@@ -1128,8 +1179,14 @@ impl Encoder {
         mby: usize,
         h: &VopHeader,
     ) -> MbSyntax {
+        let plan = self.plan_p_mb(src, rf, mbx, mby, h);
+        self.finish_p_mb(plan, src, rf, recon, mbx, mby, h)
+    }
+
+    /// Motion estimation for a P-VOP macroblock: intra or not, and its
+    /// vector(s). Changes nothing.
+    fn plan_p_mb(&self, src: &Pic, rf: &Pic, mbx: usize, mby: usize, h: &VopHeader) -> Plan {
         let qp = h.quant;
-        let mb = mby * self.st.mbw + mbx;
         let pred0 = self.st.mv_pred(mbx, mby, 0, self.slice);
         let mbw = self.st.mbw;
         let prev = self.prev_mv[(2 * mby) * 2 * mbw + 2 * mbx];
@@ -1154,10 +1211,13 @@ impl Encoder {
             .map(|&v| (v as i32 - mean as i32).unsigned_abs())
             .sum();
         if dev + 500 < sad16 {
-            if self.cfg.short_header {
-                return self.code_intra_mb_short(src, recon, mbx, mby, qp, true);
-            }
-            return self.code_intra_mb(src, recon, mbx, mby, qp, true);
+            return Plan {
+                intra: true,
+                mv: [0, 0],
+                mvs: [[0, 0]; 4],
+                four: false,
+                field: None,
+            };
         }
         let mut mvs = [mv; 4];
         let mut four = false;
@@ -1174,8 +1234,6 @@ impl Encoder {
                 mvs = [mv; 4];
             }
         }
-        let mut px = MbPix::new();
-        let qpel = self.cfg.quarter_sample;
         // Interlaced: field prediction when its two vectors predict better
         // than the frame vector, rate included.
         let mut field: Option<([[i32; 2]; 2], [bool; 2])> = None;
@@ -1203,11 +1261,60 @@ impl Encoder {
                 field = Some((fmv, fref));
             }
         }
+        Plan {
+            intra: false,
+            mv,
+            mvs,
+            four,
+            field,
+        }
+    }
+
+    /// Codes a planned P-VOP macroblock: its prediction (overlapped when
+    /// the VOL enables OBMC, the vectors of its right neighbour then being
+    /// the plan's), residual, and whether it is skipped.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_p_mb(
+        &mut self,
+        plan: Plan,
+        src: &Pic,
+        rf: &Pic,
+        recon: &mut Pic,
+        mbx: usize,
+        mby: usize,
+        h: &VopHeader,
+    ) -> MbSyntax {
+        let qp = h.quant;
+        let mb = mby * self.st.mbw + mbx;
+        if plan.intra {
+            if self.cfg.short_header {
+                return self.code_intra_mb_short(src, recon, mbx, mby, qp, true);
+            }
+            return self.code_intra_mb(src, recon, mbx, mby, qp, true);
+        }
+        let Plan {
+            mv,
+            mvs,
+            four,
+            field,
+            ..
+        } = plan;
+        let pred0 = self.st.mv_pred(mbx, mby, 0, self.slice);
+        let mut px = MbPix::new();
+        let qpel = self.cfg.quarter_sample;
         match field {
             Some((fmv, fref)) => {
                 predict_fields(rf, mbx, mby, &fmv, fref, h.rounding, qpel, &mut px)
             }
-            None => predict_mb(rf, mbx, mby, &mvs, four, h.rounding, qpel, &mut px),
+            None => {
+                predict_mb(rf, mbx, mby, &mvs, four, h.rounding, qpel, &mut px);
+                if self.cfg.obmc {
+                    let remote = crate::obmc::remote_vectors(&self.st, mbx, mby, &mvs, |_| false);
+                    crate::obmc::predict_luma(
+                        rf, mbx, mby, &mvs, &remote, h.rounding, qpel, &mut px.y,
+                    );
+                }
+            }
         }
         let field_dct = self.cfg.interlaced && prefer_field_dct(&luma_residual(src, mbx, mby, &px));
         let mut levels = [[0i16; 64]; 6];

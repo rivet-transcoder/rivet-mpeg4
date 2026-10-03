@@ -50,6 +50,8 @@ fn stream_with(
 fn short_stream() -> Vec<Vec<u8>> {
     let mut cfg = EncoderConfig::new(128, 96, 30);
     cfg.short_header = true;
+    cfg.obmc = true;
+    cfg.four_mv = true;
     cfg.packet_bytes = Some(60);
     cfg.gop_size = 4;
     let mut enc = Encoder::new(cfg).unwrap();
@@ -145,7 +147,7 @@ proptest! {
         packets in proptest::option::of(8u32..200),
         range in 1u32..64, gop in 0u32..5,
         dp in 0u8..3, qpel in any::<bool>(), mpeg in any::<bool>(),
-        interlaced in any::<bool>(),
+        interlaced in any::<bool>(), obmc in any::<bool>(),
     ) {
         let mut cfg = EncoderConfig::new(w, h, 30);
         cfg.b_frames = b;
@@ -158,6 +160,7 @@ proptest! {
         cfg.reversible_vlc = dp > 1;
         cfg.quarter_sample = qpel;
         cfg.interlaced = interlaced && dp == 0;
+        cfg.obmc = obmc;
         if mpeg {
             cfg.quantiser = mpeg4::Quantiser::mpeg_default();
         }
