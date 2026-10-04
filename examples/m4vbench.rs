@@ -1,7 +1,7 @@
 //! End-to-end speed: encodes a clip with this crate's encoder, decodes the
 //! stream with its decoder, and reports frames per second for each — the
-//! fastest of `REPS` runs — after checking that every decoded picture
-//! equals the encoder's reconstruction.
+//! fastest of `REPS` runs — after checking (in one more, untimed, encode)
+//! that every decoded picture equals the encoder's reconstruction.
 //!
 //! `cargo run --release --example m4vbench -- Y4M WxH FRAMES PRESET [REPS] [THREADS]`
 //!
@@ -12,7 +12,7 @@
 //!   I- and P-VOPs), `asp` (two B-VOPs, quarter-sample motion, four
 //!   vectors, the MPEG quantiser), or `decode:FILE` to time decoding an
 //!   existing stream only.
-//! - `THREADS`: the encoder's and decoder's thread count (0: automatic).
+//! - `THREADS`: the encoder's thread count (0: one per core; default 1).
 //!
 //! The last column is an FNV-1a hash of every decoded picture, to compare
 //! builds for bit-exactness. `MPEG4_FORCE_SCALAR=1` selects the scalar
@@ -113,7 +113,7 @@ fn fnv(h: &mut u64, d: &[u8]) {
     }
 }
 
-fn decode(stream: &[u8], _threads: usize) -> Vec<Frame> {
+fn decode(stream: &[u8]) -> Vec<Frame> {
     let mut d = Decoder::new();
     let mut out = d.decode(stream).expect("decode");
     out.extend(d.flush());
@@ -141,7 +141,7 @@ fn main() {
     } else {
         let frames = load(&a[0], w, h, n);
         let mut cfg = EncoderConfig::new(w, h, 25);
-        cfg.keep_reconstructions = true;
+        cfg.threads = threads;
         match preset {
             "sp" => {}
             "asp" => {
@@ -152,27 +152,32 @@ fn main() {
             }
             p => panic!("unknown preset {p}"),
         }
-        let mut best = f64::MAX;
-        let mut s = Vec::new();
-        for _ in 0..reps {
+        let encode = |cfg: &EncoderConfig| {
             let mut enc = Encoder::new(cfg.clone()).expect("config");
-            s.clear();
-            let t = Instant::now();
+            let mut s = Vec::new();
             for f in &frames {
                 s.extend(enc.encode(f).expect("encode"));
             }
             s.extend(enc.finish().expect("finish"));
+            (s, enc.take_reconstructions())
+        };
+        let mut best = f64::MAX;
+        for _ in 0..reps {
+            let t = Instant::now();
+            std::hint::black_box(encode(&cfg));
             best = best.min(t.elapsed().as_secs_f64());
-            recon = enc.take_reconstructions();
         }
         enc_fps = n as f64 / best;
+        cfg.keep_reconstructions = true;
+        let (s, r) = encode(&cfg);
         stream = s;
+        recon = r;
     }
     let mut best = f64::MAX;
     let mut out = Vec::new();
     for _ in 0..reps {
         let t = Instant::now();
-        out = decode(&stream, threads);
+        out = decode(&stream);
         best = best.min(t.elapsed().as_secs_f64());
     }
     let dec_fps = out.len() as f64 / best;

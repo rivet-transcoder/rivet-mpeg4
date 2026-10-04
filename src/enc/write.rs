@@ -89,6 +89,30 @@ pub(crate) fn wrap_diff(d: i32, fcode: u32) -> i32 {
 /// Writes the coefficients of `levels` (raster order) in `scan` order from
 /// position `start` as TCOEF events. Returns false (writing nothing) when
 /// there are none.
+/// The (run, level) events of a block's levels in `scan` order from
+/// `start`, in `buf`.
+#[inline]
+fn run_levels<'a>(
+    levels: &[i16; 64],
+    scan: &[u8; 64],
+    start: usize,
+    buf: &'a mut [(u32, i32); 64],
+) -> &'a [(u32, i32)] {
+    let mut n = 0;
+    let mut run = 0;
+    for &z in &scan[start..] {
+        let v = levels[z as usize];
+        if v == 0 {
+            run += 1;
+        } else {
+            buf[n] = (run, v as i32);
+            n += 1;
+            run = 0;
+        }
+    }
+    &buf[..n]
+}
+
 pub(crate) fn put_coeffs(
     w: &mut BitWriter,
     levels: &[i16; 64],
@@ -96,17 +120,8 @@ pub(crate) fn put_coeffs(
     start: usize,
     intra_table: bool,
 ) -> bool {
-    let mut events: Vec<(u32, i32)> = Vec::with_capacity(16);
-    let mut run = 0;
-    for &z in &scan[start..] {
-        let v = levels[z as usize];
-        if v == 0 {
-            run += 1;
-        } else {
-            events.push((run, v as i32));
-            run = 0;
-        }
-    }
+    let mut buf = [(0u32, 0i32); 64];
+    let events = run_levels(levels, scan, start, &mut buf);
     if events.is_empty() {
         return false;
     }
@@ -163,17 +178,8 @@ pub(crate) fn put_coeffs_short(
     scan: &[u8; 64],
     start: usize,
 ) -> bool {
-    let mut events: Vec<(u32, i32)> = Vec::with_capacity(16);
-    let mut run = 0;
-    for &z in &scan[start..] {
-        let v = levels[z as usize];
-        if v == 0 {
-            run += 1;
-        } else {
-            events.push((run, v as i32));
-            run = 0;
-        }
-    }
+    let mut buf = [(0u32, 0i32); 64];
+    let events = run_levels(levels, scan, start, &mut buf);
     let enc = tcoef_enc(false);
     let n = events.len();
     for (i, &(run, level)) in events.iter().enumerate() {
@@ -222,17 +228,8 @@ pub(crate) fn put_coeffs_rvlc(
     start: usize,
     intra_table: bool,
 ) -> bool {
-    let mut events: Vec<(u32, i32)> = Vec::with_capacity(16);
-    let mut run = 0;
-    for &z in &scan[start..] {
-        let v = levels[z as usize];
-        if v == 0 {
-            run += 1;
-        } else {
-            events.push((run, v as i32));
-            run = 0;
-        }
-    }
+    let mut buf = [(0u32, 0i32); 64];
+    let events = run_levels(levels, scan, start, &mut buf);
     let n = events.len();
     for (i, &(run, level)) in events.iter().enumerate() {
         put_rvlc_event(w, i + 1 == n, run, level, intra_table);

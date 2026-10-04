@@ -11,6 +11,8 @@ mod syntax;
 mod write;
 
 use std::collections::VecDeque;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::bits::BitWriter;
 use crate::dec::vop::{
@@ -160,6 +162,14 @@ pub struct EncoderConfig {
     /// [`Encoder::take_reconstructions`] (for measuring quality; costs a
     /// copy of every frame).
     pub keep_reconstructions: bool,
+    /// Worker threads; 0 asks for one per core. The stream is the same
+    /// for every count: B-VOPs are coded a macroblock row per thread
+    /// (each row's vector prediction starts afresh), and a P-VOP's motion
+    /// search runs as a wavefront (each macroblock once its left, upper
+    /// and upper-right neighbours are searched) before its macroblocks
+    /// are coded in order. Video packets ([`EncoderConfig::packet_bytes`])
+    /// end where the bits fall, so with them a VOP is coded on one thread.
+    pub threads: usize,
 }
 
 impl EncoderConfig {
@@ -190,6 +200,7 @@ impl EncoderConfig {
             reversible_vlc: false,
             video_signal: None,
             keep_reconstructions: false,
+            threads: 0,
         }
     }
 }
@@ -241,6 +252,106 @@ struct Plan {
     four: bool,
     /// Interlaced field prediction: the field vectors and reference fields.
     field: Option<([[i32; 2]; 2], [bool; 2])>,
+}
+
+/// The plans of a P-VOP's macroblocks as threads make them: a wavefront,
+/// a row at a time per thread, each macroblock once the row above has
+/// planned the two above it and to its right (all that vector prediction
+/// and the search's candidates read). The plans are the ones planning in
+/// order makes.
+struct PlanBoard {
+    mbw: usize,
+    plans: Vec<OnceLock<Plan>>,
+    /// Macroblocks planned in each row.
+    done: Vec<AtomicUsize>,
+    /// The next row to plan.
+    next: AtomicUsize,
+}
+
+impl PlanBoard {
+    fn new(mbw: usize, mbh: usize) -> PlanBoard {
+        PlanBoard {
+            mbw,
+            plans: (0..mbw * mbh).map(|_| OnceLock::new()).collect(),
+            done: (0..mbh).map(|_| AtomicUsize::new(0)).collect(),
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    /// Waits until row `row` has planned `n` macroblocks.
+    fn wait_row(&self, row: usize, n: usize) {
+        let mut spins = 0u32;
+        while self.done[row].load(Ordering::Acquire) < n {
+            spins += 1;
+            if spins < 64 {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    /// The plan of macroblock `mb`, once made.
+    fn wait(&self, mb: usize) -> Plan {
+        self.wait_row(mb / self.mbw, mb % self.mbw + 1);
+        *self.plans[mb].get().unwrap()
+    }
+
+    /// Plans rows until none is left. `view`: the vectors before the VOP
+    /// ([`MbState::motion_view`]).
+    fn plan_rows(&self, srch: Search, view: &MbState, src: &Pic, rf: &Pic, h: &VopHeader) {
+        let mbw = self.mbw;
+        let mbh = self.done.len();
+        let mut st = view.motion_view();
+        loop {
+            // Rows are taken in order, so the row above is always being
+            // (or done being) planned: no thread waits on one that waits
+            // on it.
+            let mby = self.next.fetch_add(1, Ordering::Relaxed);
+            if mby >= mbh {
+                return;
+            }
+            let mut have = 0;
+            for mbx in 0..mbw {
+                if mby > 0 {
+                    let need = (mbx + 2).min(mbw);
+                    self.wait_row(mby - 1, need);
+                    for x in have..need {
+                        let up = (mby - 1) * mbw + x;
+                        st.slice[up] = srch.slice;
+                        apply_plan(&mut st, x, mby - 1, self.plans[up].get().unwrap());
+                    }
+                    have = need;
+                }
+                let mb = mby * mbw + mbx;
+                st.slice[mb] = srch.slice;
+                let p = srch.plan_p_mb(&st, src, rf, mbx, mby, h);
+                apply_plan(&mut st, mbx, mby, &p);
+                let _ = self.plans[mb].set(p);
+                self.done[mby].store(mbx + 1, Ordering::Release);
+            }
+        }
+    }
+
+    fn into_plans(self) -> Vec<Plan> {
+        self.plans
+            .into_iter()
+            .map(|p| p.into_inner().unwrap())
+            .collect()
+    }
+}
+
+/// Sets the vectors a planned macroblock leaves for vector prediction:
+/// what coding it sets them to (zero when intra or skipped, the frame
+/// vector a field-predicted macroblock stands for).
+fn apply_plan(st: &mut MbState, mbx: usize, mby: usize, p: &Plan) {
+    if let Some((fmv, _)) = p.field {
+        st.set_mb_mv(mbx, mby, field_to_frame(fmv[0], fmv[1]));
+    } else {
+        for k in 0..4 {
+            st.set_mv(mbx, mby, k, p.mvs[k]);
+        }
+    }
 }
 
 /// B-VOP macroblock modes.
@@ -640,6 +751,15 @@ impl Encoder {
         }
     }
 
+    /// The worker threads for a VOP of `mbh` macroblock rows.
+    fn threads(&self, mbh: usize) -> usize {
+        let t = match self.cfg.threads {
+            0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+            n => n,
+        };
+        t.min(mbh).max(1)
+    }
+
     fn new_slice(&mut self) {
         self.slice_counter = self.slice_counter.wrapping_add(1).max(1);
         self.slice = self.slice_counter;
@@ -690,9 +810,95 @@ impl Encoder {
     fn code_ip(&mut self, w: &mut BitWriter, src: &Pic, recon: &mut Pic, h: &VopHeader) {
         let (mbw, mbh) = (self.st.mbw, self.st.mbh);
         self.new_slice();
+        let reference = self.future.take();
+        // With OBMC a macroblock's prediction needs its right neighbour's
+        // vectors: plan every macroblock's motion first. With threads (and
+        // no video packets, whose boundaries depend on the bits) the plans
+        // are made on other threads as a wavefront while this one codes
+        // the macroblocks in order — the same plans: a plan reads only the
+        // vectors of the macroblocks before it, which coding a macroblock
+        // sets to its plan's.
+        let threads = self.threads(mbh);
+        let parallel = threads > 1 && self.cfg.packet_bytes.is_none();
+        let p_vop = h.vop_type == VopType::P && reference.is_some();
+        if p_vop && self.cfg.obmc {
+            let rf = &reference.as_ref().unwrap().pic;
+            let plans: Vec<Plan> = if parallel {
+                let plans = PlanBoard::new(mbw, mbh);
+                let view = self.st.motion_view();
+                let srch = self.srch();
+                std::thread::scope(|s| {
+                    for _ in 1..threads {
+                        s.spawn(|| plans.plan_rows(srch, &view, src, rf, h));
+                    }
+                    plans.plan_rows(srch, &view, src, rf, h);
+                });
+                plans.into_plans()
+            } else {
+                let mut st = self.st.motion_view();
+                (0..mbw * mbh)
+                    .map(|mb| {
+                        let (mbx, mby) = (mb % mbw, mb / mbw);
+                        st.slice[mb] = self.slice;
+                        let p = self.srch().plan_p_mb(&st, src, rf, mbx, mby, h);
+                        apply_plan(&mut st, mbx, mby, &p);
+                        p
+                    })
+                    .collect()
+            };
+            for (mb, p) in plans.iter().enumerate() {
+                let (mbx, mby) = (mb % mbw, mb / mbw);
+                self.st.slice[mb] = self.slice;
+                self.st.kind[mb] = if p.intra {
+                    MbKind::Intra
+                } else {
+                    MbKind::Inter
+                };
+                apply_plan(&mut self.st, mbx, mby, p);
+            }
+            self.code_ip_mbs(w, src, recon, h, &reference, &|mb| Some(plans[mb]));
+        } else if p_vop && parallel {
+            let rf = &reference.as_ref().unwrap().pic;
+            let plans = PlanBoard::new(mbw, mbh);
+            let view = self.st.motion_view();
+            // The searches read a copy of what they need, so that this
+            // thread can code (and change the encoder) meanwhile.
+            let cfg = self.cfg.clone();
+            let prev_mv = std::mem::take(&mut self.prev_mv);
+            let srch = Search {
+                cfg: &cfg,
+                fcode: self.fcode,
+                slice: self.slice,
+                prev_mv: &prev_mv,
+            };
+            std::thread::scope(|s| {
+                for _ in 1..threads {
+                    s.spawn(|| plans.plan_rows(srch, &view, src, rf, h));
+                }
+                self.code_ip_mbs(w, src, recon, h, &reference, &|mb| Some(plans.wait(mb)));
+            });
+            self.prev_mv = prev_mv;
+        } else {
+            self.code_ip_mbs(w, src, recon, h, &reference, &|_| None);
+        }
+        self.future = reference;
+    }
+
+    /// The macroblocks of an I- or P-VOP, in order, with video packets
+    /// (or GOBs) and data partitioning; a P-VOP macroblock's motion from
+    /// `plan` when it has one, else searched here.
+    fn code_ip_mbs(
+        &mut self,
+        w: &mut BitWriter,
+        src: &Pic,
+        recon: &mut Pic,
+        h: &VopHeader,
+        reference: &Option<Ref>,
+        plan: &dyn Fn(usize) -> Option<Plan>,
+    ) {
+        let (mbw, mbh) = (self.st.mbw, self.st.mbh);
         let dp = self.cfg.data_partitioning;
         let i_vop = h.vop_type == VopType::I;
-        let reference = self.future.take();
         let mut packet: Vec<MbSyntax> = Vec::new();
         let mut packet_bits = 0;
         let sh = self.cfg.short_header;
@@ -703,32 +909,6 @@ impl Encoder {
             289..=576 => 2,
             _ => 4,
         };
-        // With OBMC a macroblock's prediction needs its right neighbour's
-        // vectors: plan every macroblock's motion first.
-        let mut plans = Vec::new();
-        if self.cfg.obmc
-            && h.vop_type == VopType::P
-            && let Some(rf) = &reference
-        {
-            for mb in 0..mbw * mbh {
-                let (mbx, mby) = (mb % mbw, mb / mbw);
-                self.st.slice[mb] = self.slice;
-                let p = self.plan_p_mb(src, &rf.pic, mbx, mby, h);
-                self.st.kind[mb] = if p.intra {
-                    MbKind::Intra
-                } else {
-                    MbKind::Inter
-                };
-                if let Some((fmv, _)) = p.field {
-                    self.st.set_mb_mv(mbx, mby, field_to_frame(fmv[0], fmv[1]));
-                } else {
-                    for k in 0..4 {
-                        self.st.set_mv(mbx, mby, k, p.mvs[k]);
-                    }
-                }
-                plans.push(p);
-            }
-        }
         for mb in 0..mbw * mbh {
             if sh {
                 if mb > 0 && mb % (mbw * gob_rows) == 0 && self.packet_due(mb, packet_bits) {
@@ -751,27 +931,28 @@ impl Encoder {
             let (mbx, mby) = (mb % mbw, mb / mbw);
             self.st.slice[mb] = self.slice;
             self.st.qp[mb] = h.quant as u8;
-            let syn = match (&reference, h.vop_type) {
-                (Some(rf), VopType::P) if !plans.is_empty() => {
-                    self.finish_p_mb(plans[mb], src, &rf.pic, recon, mbx, mby, h)
-                }
-                (Some(rf), VopType::P) => self.code_p_mb(src, &rf.pic, recon, mbx, mby, h),
+            let syn = match (reference, h.vop_type) {
+                (Some(rf), VopType::P) => match plan(mb) {
+                    Some(p) => self.finish_p_mb(p, src, &rf.pic, recon, mbx, mby, h),
+                    None => self.code_p_mb(src, &rf.pic, recon, mbx, mby, h),
+                },
                 _ if sh => self.code_intra_mb_short(src, recon, mbx, mby, h.quant, !i_vop),
                 _ => self.code_intra_mb(src, recon, mbx, mby, h.quant, !i_vop),
             };
-            let mut t = BitWriter::new();
-            syn.write(&mut t);
-            packet_bits += t.len_bits();
             if dp {
+                let mut t = BitWriter::new();
+                syn.write(&mut t);
+                packet_bits += t.len_bits();
                 packet.push(syn);
             } else {
-                w.append(&t);
+                let before = w.len_bits();
+                syn.write(w);
+                packet_bits += w.len_bits() - before;
             }
         }
         if dp {
             write_partitioned(w, &packet, i_vop, self.cfg.reversible_vlc);
         }
-        self.future = reference;
     }
 
     /// Codes frame `index`, which lies between the two references, as a
@@ -808,30 +989,78 @@ impl Encoder {
         let (mbw, mbh) = (self.st.mbw, self.st.mbh);
         self.new_slice();
         let mut packet_start = w.len_bits();
-        // Vector predictors, [forward, backward][top field, bottom field]
-        // in frame units, as the decoder keeps them (7.7.2.2).
-        let mut pmv = [[[0i32; 2]; 2]; 2];
-        for mb in 0..mbw * mbh {
-            if self.maybe_packet(w, &mut packet_start, mb, &hdr) {
-                pmv = [[[0, 0]; 2]; 2];
+        let threads = self.threads(mbh);
+        if threads > 1 && self.cfg.packet_bytes.is_none() {
+            // Without video packets every macroblock row stands alone (the
+            // vector predictors restart at each row): rows on threads,
+            // their bits and samples joined in order.
+            let next = AtomicUsize::new(0);
+            let rows: Vec<Vec<(usize, BitWriter, Pic)>> = std::thread::scope(|s| {
+                let work = || {
+                    let mut done = Vec::new();
+                    loop {
+                        let mby = next.fetch_add(1, Ordering::Relaxed);
+                        if mby >= mbh {
+                            return done;
+                        }
+                        let mut bw = BitWriter::new();
+                        let mut band = Pic::new(self.cfg.width, 16);
+                        let mut pmv = [[[0i32; 2]; 2]; 2];
+                        for mbx in 0..mbw {
+                            self.code_b_mb(
+                                &mut bw,
+                                src,
+                                &past,
+                                &future,
+                                (&mut band, 0),
+                                mbx,
+                                mby,
+                                qp,
+                                (trb, trd),
+                                field_times,
+                                &mut pmv,
+                            );
+                        }
+                        done.push((mby, bw, band));
+                    }
+                };
+                let handles: Vec<_> = (1..threads).map(|_| s.spawn(work)).collect();
+                let mut all = vec![work()];
+                all.extend(handles.into_iter().map(|h| h.join().unwrap()));
+                all
+            });
+            let mut rows: Vec<(usize, BitWriter, Pic)> = rows.into_iter().flatten().collect();
+            rows.sort_by_key(|r| r.0);
+            for (mby, bw, band) in &rows {
+                w.append(bw);
+                recon.put_band(band, *mby);
             }
-            let (mbx, mby) = (mb % mbw, mb / mbw);
-            if mbx == 0 {
-                pmv = [[[0, 0]; 2]; 2];
+        } else {
+            // Vector predictors, [forward, backward][top field, bottom
+            // field] in frame units, as the decoder keeps them (7.7.2.2).
+            let mut pmv = [[[0i32; 2]; 2]; 2];
+            for mb in 0..mbw * mbh {
+                if self.maybe_packet(w, &mut packet_start, mb, &hdr) {
+                    pmv = [[[0, 0]; 2]; 2];
+                }
+                let (mbx, mby) = (mb % mbw, mb / mbw);
+                if mbx == 0 {
+                    pmv = [[[0, 0]; 2]; 2];
+                }
+                self.code_b_mb(
+                    w,
+                    src,
+                    &past,
+                    &future,
+                    (&mut recon, mby),
+                    mbx,
+                    mby,
+                    qp,
+                    (trb, trd),
+                    field_times,
+                    &mut pmv,
+                );
             }
-            self.code_b_mb(
-                w,
-                src,
-                &past,
-                &future,
-                &mut recon,
-                mbx,
-                mby,
-                qp,
-                (trb, trd),
-                field_times,
-                &mut pmv,
-            );
         }
         w.stuff();
         self.rate_update(w.len_bits() - start, false);
@@ -847,7 +1076,7 @@ impl Encoder {
         src: &Pic,
         past: &Ref,
         future: &Ref,
-        recon: &mut Pic,
+        (recon, rmby): (&mut Pic, usize),
         mbx: usize,
         mby: usize,
         qp: u32,
@@ -869,7 +1098,7 @@ impl Encoder {
                 false,
                 &mut px,
             );
-            write_mb(recon, mbx, mby, &px);
+            write_mb(recon, mbx, rmby, &px);
             return;
         }
         let col = {
@@ -883,7 +1112,7 @@ impl Encoder {
                 [0, 0]
             }
         };
-        let (mvf, _) = self.search(
+        let (mvf, _) = self.srch().search(
             src,
             &past.pic,
             mbx,
@@ -893,7 +1122,7 @@ impl Encoder {
             qp,
             false,
         );
-        let (mvb, _) = self.search(
+        let (mvb, _) = self.srch().search(
             src,
             &future.pic,
             mbx,
@@ -975,20 +1204,20 @@ impl Encoder {
             (
                 BMode::Forward,
                 false,
-                sad(&pf.y) + lambda * (self.mv_bits(mvf, pmv[0][0]) + 4 + field_bit),
+                sad(&pf.y) + lambda * (self.srch().mv_bits(mvf, pmv[0][0]) + 4 + field_bit),
             ),
             (
                 BMode::Backward,
                 false,
-                sad(&pb.y) + lambda * (self.mv_bits(mvb, pmv[1][0]) + 3 + field_bit),
+                sad(&pb.y) + lambda * (self.srch().mv_bits(mvb, pmv[1][0]) + 3 + field_bit),
             ),
             (
                 BMode::Interpolate,
                 false,
                 sad(&pi.y)
                     + lambda
-                        * (self.mv_bits(mvf, pmv[0][0])
-                            + self.mv_bits(mvb, pmv[1][0])
+                        * (self.srch().mv_bits(mvf, pmv[0][0])
+                            + self.srch().mv_bits(mvb, pmv[1][0])
                             + 2
                             + field_bit),
             ),
@@ -1008,9 +1237,10 @@ impl Encoder {
                     let fp = field_pred(p);
                     let mut best = (u32::MAX, [0, 0], false);
                     for parity in [f == 1, f != 1] {
-                        let (v, sad) =
-                            self.search_field(src, rf, mbx, mby, f, parity, start, false);
-                        let c = sad + qp * self.mv_bits(v, fp);
+                        let (v, sad) = self
+                            .srch()
+                            .search_field(src, rf, mbx, mby, f, parity, start, false);
+                        let c = sad + qp * self.srch().mv_bits(v, fp);
                         if c < best.0 {
                             best = (c, v, parity);
                         }
@@ -1033,7 +1263,7 @@ impl Encoder {
             mc::average(&mut f2.cr, &f1.cr);
             let bits = |d: usize| -> u32 {
                 (0..2)
-                    .map(|f| self.mv_bits(fields[d].0[f], field_pred(pmv[d][f])) + 1)
+                    .map(|f| self.srch().mv_bits(fields[d].0[f], field_pred(pmv[d][f])) + 1)
                     .sum()
             };
             costs.push((
@@ -1137,7 +1367,7 @@ impl Encoder {
                 put_mvd(w, 0, 1);
             }
         }
-        write_mb(recon, mbx, mby, &px);
+        write_mb(recon, mbx, rmby, &px);
         for (k, lv) in levels.iter().enumerate() {
             if cbp >> (5 - k) & 1 == 0 {
                 continue;
@@ -1146,7 +1376,7 @@ impl Encoder {
             let mut rec = *lv;
             self.quant.inter(&mut rec, qp);
             idct(&mut rec);
-            add_block(recon, mbx, mby, k, &rec, field_dct);
+            add_block(recon, mbx, rmby, k, &rec, field_dct);
         }
     }
 
@@ -1299,95 +1529,8 @@ impl Encoder {
         mby: usize,
         h: &VopHeader,
     ) -> MbSyntax {
-        let plan = self.plan_p_mb(src, rf, mbx, mby, h);
+        let plan = self.srch().plan_p_mb(&self.st, src, rf, mbx, mby, h);
         self.finish_p_mb(plan, src, rf, recon, mbx, mby, h)
-    }
-
-    /// Motion estimation for a P-VOP macroblock: intra or not, and its
-    /// vector(s). Changes nothing.
-    fn plan_p_mb(&self, src: &Pic, rf: &Pic, mbx: usize, mby: usize, h: &VopHeader) -> Plan {
-        let qp = h.quant;
-        let pred0 = self.st.mv_pred(mbx, mby, 0, self.slice);
-        let mbw = self.st.mbw;
-        let prev = self.prev_mv[(2 * mby) * 2 * mbw + 2 * mbx];
-        let mut cands = vec![[prev[0] as i32, prev[1] as i32]];
-        if mbx > 0 {
-            cands.push(self.st.get_mv(mbx - 1, mby, 1));
-        }
-        if mby > 0 {
-            cands.push(self.st.get_mv(mbx, mby - 1, 2));
-            if mbx + 1 < mbw {
-                cands.push(self.st.get_mv(mbx + 1, mby - 1, 2));
-            }
-        }
-        let (mv, sad16) = self.search(src, rf, mbx, mby, pred0, &cands, qp, h.rounding);
-        // TMN's intra decision: intra when the macroblock's deviation from
-        // its own mean is clearly below the best prediction error.
-        let mut ys = [0u8; 256];
-        luma_mb(src, mbx, mby, &mut ys);
-        let mean = ys.iter().map(|&v| v as u32).sum::<u32>() / 256;
-        let dev: u32 = ys
-            .iter()
-            .map(|&v| (v as i32 - mean as i32).unsigned_abs())
-            .sum();
-        if dev + 500 < sad16 {
-            return Plan {
-                intra: true,
-                mv: [0, 0],
-                mvs: [[0, 0]; 4],
-                four: false,
-                field: None,
-            };
-        }
-        let mut mvs = [mv; 4];
-        let mut four = false;
-        if self.cfg.four_mv {
-            let mut sad4 = 0;
-            for (k, v) in mvs.iter_mut().enumerate() {
-                let (b, s) = self.search8(src, rf, mbx, mby, k, mv, h.rounding);
-                *v = b;
-                sad4 += s;
-            }
-            if sad4 + 16 * qp * 3 < sad16 && mvs.iter().any(|&v| v != mv) {
-                four = true;
-            } else {
-                mvs = [mv; 4];
-            }
-        }
-        // Interlaced: field prediction when its two vectors predict better
-        // than the frame vector, rate included.
-        let mut field: Option<([[i32; 2]; 2], [bool; 2])> = None;
-        if self.cfg.interlaced && !four {
-            let fp = field_pred(pred0);
-            let start = [mv[0], mv[1] >> 1];
-            let mut fsad = 0;
-            let mut fmv = [[0; 2]; 2];
-            let mut fref = [false; 2];
-            for f in 0..2 {
-                let mut best = (u32::MAX, [0, 0], false);
-                for parity in [f == 1, f != 1] {
-                    let (v, sad) =
-                        self.search_field(src, rf, mbx, mby, f, parity, start, h.rounding);
-                    let c = sad + qp * self.mv_bits(v, fp);
-                    if c < best.0 {
-                        best = (c, v, parity);
-                    }
-                }
-                fsad += best.0;
-                fmv[f] = best.1;
-                fref[f] = best.2;
-            }
-            if fsad + 2 * qp < sad16 + qp * self.mv_bits(mv, pred0) {
-                field = Some((fmv, fref));
-            }
-        }
-        Plan {
-            intra: false,
-            mv,
-            mvs,
-            four,
-            field,
-        }
     }
 
     /// Codes a planned P-VOP macroblock: its prediction (overlapped when
@@ -1526,14 +1669,136 @@ impl Encoder {
         }
     }
 
-    /// Vector units per sample: 2 (half samples) or 4 (quarter samples).
-    fn unit(&self) -> i32 {
-        if self.cfg.quarter_sample { 4 } else { 2 }
+    /// The motion search's view of the encoder.
+    fn srch(&self) -> Search<'_> {
+        Search {
+            cfg: &self.cfg,
+            fcode: self.fcode,
+            slice: self.slice,
+            prev_mv: &self.prev_mv,
+        }
     }
 
     fn put_mv(&self, w: &mut BitWriter, mv: [i32; 2], pred: [i32; 2]) {
         for j in 0..2 {
             put_mvd(w, wrap_diff(mv[j] - pred[j], self.fcode), self.fcode);
+        }
+    }
+}
+
+/// What motion search reads, apart from the pictures: the configuration,
+/// the VOP's `fcode`, its video packet and the previous VOP's vectors.
+/// Copied into each of the encoder's threads.
+#[derive(Clone, Copy)]
+struct Search<'a> {
+    cfg: &'a EncoderConfig,
+    fcode: u32,
+    slice: u32,
+    prev_mv: &'a [[i16; 2]],
+}
+
+impl Search<'_> {
+    /// Vector units per sample: 2 (half samples) or 4 (quarter samples).
+    fn unit(&self) -> i32 {
+        if self.cfg.quarter_sample { 4 } else { 2 }
+    }
+
+    /// Motion estimation for a P-VOP macroblock: intra or not, and its
+    /// vector(s). Changes nothing.
+    fn plan_p_mb(
+        &self,
+        st: &MbState,
+        src: &Pic,
+        rf: &Pic,
+        mbx: usize,
+        mby: usize,
+        h: &VopHeader,
+    ) -> Plan {
+        let qp = h.quant;
+        let pred0 = st.mv_pred(mbx, mby, 0, self.slice);
+        let mbw = st.mbw;
+        let prev = self.prev_mv[(2 * mby) * 2 * mbw + 2 * mbx];
+        let mut cands = [[prev[0] as i32, prev[1] as i32]; 4];
+        let mut n = 1;
+        if mbx > 0 {
+            cands[n] = st.get_mv(mbx - 1, mby, 1);
+            n += 1;
+        }
+        if mby > 0 {
+            cands[n] = st.get_mv(mbx, mby - 1, 2);
+            n += 1;
+            if mbx + 1 < mbw {
+                cands[n] = st.get_mv(mbx + 1, mby - 1, 2);
+                n += 1;
+            }
+        }
+        let (mv, sad16) = self.search(src, rf, mbx, mby, pred0, &cands[..n], qp, h.rounding);
+        // TMN's intra decision: intra when the macroblock's deviation from
+        // its own mean is clearly below the best prediction error.
+        let mut ys = [0u8; 256];
+        luma_mb(src, mbx, mby, &mut ys);
+        let mean = ys.iter().map(|&v| v as u32).sum::<u32>() / 256;
+        let dev: u32 = ys
+            .iter()
+            .map(|&v| (v as i32 - mean as i32).unsigned_abs())
+            .sum();
+        if dev + 500 < sad16 {
+            return Plan {
+                intra: true,
+                mv: [0, 0],
+                mvs: [[0, 0]; 4],
+                four: false,
+                field: None,
+            };
+        }
+        let mut mvs = [mv; 4];
+        let mut four = false;
+        if self.cfg.four_mv {
+            let mut sad4 = 0;
+            for (k, v) in mvs.iter_mut().enumerate() {
+                let (b, s) = self.search8(src, rf, mbx, mby, k, mv, h.rounding);
+                *v = b;
+                sad4 += s;
+            }
+            if sad4 + 16 * qp * 3 < sad16 && mvs.iter().any(|&v| v != mv) {
+                four = true;
+            } else {
+                mvs = [mv; 4];
+            }
+        }
+        // Interlaced: field prediction when its two vectors predict better
+        // than the frame vector, rate included.
+        let mut field: Option<([[i32; 2]; 2], [bool; 2])> = None;
+        if self.cfg.interlaced && !four {
+            let fp = field_pred(pred0);
+            let start = [mv[0], mv[1] >> 1];
+            let mut fsad = 0;
+            let mut fmv = [[0; 2]; 2];
+            let mut fref = [false; 2];
+            for f in 0..2 {
+                let mut best = (u32::MAX, [0, 0], false);
+                for parity in [f == 1, f != 1] {
+                    let (v, sad) =
+                        self.search_field(src, rf, mbx, mby, f, parity, start, h.rounding);
+                    let c = sad + qp * self.mv_bits(v, fp);
+                    if c < best.0 {
+                        best = (c, v, parity);
+                    }
+                }
+                fsad += best.0;
+                fmv[f] = best.1;
+                fref[f] = best.2;
+            }
+            if fsad + 2 * qp < sad16 + qp * self.mv_bits(mv, pred0) {
+                field = Some((fmv, fref));
+            }
+        }
+        Plan {
+            intra: false,
+            mv,
+            mvs,
+            four,
+            field,
         }
     }
 
@@ -1855,9 +2120,9 @@ fn source_block(src: &Pic, mbx: usize, mby: usize, k: usize) -> [i16; 64] {
         _ => (&src.cr, src.cstride(), mby * 8 * src.cstride() + mbx * 8),
     };
     let mut b = [0i16; 64];
-    for r in 0..8 {
-        for c in 0..8 {
-            b[r * 8 + c] = p[o + r * s + c] as i16;
+    for (r, row) in b.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+        for (d, &v) in row.iter_mut().zip(&p[o + r * s..o + r * s + 8]) {
+            *d = v as i16;
         }
     }
     b

@@ -89,27 +89,27 @@ fn mismatch(b: &mut [i16; 64], sum: i32) {
     }
 }
 
-/// `ceil(2^32 / d)`: with it, `a / d == (a * recip(d)) >> 32` for every
-/// `a < 2^32 / d` (see [`rdiv`]).
-pub(crate) const fn recip(d: u32) -> u64 {
-    (1u64 << 32).div_ceil(d as u64)
+/// `ceil(2^K / d)`, for [`rdiv`]; it fits 32 bits when `d >= 2^(K - 31)`.
+pub(crate) const fn recip<const K: u32>(d: u32) -> u32 {
+    (1u64 << K).div_ceil(d as u64) as u32
 }
 
-/// `a / d` as a multiplication by `m = recip(d)`, exact for `a * d < 2^32`:
-/// with `m = (2^32 + e) / d`, `0 <= e < d`, and `a = q d + r`,
-/// `a m / 2^32 = q + (r + a e / 2^32) / d`, and `r + a e / 2^32 < d`
-/// because `r <= d - 1` and `a e < a d < 2^32`.
+/// `a / d` as a multiplication by `m = recip::<K>(d)`, exact when
+/// `a d < 2^K`: with `m = (2^K + e) / d`, `0 <= e < d`, and `a = q d + r`,
+/// `a m / 2^K = q + (r + a e / 2^K) / d`, and `r + a e / 2^K < d` because
+/// `r <= d - 1` and `a e < a d < 2^K`. (32-bit operands into a 64-bit
+/// product: one vector multiply per lane.)
 #[inline(always)]
-pub(crate) fn rdiv(a: u32, m: u64) -> u32 {
-    ((a as u64 * m) >> 32) as u32
+pub(crate) fn rdiv<const K: u32>(a: u32, m: u32) -> u32 {
+    ((a as u64 * m as u64) >> K) as u32
 }
 
-/// `recip(2 QP)` for QP 0..=31 (0 unused).
-const H263_RECIP: [u64; 32] = {
-    let mut t = [0u64; 32];
+/// `recip::<32>(2 QP)` for QP 0..=31 (0 unused).
+const H263_RECIP: [u32; 32] = {
+    let mut t = [0u32; 32];
     let mut q = 1;
     while q < 32 {
-        t[q] = recip(2 * q as u32);
+        t[q] = recip::<32>(2 * q as u32);
         q += 1;
     }
     t
@@ -129,7 +129,7 @@ pub(crate) fn quantise_h263(b: &mut [i16; 64], qp: u32, intra: bool) {
     for v in &mut b[from..] {
         let c = *v as i32;
         let a = (c.abs() - dz).max(0) as u32;
-        let l = rdiv(a, m).min(2047) as i32;
+        let l = rdiv::<32>(a, m).min(2047) as i32;
         *v = (if c < 0 { -l } else { l }) as i16;
     }
 }
@@ -154,8 +154,8 @@ pub(crate) fn quantise_h263_div(b: &mut [i16; 64], qp: u32, intra: bool) {
 /// The reciprocals of the first method's steps `W QP` for one pair of
 /// weighting matrices, QP 1..=31: what [`quantise_mpeg`] multiplies by.
 pub(crate) struct MpegRecips {
-    /// `[qp][intra as usize][i]`.
-    t: Vec<[[u64; 64]; 2]>,
+    /// `[qp][intra as usize][i]`: `recip::<31>(W QP)`.
+    t: Vec<[[u32; 64]; 2]>,
     intra_matrix: [u8; 64],
     inter_matrix: [u8; 64],
 }
@@ -165,7 +165,7 @@ impl MpegRecips {
         let t = (0..32u32)
             .map(|qp| {
                 [inter_matrix, intra_matrix]
-                    .map(|m| std::array::from_fn(|i| recip((m[i] as u32 * qp).max(1))))
+                    .map(|m| std::array::from_fn(|i| recip::<31>((m[i] as u32 * qp).max(1))))
             })
             .collect();
         MpegRecips {
@@ -194,13 +194,14 @@ pub(crate) fn quantise_mpeg(b: &mut [i16; 64], qp: u32, intra: bool, r: &MpegRec
     };
     let t = &t[intra as usize];
     let qp = qp as i32;
-    // 8 |F| + W QP / 2 < 2^19 and W QP < 2^13: the multiplications are
-    // exact.
+    // a = 8 |F| (+ W QP / 2) <= 8 * 2^15 + 3952 and W QP <= 7905, so
+    // a W QP < 2^31: the multiplications are exact.
+    let half = if intra { 1 } else { 0 };
     for ((v, &w), &m) in b.iter_mut().zip(matrix).zip(t).skip(from) {
         let c = *v as i32;
         let d = w as i32 * qp;
-        let a = 8 * c.abs() + if intra { d / 2 } else { 0 };
-        let l = rdiv(a as u32, m).min(2047) as i32;
+        let a = 8 * c.abs() + ((d >> 1) & -half);
+        let l = rdiv::<31>(a as u32, m).min(2047) as i32;
         *v = (if c < 0 { -l } else { l }) as i16;
     }
 }

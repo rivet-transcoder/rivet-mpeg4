@@ -23,12 +23,20 @@ fn fetch(src: Src, x: i32, y: i32, ww: usize, wh: usize, out: &mut [u8], os: usi
         }
         return;
     }
+    // Columns left of the area take its first sample, columns right of
+    // it its last, the rest are copied.
+    let left = ((-x).max(0) as usize).min(ww);
+    let right = ((x + ww as i32 - pw).max(0) as usize).min(ww - left);
+    let mid = ww - left - right;
     for r in 0..wh {
-        let sy = (y + r as i32).clamp(0, ph - 1) as usize * stride;
-        for c in 0..ww {
-            let sx = (x + c as i32).clamp(0, pw - 1) as usize;
-            out[r * os + c] = plane[sy + sx];
+        let row = &plane[(y + r as i32).clamp(0, ph - 1) as usize * stride..];
+        let o = &mut out[r * os..r * os + ww];
+        o[..left].fill(row[0]);
+        if mid > 0 {
+            let sx = (x + left as i32) as usize;
+            o[left..left + mid].copy_from_slice(&row[sx..sx + mid]);
         }
+        o[left + mid..].fill(row[pw as usize - 1]);
     }
 }
 

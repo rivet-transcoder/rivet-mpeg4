@@ -583,3 +583,78 @@ fn overlapped_block_motion_compensation() {
         check(&r, 32.0, &format!("H.263 Advanced Prediction, 4MV {four}"));
     }
 }
+
+/// The stream does not depend on the encoder's thread count: B-VOP rows
+/// and P-VOP motion search on threads give the bytes one thread does —
+/// one vector or four, quarter samples, interlaced, OBMC, odd sizes, and
+/// with video packets (which keep a VOP on one thread).
+#[test]
+fn threads_do_not_change_the_stream() {
+    let configs = {
+        let mut v = Vec::new();
+        let mut c = EncoderConfig::new(320, 240, 25);
+        c.b_frames = 2;
+        c.four_mv = true;
+        v.push(c);
+        let mut c = EncoderConfig::new(200, 150, 25);
+        c.b_frames = 1;
+        c.quarter_sample = true;
+        c.quantiser = mpeg4::Quantiser::mpeg_default();
+        v.push(c);
+        let mut c = EncoderConfig::new(352, 288, 25);
+        c.interlaced = true;
+        c.b_frames = 2;
+        c.b_field_prediction = true;
+        v.push(c);
+        let mut c = EncoderConfig::new(176, 144, 25);
+        c.obmc = true;
+        c.four_mv = true;
+        v.push(c);
+        let mut c = EncoderConfig::new(352, 288, 25);
+        c.b_frames = 2;
+        c.packet_bytes = Some(400);
+        v.push(c);
+        let mut c = EncoderConfig::new(64, 16, 25);
+        c.b_frames = 1;
+        v.push(c);
+        v
+    };
+    for cfg in configs {
+        let label = format!(
+            "{}x{} b {} qpel {} interlaced {} obmc {} packets {:?}",
+            cfg.width,
+            cfg.height,
+            cfg.b_frames,
+            cfg.quarter_sample,
+            cfg.interlaced,
+            cfg.obmc,
+            cfg.packet_bytes
+        );
+        let streams: Vec<Vec<u8>> = [1, 2, 3, 8]
+            .into_iter()
+            .map(|threads| {
+                let mut c = cfg.clone();
+                c.threads = threads;
+                let (w, h) = (c.width, c.height);
+                let mut enc = Encoder::new(c).unwrap();
+                let mut s = Vec::new();
+                for t in 0..14 {
+                    let src = if cfg.interlaced {
+                        common::synth_interlaced(w, h, t, 4.0, true)
+                    } else {
+                        synth(w, h, t)
+                    };
+                    s.extend(enc.encode(&src).unwrap());
+                }
+                s.extend(enc.finish().unwrap());
+                s
+            })
+            .collect();
+        for (i, s) in streams.iter().enumerate().skip(1) {
+            assert!(
+                s == &streams[0],
+                "{label}: thread count {i} changes the stream"
+            );
+        }
+    }
+}

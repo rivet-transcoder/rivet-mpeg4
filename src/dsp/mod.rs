@@ -151,6 +151,14 @@ pub(crate) fn idct(b: &mut [i16; 64]) {
 }
 
 pub(crate) fn idct_with(isa: Isa, b: &mut [i16; 64]) {
+    // A block with only a DC coefficient (common) transforms to a constant:
+    // the scalar transform's two passes over it, exactly.
+    if b[1..].iter().fold(0, |a, &c| a | c) == 0 {
+        let row = (scalar::BASIS[0][0] * b[0] as i32 + 128) >> 8;
+        let v = (scalar::BASIS[0][0] as i64 * row as i64 + (1 << 23)) >> 24;
+        b.fill(v as i16);
+        return;
+    }
     match isa.0 {
         // SAFETY: an `Isa` of this level exists only when the CPU has it.
         #[cfg(target_arch = "x86_64")]

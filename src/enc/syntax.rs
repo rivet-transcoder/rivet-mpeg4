@@ -12,6 +12,25 @@ use super::write::{
     put_mvd,
 };
 
+/// Up to four vector differences, held in place (no allocation per
+/// macroblock).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Mvds {
+    v: [[i32; 2]; 4],
+    n: usize,
+}
+
+impl Mvds {
+    pub fn push(&mut self, d: [i32; 2]) {
+        self.v[self.n] = d;
+        self.n += 1;
+    }
+
+    pub fn as_slice(&self) -> &[[i32; 2]] {
+        &self.v[..self.n]
+    }
+}
+
 /// One macroblock of an I- or P-VOP.
 #[derive(Clone)]
 pub(crate) struct MbSyntax {
@@ -40,7 +59,7 @@ pub(crate) struct MbSyntax {
     /// `dquant` code (Table 6-22) for `mb_type` 1 and 4.
     pub dquant: u32,
     /// Vector differences, already wrapped, as `(x, y)` pairs.
-    pub mvd: Vec<[i32; 2]>,
+    pub mvd: Mvds,
     pub fcode: u32,
     /// Intra DC differentials (the encoder always codes the DC with its
     /// own VLC: `intra_dc_vlc_thr` 0).
@@ -64,7 +83,7 @@ impl MbSyntax {
             cbp: 0,
             ac_pred: false,
             dquant: 0,
-            mvd: Vec::new(),
+            mvd: Mvds::default(),
             fcode,
             dc: [0; 6],
             blocks: [[0; 64]; 6],
@@ -96,7 +115,7 @@ impl MbSyntax {
     }
 
     fn mvs(&self, w: &mut BitWriter) {
-        for d in &self.mvd {
+        for d in self.mvd.as_slice() {
             put_mvd(w, d[0], self.fcode);
             put_mvd(w, d[1], self.fcode);
         }

@@ -494,32 +494,44 @@ unsafe fn qpel_body(win: &[u8], off: usize, ws: usize, a: Interp, out: &mut [u8]
             };
             _mm_storeu_si128(h.add(r * 16) as *mut __m128i, v);
         }
-        // Pass 2: down the columns.
+        // Pass 2: down the columns. The mirrored rows E[i] = hq[m(i - 3)]
+        // interleaved in pairs P[s] = (E[s], E[s + 1]) byte by byte
+        // (columns 0-7, `lo`, and 8-15, `hi`); output row r is
+        // sum_p TAPS[p] . P[r + 2 p].
         let h = hq.as_ptr();
+        if fy == 0 {
+            for r in 0..bh {
+                st(dst.add(r * os), ld(h.add(r * 16)), bw);
+            }
+            return;
+        }
+        let e = |i: usize| ld(h.add(16 * mirror(i as isize - 3, bh as isize) as usize));
+        let mut lo = [_mm_setzero_si128(); 16 + 6];
+        let mut hi = [_mm_setzero_si128(); 16 + 6];
+        let mut prev = e(0);
+        for s in 0..bh + 6 {
+            let next = e(s + 1);
+            lo[s] = _mm_unpacklo_epi8(prev, next);
+            hi[s] = _mm_unpackhi_epi8(prev, next);
+            prev = next;
+        }
         for r in 0..bh {
-            let cur = ld(h.add(r * 16));
-            let v = if fy == 0 {
-                cur
-            } else {
-                let rows: [__m128i; 8] = std::array::from_fn(|t| {
-                    ld(h.add(16 * mirror(r as isize + t as isize - 3, bh as isize) as usize))
-                });
-                let mut lo = _mm_setzero_si128();
-                let mut hi = _mm_setzero_si128();
-                for p in 0..4 {
-                    let (x, y) = (rows[2 * p], rows[2 * p + 1]);
-                    lo = _mm_add_epi16(lo, _mm_maddubs_epi16(_mm_unpacklo_epi8(x, y), coef[p]));
-                    hi = _mm_add_epi16(hi, _mm_maddubs_epi16(_mm_unpackhi_epi8(x, y), coef[p]));
+            let mut sl = _mm_setzero_si128();
+            let mut sh = _mm_setzero_si128();
+            for p in 0..4 {
+                sl = _mm_add_epi16(sl, _mm_maddubs_epi16(lo[r + 2 * p], coef[p]));
+                if bw == 16 {
+                    sh = _mm_add_epi16(sh, _mm_maddubs_epi16(hi[r + 2 * p], coef[p]));
                 }
-                let half = _mm_packus_epi16(
-                    _mm_srai_epi16(_mm_add_epi16(lo, rnd), 5),
-                    _mm_srai_epi16(_mm_add_epi16(hi, rnd), 5),
-                );
-                match fy {
-                    1 => avg(cur, half, rcm),
-                    2 => half,
-                    _ => avg(half, ld(h.add((r + 1) * 16)), rcm),
-                }
+            }
+            let half = _mm_packus_epi16(
+                _mm_srai_epi16(_mm_add_epi16(sl, rnd), 5),
+                _mm_srai_epi16(_mm_add_epi16(sh, rnd), 5),
+            );
+            let v = match fy {
+                1 => avg(ld(h.add(r * 16)), half, rcm),
+                2 => half,
+                _ => avg(half, ld(h.add((r + 1) * 16)), rcm),
             };
             st(dst.add(r * os), v, bw);
         }
@@ -554,7 +566,115 @@ pub(super) unsafe fn qpel_avx2(
     os: usize,
 ) {
     // SAFETY: as documented.
-    unsafe { qpel_body(win, off, ws, a, out, os) }
+    unsafe {
+        if a.bw == 16 && (a.fx | a.fy) != 0 {
+            qpel16_avx2(win, off, ws, a, out, os)
+        } else {
+            qpel_body(win, off, ws, a, out, os)
+        }
+    }
+}
+
+/// The two halves of an AVX2 register of 16 bytes per lane, the sixteen
+/// 16-bit filter sums `s` (lane 0 outputs 0-7, lane 1 outputs 8-15)
+/// rounded, clipped and packed to 16 bytes in order.
+#[inline(always)]
+unsafe fn round_pack16(s: __m256i, rnd: __m256i) -> __m128i {
+    // SAFETY: AVX2 (the caller's target features).
+    unsafe {
+        let v = _mm256_srai_epi16(_mm256_add_epi16(s, rnd), 5);
+        let p = _mm256_packus_epi16(v, v);
+        _mm256_castsi256_si128(_mm256_permute4x64_epi64::<0b1000>(p))
+    }
+}
+
+/// Quarter-sample interpolation of a 16-wide block with both halves of
+/// each row (and each pair of rows) in one AVX2 register.
+#[target_feature(enable = "avx2")]
+unsafe fn qpel16_avx2(win: &[u8], off: usize, ws: usize, a: Interp, out: &mut [u8], os: usize) {
+    let Interp { bh, fx, fy, .. } = a;
+    let rc = a.rounding as i32;
+    // SAFETY: as `qpel_body`: the window reads are within `QPEL_READ`
+    // bytes of each of its `bh + 1` rows, the writes 16 bytes of each of
+    // `bh` output rows (asserted by `super::qpel_block`); `hq` holds 17
+    // rows of 16 and every row index read is mirrored into 0..=bh.
+    unsafe {
+        let src = win.as_ptr().add(off);
+        let dst = out.as_mut_ptr();
+        let rnd = _mm256_set1_epi16((16 - rc) as i16);
+        let rcm = _mm_set1_epi8(rc as i8);
+        let coef: [__m256i; 4] = std::array::from_fn(|p| {
+            _mm256_set1_epi16(((TAPS[p][1] as i16) << 8) | (TAPS[p][0] as u8 as i16))
+        });
+        let tabs: [__m256i; 4] = std::array::from_fn(|p| {
+            _mm256_loadu2_m128i(
+                H16[1][p].as_ptr() as *const __m128i,
+                H16[0][p].as_ptr() as *const __m128i,
+            )
+        });
+        let mut hq = [0u8; 17 * 16];
+        let h = hq.as_mut_ptr();
+        // Pass 1, the rows: with no vertical fraction the last window
+        // row is not needed.
+        let rows = if fy == 0 { bh } else { bh + 1 };
+        for r in 0..rows {
+            let p = src.add(r * ws);
+            let row = ld(p);
+            let v = if fx == 0 {
+                row
+            } else {
+                // Outputs 0-7 from samples 0-15, 8-15 from samples 5-20.
+                let w = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(row), ld(p.add(5)));
+                let mut s = _mm256_setzero_si256();
+                for q in 0..4 {
+                    s = _mm256_add_epi16(
+                        s,
+                        _mm256_maddubs_epi16(_mm256_shuffle_epi8(w, tabs[q]), coef[q]),
+                    );
+                }
+                let half = round_pack16(s, rnd);
+                match fx {
+                    1 => avg(row, half, rcm),
+                    2 => half,
+                    _ => avg(half, ld(p.add(1)), rcm),
+                }
+            };
+            if fy == 0 {
+                _mm_storeu_si128(dst.add(r * os) as *mut __m128i, v);
+            } else {
+                _mm_storeu_si128(h.add(r * 16) as *mut __m128i, v);
+            }
+        }
+        if fy == 0 {
+            return;
+        }
+        // Pass 2, the columns. The mirrored rows E[i] = hq[m(i - 3)]
+        // interleaved in pairs P[s] = (E[s], E[s + 1]), byte by byte:
+        // columns 0-7 in lane 0, 8-15 in lane 1. Output row r is
+        // sum_q TAPS[q] . P[r + 2 q].
+        let h = hq.as_ptr();
+        let e = |i: usize| ld(h.add(16 * mirror(i as isize - 3, bh as isize) as usize));
+        let mut pairs = [_mm256_setzero_si256(); 16 + 6];
+        let mut prev = e(0);
+        for (s, pr) in pairs.iter_mut().enumerate().take(bh + 6) {
+            let next = e(s + 1);
+            *pr = _mm256_set_m128i(_mm_unpackhi_epi8(prev, next), _mm_unpacklo_epi8(prev, next));
+            prev = next;
+        }
+        for r in 0..bh {
+            let mut s = _mm256_setzero_si256();
+            for q in 0..4 {
+                s = _mm256_add_epi16(s, _mm256_maddubs_epi16(pairs[r + 2 * q], coef[q]));
+            }
+            let half = round_pack16(s, rnd);
+            let v = match fy {
+                1 => avg(ld(h.add(r * 16)), half, rcm),
+                2 => half,
+                _ => avg(half, ld(h.add((r + 1) * 16)), rcm),
+            };
+            _mm_storeu_si128(dst.add(r * os) as *mut __m128i, v);
+        }
+    }
 }
 
 #[inline(always)]

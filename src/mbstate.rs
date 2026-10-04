@@ -111,6 +111,24 @@ impl MbState {
         }
     }
 
+    /// A copy of what vector prediction ([`MbState::mv_pred`],
+    /// [`MbState::get_mv`]) reads — packets and vectors — and nothing else
+    /// (the other fields empty): for the encoder's motion-search threads.
+    pub fn motion_view(&self) -> MbState {
+        MbState {
+            mbw: self.mbw,
+            mbh: self.mbh,
+            slice: self.slice.clone(),
+            kind: Vec::new(),
+            qp: Vec::new(),
+            pred: Vec::new(),
+            mv: self.mv.clone(),
+            field: Vec::new(),
+            field_mv: Vec::new(),
+            field_ref: Vec::new(),
+        }
+    }
+
     /// The index of macroblock `(x, y)` when it is inside the VOP and in
     /// video packet `slice`.
     #[inline]

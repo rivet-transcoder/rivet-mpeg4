@@ -69,6 +69,15 @@ impl Pic {
     /// the reference. DivX 5 streams of such sizes drift at the bottom
     /// edge when padding starts at the VOP boundary instead, and decode
     /// cleanly this way.
+    /// Copies `band`, a picture one macroblock row high and as wide as
+    /// this one, into macroblock row `mby`.
+    pub fn put_band(&mut self, band: &Pic, mby: usize) {
+        let (ys, cs) = (self.ystride() * 16, self.cstride() * 8);
+        self.y[mby * ys..(mby + 1) * ys].copy_from_slice(&band.y[..ys]);
+        self.cb[mby * cs..(mby + 1) * cs].copy_from_slice(&band.cb[..cs]);
+        self.cr[mby * cs..(mby + 1) * cs].copy_from_slice(&band.cr[..cs]);
+    }
+
     pub fn ref_plane(&self, i: usize) -> (&[u8], usize, i32, i32) {
         let (w, h) = ((self.mbw * 16) as i32, (self.mbh * 16) as i32);
         match i {
