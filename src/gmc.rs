@@ -39,8 +39,50 @@ fn div_round_up(n: i128, d: i128) -> i128 {
     (2 * n + d).div_euclid(2 * d)
 }
 
+/// One coordinate of a warp of at most three points, which is affine:
+/// `base + div_up(ai i + aj j + c, 2^shift)` at sample `(i, j)` (`///` of a
+/// power of two being `(n + d / 2) >> log2 d`). Along a row the numerator
+/// grows by `ai` a sample, so it is kept as a running sum: the same
+/// integers as evaluating the warp at each sample.
+#[derive(Clone, Copy, Debug)]
+struct Affine {
+    ai: i64,
+    aj: i64,
+    c: i64,
+    shift: u32,
+    base: i64,
+}
+
+impl Affine {
+    /// `n / d` with `d` a power of two (`div_up`'s divisor).
+    fn new(ai: i64, aj: i64, c: i64, d: i64, base: i64) -> Affine {
+        debug_assert!(d > 0 && d & (d - 1) == 0);
+        Affine {
+            ai,
+            aj,
+            c,
+            shift: d.trailing_zeros(),
+            base,
+        }
+    }
+
+    /// The numerator, rounding offset included, at `(i, j)`.
+    #[inline]
+    fn start(&self, i: i64, j: i64) -> i64 {
+        self.ai * i + self.aj * j + self.c + ((1i64 << self.shift) >> 1)
+    }
+
+    #[inline]
+    fn at(&self, n: i64) -> i64 {
+        self.base + (n >> self.shift)
+    }
+}
+
 pub(crate) struct Gmc {
     points: usize,
+    /// Without perspective: the luminance and chrominance warps as
+    /// [`Affine`] coordinates `[f, g]`.
+    lin: Option<([Affine; 2], [Affine; 2])>,
     persp: Option<Persp>,
     /// `s`, and its log2.
     s: i64,
@@ -128,8 +170,72 @@ impl Gmc {
         let j1pp = rd((w - wp) * (r * j0p) + wp * (r * j1p), w);
         let i2pp = rd((h - hp) * (r * i0p) + hp * (r * i2p), h);
         let j2pp = 16 * hp + rd((h - hp) * (r * j0p) + hp * (r * j2p - 16 * h), h);
+        let points = warping.len().min(4);
+        let lin = persp.is_none().then(|| {
+            let (a2, b2, c2) = (-r * i0p + i1pp, r * j0p - j1pp, -r * j0p + j1pp);
+            let (fi, fj) = ((-r * i0p + i1pp) * hp, (-r * i0p + i2pp) * wp);
+            let (gi, gj) = ((-r * j0p + j1pp) * hp, (-r * j0p + j2pp) * wp);
+            let a = |ai, aj, c, d, base| Affine::new(ai, aj, c, d, base);
+            // Chrominance sample (ic, jc) is warped at x = 4 ic + 1,
+            // y = 4 jc + 1: the coefficients times four, the ones added.
+            match points {
+                0 => (
+                    [a(s, 0, 0, 1, 0), a(0, s, 0, 1, 0)],
+                    [a(s, 0, 0, 1, 0), a(0, s, 0, 1, 0)],
+                ),
+                1 => (
+                    [a(s, 0, 0, 1, i0p), a(0, s, 0, 1, j0p)],
+                    [a(s, 0, 0, 1, div_up(i0p, 2)), a(0, s, 0, 1, div_up(j0p, 2))],
+                ),
+                2 => {
+                    let d = wp * r;
+                    (
+                        [a(a2, b2, 0, d, i0p), a(c2, a2, 0, d, j0p)],
+                        [
+                            a(
+                                4 * a2,
+                                4 * b2,
+                                a2 + b2 + 2 * wp * r * i0p - 16 * wp,
+                                4 * d,
+                                0,
+                            ),
+                            a(
+                                4 * c2,
+                                4 * a2,
+                                c2 + a2 + 2 * wp * r * j0p - 16 * wp,
+                                4 * d,
+                                0,
+                            ),
+                        ],
+                    )
+                }
+                _ => {
+                    let d = wp * hp * r;
+                    (
+                        [a(fi, fj, 0, d, i0p), a(gi, gj, 0, d, j0p)],
+                        [
+                            a(
+                                4 * fi,
+                                4 * fj,
+                                fi + fj + 2 * wp * hp * r * i0p - 16 * wp * hp,
+                                4 * d,
+                                0,
+                            ),
+                            a(
+                                4 * gi,
+                                4 * gj,
+                                gi + gj + 2 * wp * hp * r * j0p - 16 * wp * hp,
+                                4 * d,
+                                0,
+                            ),
+                        ],
+                    )
+                }
+            }
+        });
         Gmc {
-            points: warping.len().min(4),
+            points,
+            lin,
             persp,
             s,
             rho: s.trailing_zeros(),
@@ -255,8 +361,100 @@ impl Gmc {
         v.clamp(0, 255) as u8
     }
 
+    /// Bilinear samples along a row: `out[c]` at `(f, g)` of `warp`'s
+    /// sample `(i0 + c, j)`.
+    #[inline]
+    fn sample_row(
+        &self,
+        src: (&[u8], usize, i32, i32),
+        warp: &[Affine; 2],
+        (i0, j): (i64, i64),
+        rounding: bool,
+        out: &mut [u8],
+    ) {
+        let (p, stride, w, h) = src;
+        let [wf, wg] = warp;
+        let (mut nf, mut ng) = (wf.start(i0, j), wg.start(i0, j));
+        let s = self.s;
+        let round = s * s / 2 - rounding as i64;
+        let sh = 2 * self.rho;
+        // A translation (no more than one point): one fraction for the
+        // whole row, whose samples are consecutive — a fixed-weight
+        // bilinear filter over two rows when they lie inside.
+        if wf.shift == 0 && wg.shift == 0 && wf.ai == s && wg.ai == 0 {
+            let (f, g) = (wf.at(nf), wg.at(ng));
+            let (x, y) = (f >> self.rho, g >> self.rho);
+            let n = out.len() as i64;
+            if x >= 0 && y >= 0 && x + n < w as i64 && y < h as i64 - 1 {
+                let (ri, rj) = ((f & (s - 1)) as u32, (g & (s - 1)) as u32);
+                let s = s as u32;
+                let i = y as usize * stride + x as usize;
+                let (a, b) = (
+                    &p[i..i + out.len() + 1],
+                    &p[i + stride..i + stride + out.len() + 1],
+                );
+                let (wa, wb) = ((s - ri) * (s - rj), ri * (s - rj));
+                let (wc, wd) = ((s - ri) * rj, ri * rj);
+                let round = round as u32;
+                for (c, o) in out.iter_mut().enumerate() {
+                    let v = wa * a[c] as u32
+                        + wb * a[c + 1] as u32
+                        + wc * b[c] as u32
+                        + wd * b[c + 1] as u32;
+                    *o = ((v + round) >> sh) as u8;
+                }
+                return;
+            }
+        }
+        for o in out.iter_mut() {
+            let (f, g) = (wf.at(nf), wg.at(ng));
+            nf += wf.ai;
+            ng += wg.ai;
+            let (x, y) = (f >> self.rho, g >> self.rho);
+            if x >= 0 && y >= 0 && x < w as i64 - 1 && y < h as i64 - 1 {
+                let (ri, rj) = (f & (s - 1), g & (s - 1));
+                let i = y as usize * stride + x as usize;
+                let (a, b) = (p[i] as i64, p[i + 1] as i64);
+                let (c, d) = (p[i + stride] as i64, p[i + stride + 1] as i64);
+                let top = (s - ri) * a + ri * b;
+                let bot = (s - ri) * c + ri * d;
+                *o = (((s - rj) * top + rj * bot + round) >> sh).clamp(0, 255) as u8;
+            } else {
+                *o = self.sample(src, f, g, rounding);
+            }
+        }
+    }
+
     /// The prediction of macroblock `(mbx, mby)` from `src`.
     pub fn predict_mb(&self, src: &Pic, mbx: usize, mby: usize, rounding: bool, out: &mut MbPix) {
+        if let Some((lw, cw)) = &self.lin {
+            let (x0, y0) = (mbx as i64 * 16, mby as i64 * 16);
+            let luma = src.ref_plane(0);
+            for (r, row) in out.y.as_chunks_mut::<16>().0.iter_mut().enumerate() {
+                self.sample_row(luma, lw, (x0, y0 + r as i64), rounding, row);
+            }
+            let (x0, y0) = (mbx as i64 * 8, mby as i64 * 8);
+            for (plane, o) in [(1, &mut out.cb), (2, &mut out.cr)] {
+                let src = src.ref_plane(plane);
+                for (r, row) in o.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+                    self.sample_row(src, cw, (x0, y0 + r as i64), rounding, row);
+                }
+            }
+            return;
+        }
+        self.predict_mb_points(src, mbx, mby, rounding, out)
+    }
+
+    /// [`Gmc::predict_mb`] evaluating the warp at every sample (the
+    /// definition; what a perspective warp uses).
+    fn predict_mb_points(
+        &self,
+        src: &Pic,
+        mbx: usize,
+        mby: usize,
+        rounding: bool,
+        out: &mut MbPix,
+    ) {
         let luma = src.ref_plane(0);
         for r in 0..16 {
             for c in 0..16 {
@@ -280,8 +478,19 @@ impl Gmc {
     pub fn mb_vector(&self, mbx: usize, mby: usize) -> [i32; 2] {
         let (mut sx, mut sy) = (0i64, 0i64);
         for r in 0..16 {
-            for c in 0..16 {
-                let (i, j) = ((mbx * 16 + c) as i64, (mby * 16 + r) as i64);
+            let j = (mby * 16 + r) as i64;
+            let i0 = (mbx * 16) as i64;
+            if let Some(([wf, wg], _)) = &self.lin {
+                let (mut nf, mut ng) = (wf.start(i0, j), wg.start(i0, j));
+                for i in i0..i0 + 16 {
+                    sx += wf.at(nf) - self.s * i;
+                    sy += wg.at(ng) - self.s * j;
+                    nf += wf.ai;
+                    ng += wg.ai;
+                }
+                continue;
+            }
+            for i in i0..i0 + 16 {
                 let (f, g) = self.luma(i, j);
                 sx += f - self.s * i;
                 sy += g - self.s * j;
@@ -461,5 +670,130 @@ mod tests {
         // On the line from (256, 0) to (224, 224): 7 x + y = 7 * 256.
         assert!((7 * x + y - 7 * 256).abs() <= 8, "{x},{y}");
         assert_ne!((x, y), (240, 112));
+    }
+
+    /// The running-sum warp predicts what evaluating the warp at every
+    /// sample does, and gives the same macroblock vectors: every point
+    /// count and accuracy, trajectories small and large (reaching outside
+    /// the picture), odd sizes, both roundings.
+    #[test]
+    fn affine_rows_match_the_warp() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = move |n: i64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % (2 * n as u64 + 1)) as i64 - n
+        };
+        for (w, h) in [(64, 48), (176, 144), (200, 150)] {
+            let mut pic = Pic::new(w, h);
+            for (i, v) in pic.y.iter_mut().enumerate() {
+                *v = ((i * 37 + i / 64 * 11) % 251) as u8;
+            }
+            for (i, v) in pic.cb.iter_mut().enumerate() {
+                *v = ((i * 13 + 7) % 241) as u8;
+            }
+            for (i, v) in pic.cr.iter_mut().enumerate() {
+                *v = ((i * 29 + 3) % 239) as u8;
+            }
+            for trial in 0..300 {
+                let acc = (trial % 4) as u32;
+                let points = trial % 4;
+                let big = if trial % 3 == 0 { 400 } else { 24 };
+                let traj: Vec<(i32, i32)> = (0..points)
+                    .map(|_| (rnd(big) as i32, rnd(big) as i32))
+                    .collect();
+                let g = Gmc::new(&vol(w, h, acc, trial % 2 == 0), &traj, trial % 5 == 0);
+                assert!(g.lin.is_some());
+                let (mbw, mbh) = (w.div_ceil(16) as usize, h.div_ceil(16) as usize);
+                for mby in 0..mbh {
+                    for mbx in 0..mbw {
+                        for rounding in [false, true] {
+                            let mut a = MbPix::new();
+                            let mut b = MbPix::new();
+                            g.predict_mb(&pic, mbx, mby, rounding, &mut a);
+                            g.predict_mb_points(&pic, mbx, mby, rounding, &mut b);
+                            assert_eq!(a.y, b.y, "{traj:?} acc {acc} mb {mbx},{mby}");
+                            assert_eq!(a.cb, b.cb, "{traj:?} acc {acc} mb {mbx},{mby}");
+                            assert_eq!(a.cr, b.cr, "{traj:?} acc {acc} mb {mbx},{mby}");
+                        }
+                        let mut v = [0i64; 2];
+                        for r in 0..16 {
+                            for c in 0..16 {
+                                let (i, j) = ((mbx * 16 + c) as i64, (mby * 16 + r) as i64);
+                                let (f, gg) = g.luma(i, j);
+                                v[0] += f - g.s * i;
+                                v[1] += gg - g.s * j;
+                            }
+                        }
+                        let unit = if g.quarter { 4 } else { 2 };
+                        let d = 256 * g.s / unit;
+                        let rd = |n: i64| {
+                            if n >= 0 {
+                                (n + d / 2) / d
+                            } else {
+                                -((-n + d / 2) / d)
+                            }
+                        };
+                        assert_eq!(
+                            g.mb_vector(mbx, mby),
+                            [
+                                rd(v[0]).clamp(-16384, 16383) as i32,
+                                rd(v[1]).clamp(-16384, 16383) as i32
+                            ]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Prediction speed, the running-sum warp against the per-sample one:
+    /// `cargo test --release --lib gmc_speed -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn gmc_speed() {
+        let (w, h) = (1280u32, 720u32);
+        let mut pic = Pic::new(w, h);
+        for (i, v) in pic.y.iter_mut().enumerate() {
+            *v = ((i * 37 + i / 64 * 11) % 251) as u8;
+        }
+        for (points, traj) in [
+            (1, vec![(5, -3)]),
+            (2, vec![(5, -3), (9, 4)]),
+            (3, vec![(5, -3), (9, 4), (-6, 11)]),
+        ] {
+            let g = Gmc::new(&vol(w, h, 3, false), &traj, false);
+            let mut px = MbPix::new();
+            let time = |f: &mut dyn FnMut()| {
+                let mut best = f64::MAX;
+                for _ in 0..5 {
+                    let t = std::time::Instant::now();
+                    f();
+                    best = best.min(t.elapsed().as_secs_f64());
+                }
+                best * 1e9 / (80.0 * 45.0)
+            };
+            let fast = time(&mut || {
+                for mby in 0..45 {
+                    for mbx in 0..80 {
+                        g.predict_mb(&pic, mbx, mby, true, &mut px);
+                        std::hint::black_box(&px);
+                    }
+                }
+            });
+            let slow = time(&mut || {
+                for mby in 0..45 {
+                    for mbx in 0..80 {
+                        g.predict_mb_points(&pic, mbx, mby, true, &mut px);
+                        std::hint::black_box(&px);
+                    }
+                }
+            });
+            println!(
+                "GMC {points} point(s): {slow:.0} ns per macroblock per sample, {fast:.0} ns running sums ({:.1}x)",
+                slow / fast
+            );
+        }
     }
 }

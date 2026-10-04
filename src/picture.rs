@@ -95,20 +95,28 @@ impl Pic {
         vop_type: VopType,
         decode_index: u64,
     ) -> Frame {
-        let mut f = Frame::new(self.w, self.h);
-        f.timestamp = timestamp;
-        f.time_base = time_base;
-        f.vop_type = vop_type;
-        f.decode_index = decode_index;
+        // The planes' rows appended in order (no fill first), in the
+        // layout `Frame::new` makes.
+        let (planes, total) = Frame::layout(self.w, self.h);
+        let mut data = Vec::with_capacity(total);
         for i in 0..3 {
             let (src, stride, w, h) = self.plane(i);
             let (w, h) = (w as usize, h as usize);
-            let dst = f.plane_mut(i);
             for row in 0..h {
-                dst[row * w..row * w + w].copy_from_slice(&src[row * stride..row * stride + w]);
+                data.extend_from_slice(&src[row * stride..row * stride + w]);
             }
         }
-        f
+        Frame {
+            width: self.w,
+            height: self.h,
+            data,
+            planes,
+            timestamp,
+            time_base,
+            vop_type,
+            decode_index,
+            concealed: false,
+        }
     }
 
     /// From a [`Frame`] of the same size, the area beyond its edges

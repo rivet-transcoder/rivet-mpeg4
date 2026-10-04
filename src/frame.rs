@@ -83,7 +83,7 @@ impl Frame {
         (width.div_ceil(2), height.div_ceil(2))
     }
 
-    fn layout(width: u32, height: u32) -> ([Plane; 3], usize) {
+    pub(crate) fn layout(width: u32, height: u32) -> ([Plane; 3], usize) {
         let (cw, ch) = Self::chroma_size(width, height);
         let y = Plane {
             offset: 0,

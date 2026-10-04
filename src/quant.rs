@@ -30,16 +30,18 @@ impl Quant {
         let qp = qp as i32;
         let dc = (b[0] as i32 * dc_scaler as i32).clamp(MIN, MAX);
         if self.mpeg {
-            let mut sum = dc;
-            b[0] = dc as i16;
-            // Branch-free (a zero QF gives zero), so it vectorises.
-            for (v, &w) in b.iter_mut().zip(&self.intra_matrix).skip(1) {
-                let q = *v as i32;
-                // F'' = (2 QF W QP) / 16, truncating.
-                let f = (2 * q * w as i32 * qp / 16).clamp(MIN, MAX);
-                *v = f as i16;
+            // F'' = (2 QF W QP) / 16, truncating; branch-free over the whole
+            // block (a zero QF gives zero) so it vectorises, the DC put
+            // back after.
+            let w = &self.intra_matrix;
+            let mut sum = 0;
+            for i in 0..64 {
+                let f = (2 * b[i] as i32 * w[i] as i32 * qp / 16).clamp(MIN, MAX);
+                b[i] = f as i16;
                 sum += f;
             }
+            sum += dc - b[0] as i32;
+            b[0] = dc as i16;
             mismatch(b, sum);
         } else {
             b[0] = dc as i16;
@@ -51,12 +53,13 @@ impl Quant {
     pub fn inter(&self, b: &mut [i16; 64], qp: u32) {
         let qp = qp as i32;
         if self.mpeg {
+            let w = &self.inter_matrix;
             let mut sum = 0;
-            for (v, &w) in b.iter_mut().zip(&self.inter_matrix) {
-                let q = *v as i32;
+            for i in 0..64 {
+                let q = b[i] as i32;
                 // F'' = ((2 QF + sign(QF)) W QP) / 16, truncating.
-                let f = ((2 * q + q.signum()) * w as i32 * qp / 16).clamp(MIN, MAX);
-                *v = f as i16;
+                let f = ((2 * q + q.signum()) * w[i] as i32 * qp / 16).clamp(MIN, MAX);
+                b[i] = f as i16;
                 sum += f;
             }
             mismatch(b, sum);
@@ -126,11 +129,17 @@ pub(crate) fn quantise_h263(b: &mut [i16; 64], qp: u32, intra: bool) {
     };
     // |COF| <= 2^15 and 2 QP < 64: the multiplication is exact.
     let dz = if intra { 0 } else { qp as i32 / 2 };
-    for v in &mut b[from..] {
+    // The whole block, the intra DC put back after: a loop that
+    // vectorises.
+    let dc = b[0];
+    for v in b.iter_mut() {
         let c = *v as i32;
         let a = (c.abs() - dz).max(0) as u32;
         let l = rdiv::<32>(a, m).min(2047) as i32;
         *v = (if c < 0 { -l } else { l }) as i16;
+    }
+    if from == 1 {
+        b[0] = dc;
     }
 }
 
@@ -197,12 +206,18 @@ pub(crate) fn quantise_mpeg(b: &mut [i16; 64], qp: u32, intra: bool, r: &MpegRec
     // a = 8 |F| (+ W QP / 2) <= 8 * 2^15 + 3952 and W QP <= 7905, so
     // a W QP < 2^31: the multiplications are exact.
     let half = if intra { 1 } else { 0 };
-    for ((v, &w), &m) in b.iter_mut().zip(matrix).zip(t).skip(from) {
-        let c = *v as i32;
-        let d = w as i32 * qp;
+    // The whole block, the intra DC put back after: a loop that
+    // vectorises.
+    let dc = b[0];
+    for i in 0..64 {
+        let c = b[i] as i32;
+        let d = matrix[i] as i32 * qp;
         let a = 8 * c.abs() + ((d >> 1) & -half);
-        let l = rdiv::<31>(a as u32, m).min(2047) as i32;
-        *v = (if c < 0 { -l } else { l }) as i16;
+        let l = rdiv::<31>(a as u32, t[i]).min(2047) as i32;
+        b[i] = (if c < 0 { -l } else { l }) as i16;
+    }
+    if from == 1 {
+        b[0] = dc;
     }
 }
 

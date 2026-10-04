@@ -320,7 +320,7 @@ fn sad_matches_scalar() {
 fn kernel_speed() {
     use std::hint::black_box;
     use std::time::Instant;
-    fn time(mut f: impl FnMut()) -> f64 {
+    fn time(f: &mut dyn FnMut()) -> f64 {
         let n = 20_000;
         let mut best = f64::MAX;
         for _ in 0..7 {
@@ -346,7 +346,7 @@ fn kernel_speed() {
     let levels = Isa::all();
     let mut rows: Vec<(String, Vec<f64>)> = Vec::new();
     let mut row = |name: &str, f: &mut dyn FnMut(Isa)| {
-        let t = levels.iter().map(|&isa| time(|| f(isa))).collect();
+        let t = levels.iter().map(|&isa| time(&mut || f(isa))).collect();
         rows.push((name.to_string(), t));
     };
     row("idct 8x8", &mut |isa| {
@@ -404,6 +404,49 @@ fn kernel_speed() {
                 bh,
             ));
         });
+    }
+    // The forward quantisers: by division (what the encoder did) against
+    // the reciprocal multiplications, shown in the scalar and last columns.
+    {
+        use crate::quant::{
+            MpegRecips, quantise_h263, quantise_h263_div, quantise_mpeg, quantise_mpeg_div,
+        };
+        let m = crate::tables::DEFAULT_INTER_MATRIX;
+        let r = MpegRecips::new(&crate::tables::DEFAULT_INTRA_MATRIX, &m);
+        let n = levels.len();
+        let mut q = |name: &str, old: &mut dyn FnMut(), new: &mut dyn FnMut()| {
+            let (a, b) = (time(&mut *old), time(&mut *new));
+            let mut t = vec![f64::NAN; n];
+            t[0] = a;
+            t[n - 1] = b;
+            rows.push((name.to_string(), t));
+        };
+        q(
+            "quant h263 (div / mul)",
+            &mut || {
+                let mut b = black_box(samples);
+                quantise_h263_div(&mut b, black_box(7), false);
+                black_box(b);
+            },
+            &mut || {
+                let mut b = black_box(samples);
+                quantise_h263(&mut b, black_box(7), false);
+                black_box(b);
+            },
+        );
+        q(
+            "quant mpeg (div / mul)",
+            &mut || {
+                let mut b = black_box(samples);
+                quantise_mpeg_div(&mut b, black_box(7), false, &m);
+                black_box(b);
+            },
+            &mut || {
+                let mut b = black_box(samples);
+                quantise_mpeg(&mut b, black_box(7), false, &r);
+                black_box(b);
+            },
+        );
     }
     print!("{:<24}", "kernel (ns/call)");
     for isa in &levels {
