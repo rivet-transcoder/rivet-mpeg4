@@ -31,7 +31,7 @@ jobs:
         # whole suite again with MPEG4_FORCE_SCALAR=1.
         include:
           - { name: linux x86-64 (AVX2),   os: safewords-runners }
-          - { name: linux arm64 (NEON, QEMU),    os: safewords-runners, target: aarch64-unknown-linux-gnu }
+          - { name: linux arm64 (NEON) under QEMU,    os: safewords-runners, target: aarch64-unknown-linux-gnu }
     env:
       MPEG4_REQUIRE_SIMD: "1"
     steps:
@@ -87,7 +87,7 @@ jobs:
       matrix:
         include:
           - { name: x86-64, os: safewords-runners }
-          - { name: arm64 (QEMU),  os: safewords-runners, target: aarch64-unknown-linux-gnu }
+          - { name: arm64 under QEMU,  os: safewords-runners, target: aarch64-unknown-linux-gnu }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
