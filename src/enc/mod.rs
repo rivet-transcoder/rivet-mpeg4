@@ -162,13 +162,14 @@ pub struct EncoderConfig {
     /// [`Encoder::take_reconstructions`] (for measuring quality; costs a
     /// copy of every frame).
     pub keep_reconstructions: bool,
-    /// Worker threads; 0 asks for one per core. The stream is the same
-    /// for every count: B-VOPs are coded a macroblock row per thread
-    /// (each row's vector prediction starts afresh), and a P-VOP's motion
-    /// search runs as a wavefront (each macroblock once its left, upper
-    /// and upper-right neighbours are searched) before its macroblocks
-    /// are coded in order. Video packets ([`EncoderConfig::packet_bytes`])
-    /// end where the bits fall, so with them a VOP is coded on one thread.
+    /// Worker threads; 0 asks for one per core (up to 16). The stream is
+    /// the same for every count: B-VOPs are coded a macroblock row per
+    /// thread (each row's vector prediction starts afresh), and a P-VOP's
+    /// motion search runs as a wavefront (each macroblock once its left,
+    /// upper and upper-right neighbours are searched) on other threads
+    /// while this one codes the macroblocks in order. Video packets
+    /// ([`EncoderConfig::packet_bytes`]) end where the bits fall, so with
+    /// them a VOP is coded on one thread.
     pub threads: usize,
 }
 
@@ -754,7 +755,10 @@ impl Encoder {
     /// The worker threads for a VOP of `mbh` macroblock rows.
     fn threads(&self, mbh: usize) -> usize {
         let t = match self.cfg.threads {
-            0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+            // Beyond about 16 the serial parts (coding a P-VOP's
+            // macroblocks in order, I-VOPs) and starting threads per VOP
+            // outweigh more searchers.
+            0 => std::thread::available_parallelism().map_or(1, |n| n.get().min(16)),
             n => n,
         };
         t.min(mbh).max(1)

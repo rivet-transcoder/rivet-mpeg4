@@ -261,10 +261,10 @@ No other implementation is run, in tests or in CI.
   errors or concealment, never a panic.
 
 Single-threaded decode speed, release build, AMD Ryzen 9 9950X, measured
-on other encoders' streams (2026-10-02): 640x480
-Main profile with the MPEG quantiser about 1450 frames/s; 720x480 Xvid with
-B-VOPs about 750; 640x408 DivX quarter-sample about 680; 856x472 Xvid GMC
-with quarter-sample about 440.
+on other encoders' streams (2026-10-02, before the SIMD kernels below):
+640x480 Main profile with the MPEG quantiser about 1450 frames/s; 720x480
+Xvid with B-VOPs about 750; 640x408 DivX quarter-sample about 680; 856x472
+Xvid GMC with quarter-sample about 440.
 
 ### Points the standard leaves to a reading
 
@@ -360,6 +360,62 @@ from the standard alone, this is what the code does and what decided it:
 - *Four-point GMC*: chroma uses 7.8.5's chroma formula with `Ic = 4 ic +
   1`; a zero denominator (disallowed) falls back to no warp.
 
+## Speed
+
+The sample-processing kernels (`src/dsp`) have SIMD versions chosen at
+run time — SSE4.1 and AVX2 on x86-64, NEON on aarch64 — beside scalar
+ones that define them: the 8x8 inverse and forward DCTs, quarter-sample
+interpolation (the 8-tap filter, both passes, with its block-edge
+mirroring), half-sample interpolation with rounding control, and the
+encoder's SAD. Every level computes **the same integers** as the scalar
+code (the transforms keep their exact arithmetic, splitting the second
+pass's 40-bit products into two 32-bit halves), so pictures do not depend
+on the CPU and the encoder's reconstruction stays the decoder's.
+`MPEG4_FORCE_SCALAR=1` selects the scalar kernels; `mpeg4::kernel_level()`
+names the level in use. The tests compare every kernel with the scalar
+one on random and edge inputs at every level the CPU has, IEEE 1180 is
+measured at every level, and CI decodes the conformance and Xvid streams
+with both and requires every picture to be the same.
+
+Elsewhere: the forward quantisers multiply by reciprocals (exact, checked
+exhaustively), GMC warps of up to three points are evaluated as running
+sums (the same integers), whole-sample search candidates are compared
+with the reference in place, and the per-macroblock allocations are gone.
+
+The encoder uses threads (`EncoderConfig::threads`, 0 for one per core,
+up to 16) and writes **the same stream for any count**: B-VOP macroblock
+rows are independent (vector prediction restarts at each row) and are
+coded in parallel; a P-VOP's motion search runs as a wavefront on other
+threads (each macroblock once those above and to its upper right are
+searched — all that vector prediction and the candidates read) while one
+thread codes the macroblocks in order. Video packets end where the bits
+fall, so a VOP with them is coded on one thread. The decoder is
+single-threaded: a VOP's macroblocks depend on their neighbours, and
+video packets, the only independent part, are rare.
+
+Release build, Ryzen 9 9950X, a natural 1620x1080 clip cropped or
+extended to size, 30 frames; `sp`: Simple Profile, H.263 quantiser,
+half-sample, I- and P-VOPs; `asp`: two B-VOPs, quarter-sample, four
+vectors, MPEG quantiser (frames per second, 2026-10-04, fastest of five
+runs; before = this crate before the SIMD kernels and threads):
+
+| | before | scalar kernels | 1 thread | 16 threads |
+|---|---:|---:|---:|---:|
+| 720p `sp` encode | 60 | 75 | 171 | 232 |
+| 720p `asp` encode | 13 | 13 | 78 | 263 |
+| 1080p `sp` encode | 26 | 34 | 78 | 112 |
+| 1080p `asp` encode | 5.0 | 5.5 | 38 | 130 |
+| 720p `sp` decode | 316 | 420 | 675 | |
+| 720p `asp` decode | 217 | 203 | 639 | |
+| 1080p `sp` decode | 135 | 153 | 249 | |
+| 1080p `asp` decode | 105 | 109 | 213 | |
+
+`cargo run --release --example m4vbench -- CLIP.y4m 1280x720 30 asp 5 16`
+reproduces a row (it also checks every decoded picture against the
+encoder's reconstruction); `cargo test --release --lib kernel_speed --
+--ignored --nocapture` times each kernel at every level (an IDCT 2.3x,
+16x16 quarter-sample interpolation 15-24x, half-sample 13-20x on AVX2).
+
 ## Provenance and licensing
 
 Written from ISO/IEC 14496-2 (the 2001 edition's text, and the 1998
@@ -411,7 +467,8 @@ stream.extend(enc.finish()?);
 ```
 
 `examples/m4vdec.rs` decodes an AVI or raw stream, reports counts and
-timing, and writes chosen frames as PNG.
+timing, and writes chosen frames as PNG; `examples/m4vbench.rs` times
+encoding and decoding a YUV4MPEG2 clip.
 
 ## License
 
