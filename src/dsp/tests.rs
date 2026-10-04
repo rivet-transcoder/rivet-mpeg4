@@ -461,3 +461,97 @@ fn kernel_speed() {
         println!("{:>9.1}x", t[0] / t.last().unwrap());
     }
 }
+
+/// The vector GMC blocks against per-sample bilinear sampling: random
+/// affine warps at every accuracy (`s` 2 to 16), divisors up to 2^28 and
+/// numerators far beyond 32 bits, steps from a fraction of a sample to
+/// many, positions up to and past the plane's edges (where the kernel
+/// must decline), blocks of 8 or 16 columns and 1 to 16 rows, both
+/// roundings.
+#[test]
+fn gmc_blocks_match_scalar() {
+    let mut rng = Rng(0xfeed_beef);
+    let (w, h, stride) = (96i32, 64i32, 96usize);
+    let plane: Vec<u8> = (0..stride * h as usize).map(|_| rng.byte()).collect();
+    let levels = simd_levels();
+    let mut taken = 0;
+    for trial in 0..100_000u32 {
+        let rho = 1 + trial % 4;
+        let s = 1i64 << rho;
+        let cols = if trial % 2 == 0 { 16 } else { 8 };
+        let rows = 1 + (rng.next() % 16) as usize;
+        let rounding = trial % 3 == 0;
+        let shift = rng.range(0, 28) as u32;
+        let coord = |rng: &mut Rng, size: i32| {
+            let span = size as i64 * s;
+            let low = |rng: &mut Rng| (rng.next() as i64) & ((1i64 << shift) - 1);
+            let pos = rng.range(-(span as i32) / 8, span as i32 + span as i32 / 8) as i64;
+            let step = |rng: &mut Rng| match rng.next() % 5 {
+                0 => (rng.range(-2 * s as i32, 2 * s as i32) as i64) << shift,
+                1 => ((rng.range(-2 * s as i32, 2 * s as i32) as i64) << shift) + low(rng),
+                2 => rng.range(-8, 8) as i64,
+                3 => (rng.next() as i32) as i64 * 4096,
+                _ => 0,
+            };
+            WarpBlock {
+                n0: (pos << shift) + low(rng),
+                si: step(rng),
+                sj: step(rng),
+                shift,
+                base: rng.range(-200, 200) as i64,
+            }
+        };
+        let (f, g) = (coord(&mut rng, w), coord(&mut rng, h));
+        let mut want = vec![0u8; cols * rows];
+        let mut inside = true;
+        'all: for r in 0..rows {
+            for c in 0..cols {
+                let (Some(fp), Some(gp)) = (f.at(c as i64, r as i64), g.at(c as i64, r as i64))
+                else {
+                    inside = false;
+                    break 'all;
+                };
+                let (x, y) = (fp >> rho, gp >> rho);
+                if x < 0 || y < 0 || x >= w as i64 - 1 || y >= h as i64 - 1 {
+                    inside = false;
+                    break 'all;
+                }
+                let (ri, rj) = (fp & (s - 1), gp & (s - 1));
+                let i = y as usize * stride + x as usize;
+                let (a, b) = (plane[i] as i64, plane[i + 1] as i64);
+                let (cc, d) = (plane[i + stride] as i64, plane[i + stride + 1] as i64);
+                let top = (s - ri) * a + ri * b;
+                let bot = (s - ri) * cc + ri * d;
+                want[r * cols + c] = (((s - rj) * top + rj * bot + s * s / 2 - rounding as i64)
+                    >> (2 * rho))
+                    .clamp(0, 255) as u8;
+            }
+        }
+        for &isa in &levels {
+            let mut got = vec![0xa5u8; cols * rows];
+            if gmc_block(
+                isa,
+                &plane,
+                stride,
+                (w, h),
+                f,
+                g,
+                rho,
+                rounding,
+                &mut got,
+                cols,
+            ) {
+                assert!(
+                    inside,
+                    "{} took a block outside the plane: {f:?} {g:?}",
+                    isa.name()
+                );
+                assert_eq!(want, got, "{} rho {rho} {f:?} {g:?}", isa.name());
+                taken += 1;
+            }
+        }
+    }
+    if levels.iter().any(|i| i.name() == "avx2") {
+        assert!(taken > 5_000, "only {taken} blocks took the vector kernel");
+    }
+}

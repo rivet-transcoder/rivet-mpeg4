@@ -793,3 +793,95 @@ pub(super) unsafe fn sad_sse2(
             .wrapping_add(_mm_cvtsi128_si32(_mm_unpackhi_epi64(acc, acc)) as u32)
     }
 }
+
+/// GMC's bilinear samples over a block, eight lanes at a time: the warped
+/// positions from `super::WarpLanes` (lane `k` of a row's block `b` at
+/// column `8 b + k`), the two rows of each 2x2 neighbourhood gathered, and
+/// the scalar bilinear sum multiplied out:
+/// `((s - ri)(s - rj) a + ri (s - rj) b + (s - ri) rj c + ri rj d + s^2/2
+/// - rounding) >> 2 rho`, the same integers.
+///
+/// # Safety
+/// The CPU has AVX2; `super::gmc_lanes` accepted the block (every value
+/// fits 32 bits, every gather is inside `plane`); `cols` is a multiple of 8
+/// dividing `out.len()`.
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx2")]
+pub(super) unsafe fn gmc_block_avx2(
+    plane: &[u8],
+    stride: usize,
+    f: super::WarpLanes,
+    g: super::WarpLanes,
+    rho: u32,
+    rounding: bool,
+    out: &mut [u8],
+    cols: usize,
+) {
+    let s = 1i32 << rho;
+    let round = _mm256_set1_epi32(s * s / 2 - rounding as i32);
+    let lanes = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    let mask = _mm256_set1_epi32(s - 1);
+    let sv = _mm256_set1_epi32(s);
+    let byte = _mm256_set1_epi32(255);
+    let stride_v = _mm256_set1_epi32(stride as i32);
+    let rho_c = _mm_cvtsi32_si128(rho as i32);
+    let sh_c = _mm_cvtsi32_si128(2 * rho as i32);
+    let (fqs, frs) = (
+        _mm256_mullo_epi32(lanes, _mm256_set1_epi32(f.qs)),
+        _mm256_mullo_epi32(lanes, _mm256_set1_epi32(f.rs)),
+    );
+    let (gqs, grs) = (
+        _mm256_mullo_epi32(lanes, _mm256_set1_epi32(g.qs)),
+        _mm256_mullo_epi32(lanes, _mm256_set1_epi32(g.rs)),
+    );
+    let (fsh, gsh) = (
+        _mm_cvtsi32_si128(f.w.shift as i32),
+        _mm_cvtsi32_si128(g.w.shift as i32),
+    );
+    for (r, row) in out.chunks_exact_mut(cols).enumerate() {
+        let ((fq, frem), (gq, grem)) = (f.row(r), g.row(r));
+        for (b, o) in row.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+            let c0 = 8 * b as i32;
+            // The position of each lane: high part plus the low part's carry.
+            let pos = |q: i32, rem: i32, qs: i32, rs: i32, vq, vr, sh| {
+                let hi = _mm256_add_epi32(_mm256_set1_epi32(q + c0 * qs), vq);
+                let lo = _mm256_add_epi32(_mm256_set1_epi32(rem + c0 * rs), vr);
+                _mm256_add_epi32(hi, _mm256_srl_epi32(lo, sh))
+            };
+            let fv = pos(fq, frem, f.qs, f.rs, fqs, frs, fsh);
+            let gv = pos(gq, grem, g.qs, g.rs, gqs, grs, gsh);
+            let (x, ri) = (_mm256_sra_epi32(fv, rho_c), _mm256_and_si256(fv, mask));
+            let (y, rj) = (_mm256_sra_epi32(gv, rho_c), _mm256_and_si256(gv, mask));
+            let idx = _mm256_add_epi32(_mm256_mullo_epi32(y, stride_v), x);
+            // SAFETY: every index is a sample of the plane with its right
+            // neighbour, the row below, and the four bytes each gather
+            // reads inside `plane` (`gmc_lanes`).
+            let (top, bot) = unsafe {
+                let p = plane.as_ptr();
+                (
+                    _mm256_i32gather_epi32::<1>(p as *const i32, idx),
+                    _mm256_i32gather_epi32::<1>(p.add(stride) as *const i32, idx),
+                )
+            };
+            let a = _mm256_and_si256(top, byte);
+            let bb = _mm256_and_si256(_mm256_srli_epi32::<8>(top), byte);
+            let c = _mm256_and_si256(bot, byte);
+            let d = _mm256_and_si256(_mm256_srli_epi32::<8>(bot), byte);
+            let (si, sj) = (_mm256_sub_epi32(sv, ri), _mm256_sub_epi32(sv, rj));
+            let mut v = _mm256_mullo_epi32(_mm256_mullo_epi32(si, sj), a);
+            v = _mm256_add_epi32(v, _mm256_mullo_epi32(_mm256_mullo_epi32(ri, sj), bb));
+            v = _mm256_add_epi32(v, _mm256_mullo_epi32(_mm256_mullo_epi32(si, rj), c));
+            v = _mm256_add_epi32(v, _mm256_mullo_epi32(_mm256_mullo_epi32(ri, rj), d));
+            v = _mm256_srl_epi32(_mm256_add_epi32(v, round), sh_c);
+            // Eight values 0..=255: byte 0 of each 32-bit lane.
+            let p16 = _mm256_packus_epi32(v, v);
+            let p8 = _mm256_packus_epi16(p16, p16);
+            let res = _mm_unpacklo_epi32(
+                _mm256_castsi256_si128(p8),
+                _mm256_extracti128_si256::<1>(p8),
+            );
+            // SAFETY: `o` is eight bytes.
+            unsafe { _mm_storel_epi64(o.as_mut_ptr() as *mut __m128i, res) };
+        }
+    }
+}

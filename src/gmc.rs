@@ -11,6 +11,7 @@
 //! points the fourth corner `(W, H)` moves too, and the warp is the
 //! perspective transform of 7.8.5, in 128-bit integers.
 
+use crate::dsp::{self, Isa, WarpBlock};
 use crate::headers::VolHeader;
 use crate::picture::Pic;
 
@@ -79,6 +80,8 @@ impl Affine {
 }
 
 pub(crate) struct Gmc {
+    /// The kernel level for [`dsp::gmc_block`].
+    isa: Isa,
     points: usize,
     /// Without perspective: the luminance and chrominance warps as
     /// [`Affine`] coordinates `[f, g]`.
@@ -234,6 +237,7 @@ impl Gmc {
             }
         });
         Gmc {
+            isa: Isa::best(),
             points,
             lin,
             persp,
@@ -425,17 +429,60 @@ impl Gmc {
         }
     }
 
+    /// A `cols`-wide block of samples from `(i0, j0)` with the vector
+    /// kernel, when the level has one and the block lies inside the plane
+    /// (translations, a fixed filter per row, go by rows).
+    fn block(
+        &self,
+        src: (&[u8], usize, i32, i32),
+        warp: &[Affine; 2],
+        (i0, j0): (i64, i64),
+        rounding: bool,
+        out: &mut [u8],
+        cols: usize,
+    ) -> bool {
+        let [wf, wg] = warp;
+        if wf.shift == 0 && wg.shift == 0 && wf.ai == self.s && wg.ai == 0 {
+            return false;
+        }
+        let blk = |a: &Affine| WarpBlock {
+            n0: a.start(i0, j0),
+            si: a.ai,
+            sj: a.aj,
+            shift: a.shift,
+            base: a.base,
+        };
+        let (p, stride, w, h) = src;
+        dsp::gmc_block(
+            self.isa,
+            p,
+            stride,
+            (w, h),
+            blk(wf),
+            blk(wg),
+            self.rho,
+            rounding,
+            out,
+            cols,
+        )
+    }
+
     /// The prediction of macroblock `(mbx, mby)` from `src`.
     pub fn predict_mb(&self, src: &Pic, mbx: usize, mby: usize, rounding: bool, out: &mut MbPix) {
         if let Some((lw, cw)) = &self.lin {
             let (x0, y0) = (mbx as i64 * 16, mby as i64 * 16);
             let luma = src.ref_plane(0);
-            for (r, row) in out.y.as_chunks_mut::<16>().0.iter_mut().enumerate() {
-                self.sample_row(luma, lw, (x0, y0 + r as i64), rounding, row);
+            if !self.block(luma, lw, (x0, y0), rounding, &mut out.y, 16) {
+                for (r, row) in out.y.as_chunks_mut::<16>().0.iter_mut().enumerate() {
+                    self.sample_row(luma, lw, (x0, y0 + r as i64), rounding, row);
+                }
             }
             let (x0, y0) = (mbx as i64 * 8, mby as i64 * 8);
             for (plane, o) in [(1, &mut out.cb), (2, &mut out.cr)] {
                 let src = src.ref_plane(plane);
+                if self.block(src, cw, (x0, y0), rounding, o, 8) {
+                    continue;
+                }
                 for (r, row) in o.as_chunks_mut::<8>().0.iter_mut().enumerate() {
                     self.sample_row(src, cw, (x0, y0 + r as i64), rounding, row);
                 }
@@ -774,25 +821,30 @@ mod tests {
                 }
                 best * 1e9 / (80.0 * 45.0)
             };
-            let fast = time(&mut || {
-                for mby in 0..45 {
-                    for mbx in 0..80 {
-                        g.predict_mb(&pic, mbx, mby, true, &mut px);
-                        std::hint::black_box(&px);
+            let mut mbs = |g: &Gmc, per_sample: bool| {
+                time(&mut || {
+                    for mby in 0..45 {
+                        for mbx in 0..80 {
+                            if per_sample {
+                                g.predict_mb_points(&pic, mbx, mby, true, &mut px);
+                            } else {
+                                g.predict_mb(&pic, mbx, mby, true, &mut px);
+                            }
+                            std::hint::black_box(&px);
+                        }
                     }
-                }
-            });
-            let slow = time(&mut || {
-                for mby in 0..45 {
-                    for mbx in 0..80 {
-                        g.predict_mb_points(&pic, mbx, mby, true, &mut px);
-                        std::hint::black_box(&px);
-                    }
-                }
-            });
+                })
+            };
+            let fast = mbs(&g, false);
+            let slow = mbs(&g, true);
+            let mut gs = Gmc::new(&vol(w, h, 3, false), &traj, false);
+            gs.isa = Isa::SCALAR;
+            let sums = mbs(&gs, false);
             println!(
-                "GMC {points} point(s): {slow:.0} ns per macroblock per sample, {fast:.0} ns running sums ({:.1}x)",
-                slow / fast
+                "GMC {points} point(s), ns per macroblock: per sample {slow:.0}, running sums {sums:.0}, {} {fast:.0} ({:.1}x, {:.1}x)",
+                g.isa.name(),
+                slow / fast,
+                sums / fast
             );
         }
     }
