@@ -379,8 +379,10 @@ with both and requires every picture to be the same.
 
 Elsewhere: the forward quantisers multiply by reciprocals (exact, checked
 exhaustively), GMC warps of up to three points are evaluated as running
-sums (the same integers), whole-sample search candidates are compared
-with the reference in place, and the per-macroblock allocations are gone.
+sums (the same integers) and, on AVX2, a block at a time in vector lanes
+with gathered samples (2.4x the running sums; NEON has no gather),
+whole-sample search candidates are compared with the reference in place,
+and the per-macroblock allocations are gone.
 
 The encoder uses threads (`EncoderConfig::threads`, 0 for one per core,
 up to 16) and writes **the same stream for any count**: B-VOP macroblock
@@ -391,7 +393,11 @@ searched — all that vector prediction and the candidates read) while one
 thread codes the macroblocks in order. Video packets end where the bits
 fall, so a VOP with them is coded on one thread. The decoder is
 single-threaded: a VOP's macroblocks depend on their neighbours, and
-video packets, the only independent part, are rare.
+video packets, the only independent part, are rare. A reconstruction
+thread behind the parser was tried (2026-10-04) and did not pay: with the
+SIMD kernels reconstruction is a small part of decoding, parsing alone
+ran at 590-600 frames/s on the 720p clips against 560-610 for the whole
+decoder, and the pipelined decoder measured 520-585.
 
 Release build, Ryzen 9 9950X, a natural 1620x1080 clip cropped or
 extended to size, 30 frames; `sp`: Simple Profile, H.263 quantiser,
