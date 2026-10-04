@@ -13,7 +13,7 @@
 #[path = "../tests/common/mod.rs"]
 mod common;
 
-use mpeg4::{Encoder, EncoderConfig, RateControl};
+use mpeg4::{Encoder, EncoderConfig, Quantiser, RateControl};
 use std::path::Path;
 
 fn main() {
@@ -26,6 +26,7 @@ fn main() {
         c
     };
     let mut cases: Vec<(&str, EncoderConfig, u32)> = Vec::new();
+    let mut interlaced: Vec<(&str, EncoderConfig, u32, f64)> = Vec::new();
     cases.push(("simple", base(320, 240), 30));
     let mut c = base(320, 240);
     c.four_mv = true;
@@ -68,13 +69,46 @@ fn main() {
     c.four_mv = true;
     c.b_frames = 2;
     cases.push(("qpel_4mv_b", c, 30));
+    // Interlaced, field DCT and field prediction in P-VOPs (vectors from
+    // either reference field, near the picture's edges too), from
+    // interlaced content, either field first, the MPEG quantiser or
+    // H.263's, with and without B-VOPs (frame-predicted: Xvid's decoder
+    // misreads field-predicted B-VOP macroblocks, see
+    // `EncoderConfig::b_field_prediction`). The content moves slowly enough
+    // that no vector reaches past the border Xvid's decoder pads its
+    // references with.
+    for (name, tff, mpeg, b, w, h, speed) in [
+        ("interlaced_p_bff_mpeg", false, true, 0, 352, 288, 6.0),
+        ("interlaced_p_tff", true, false, 0, 320, 240, 6.0),
+        ("interlaced_b_bff_mpeg", false, true, 1, 352, 288, 2.0),
+        ("interlaced_b_tff", true, false, 2, 320, 240, 2.0),
+    ] {
+        let mut c = base(w, h);
+        c.interlaced = true;
+        c.top_field_first = tff;
+        c.b_frames = b;
+        if mpeg {
+            c.quantiser = Quantiser::mpeg_default();
+        }
+        interlaced.push((name, c, 30, speed));
+    }
 
-    for (name, cfg, n) in cases {
+    let all = cases
+        .into_iter()
+        .map(|(name, c, n)| (name, c, n, 0.0))
+        .chain(interlaced);
+    for (name, cfg, n, speed) in all {
         let (w, h) = (cfg.width, cfg.height);
+        let (cfg_interlaced, tff) = (cfg.interlaced, cfg.top_field_first);
         let mut enc = Encoder::new(cfg).expect("config");
         let mut stream = Vec::new();
         for t in 0..n {
-            stream.extend(enc.encode(&common::synth(w, h, t)).expect("encode"));
+            let src = if cfg_interlaced {
+                common::synth_interlaced(w, h, t, speed, tff)
+            } else {
+                common::synth(w, h, t)
+            };
+            stream.extend(enc.encode(&src).expect("encode"));
         }
         stream.extend(enc.finish().expect("finish"));
         std::fs::write(out.join(format!("{name}.m4v")), &stream).expect("write");

@@ -71,7 +71,8 @@ VOP's stuffing begins). Header errors and unsupported tools are errors.
 Each was found by another encoder's stream failing to parse, and each
 applies only where the standard's reading fails ([docs/CONFORMANCE.md](docs/CONFORMANCE.md)
 has the detail; the streams that showed the first five are no longer
-fetched, so only the last is still checked by an external stream):
+fetched and those that showed the last two are not kept, so only Xvid's
+resync markers are still checked by an external stream):
 
 - a VOL whose `vop_time_increment_resolution` does not match the
   increments its VOPs code (libavcodec 54) — the increment length is found
@@ -84,7 +85,14 @@ fetched, so only the last is still checked by an external stream):
 - padding after a VOP's stuffing (DivX 5's extra `0x7f`, runs of ones and
   zeros) or no stuffing at all when the data ends byte aligned;
 - Xvid's resync markers in B-VOPs, a bit longer than 6.3.5.2's when both
-  `vop_fcode`s are 1.
+  `vop_fcode`s are 1;
+- Xvid's and libavcodec's field direct mode, which predicts as though the
+  co-located macroblock's field vectors were zero (7.7.2.2 scales them):
+  applied when the stream's user data names either encoder (`XviD...`,
+  `Lavc...`);
+- libavcodec's video packets in B-VOPs that start after a run of
+  macroblocks over not-coded ones (which have no bits), their resync
+  marker in front of that run.
 
 ## What it encodes
 
@@ -110,7 +118,10 @@ Simple Profile I- and P-VOPs, and, with `EncoderConfig::b_frames`,
   VOL);
 - **interlaced coding**: frame or field DCT per macroblock, frame or field
   prediction (each field's vector from either reference field) in P-VOPs,
-  field direct mode in B-VOPs, either field order;
+  either field order; on request field prediction in B-VOPs
+  (`b_field_prediction`) and field direct mode (`field_direct`), both off
+  by default because Xvid's decoder misreads the first and Xvid's and
+  libavcodec's decoders read the second their own way (below);
 - **OBMC** (`obmc`): `obmc_disable` 0 — the encoder plans a VOP's motion
   before predicting, since a macroblock's overlapped prediction needs its
   right neighbour's vectors. OBMC is outside the Simple and Advanced
@@ -218,8 +229,8 @@ No other implementation is run, in tests or in CI.
   packets at CIF 43.5; short header 41.7 (sub-QCIF), 42.5 (QCIF), 43.3 (CIF
   with GOB headers) dB; interlaced CIF (synthetic interlaced content)
   41.4 dB at under a quarter of the progressive coding's size, with B-VOPs
-  39.4–39.5 dB using field direct mode (2 to 84 macroblocks per run), with
-  quarter-sample 40.5; OBMC 42.6–42.8 dB (one or four vectors, quarter-
+  (field-predicted B macroblocks, both quantisers) 40.7–41.4 dB, with
+  quarter-sample and field direct mode 40.9; OBMC 42.6–42.8 dB (one or four vectors, quarter-
   sample, packets); H.263 Advanced Prediction 42.5 / 42.8 dB (one / four
   vectors); forced I-VOPs land where asked, with and without B-VOPs.
 - **Published conformance streams** (`tests/conformance.rs`, fetched by
@@ -291,11 +302,34 @@ from the standard alone, this is what the code does and what decided it:
   vector as the co-located one (the skipped reading misparses DivX 5).
 - *Resync marker length in B-VOPs*: 16 + max(`vop_fcode_forward`,
   `vop_fcode_backward`) bits, and 18 where that gives 17 (Xvid's length).
-- *Field prediction* (unexercised by any sample: the interlaced stream
-  above uses field DCT only): field vectors are predicted from the frame
-  predictor with its vertical component halved (arithmetic shift), and
-  contribute the mean of their horizontal and the sum of their vertical
-  components to later prediction.
+- *Field prediction*: field vectors are predicted from the frame predictor
+  with its vertical component halved by `/` (toward zero: -41 gives -20),
+  and in P-VOPs contribute the mean of their horizontal and the sum of
+  their vertical components to later prediction. In B-VOPs each direction
+  keeps a predictor per field (7.7.2.2): a frame vector sets both, a field
+  vector its own field's (in frame units), and a frame vector is predicted
+  from the top field's. A field reads the frame's padding (7.6.4): below
+  the picture the top field takes the frame's last line, above it the
+  bottom field the first. Until 2026-10-03 the halving was an arithmetic
+  shift, B-VOP field vectors shared one predictor that took the
+  macroblock's frame vector, and each field was padded from its own edge
+  lines; an interlaced B-VOP stream written with libavcodec (MPEG
+  quantiser, field DCT and prediction, one B-VOP) had 50–85 wrong
+  macroblocks in every B-VOP, and its P-VOPs drifted at the edges.
+  Xvid's decoder reads this crate's P-VOPs the same way (the shift, or
+  each field's own padding, breaks the agreement).
+- *Field direct mode, as encoders write it*: Xvid's and libavcodec's
+  decoders take the co-located field vectors as zero — `MVf` and `MVb`
+  are `MVD` (`MVb` zero when `MVD` is), from the reference fields
+  7.7.2.2 names — and their encoders code for that. The decoder follows
+  them when the stream's user data names either; otherwise it scales the
+  vectors as 7.7.2.2 does. The encoder uses field direct mode only with
+  `EncoderConfig::field_direct`.
+- *Video packets after uncoded B macroblocks*: a B-VOP macroblock over a
+  not-coded one has no bits, so a resync marker in front of a run of them
+  can belong to a packet whose `macroblock_number` is the run's end
+  (libavcodec writes them so); those macroblocks are decoded (copied),
+  not concealed.
 - *Complexity estimation*: which statistics each VOP type carries
   (unexercised).
 - *RVLC escape*: Table B-23 prints the escape as `0000s` at both ends and

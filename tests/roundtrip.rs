@@ -490,26 +490,46 @@ fn run_interlaced(mut cfg: EncoderConfig, n: u32, speed: f64) -> (Run, mpeg4::De
 
 #[test]
 fn interlaced() {
-    for (b, tff, qpel) in [
-        (0u32, true, false),
-        (2, true, false),
-        (2, false, false),
-        (1, true, true),
+    for (b, tff, qpel, field_direct, mpeg) in [
+        (0u32, true, false, false, false),
+        (2, true, false, true, false),
+        (2, false, false, true, false),
+        (1, true, true, true, false),
+        (1, false, false, false, true),
+        (2, true, false, false, true),
     ] {
         let mut cfg = EncoderConfig::new(352, 288, 25);
         cfg.interlaced = true;
         cfg.top_field_first = tff;
         cfg.b_frames = b;
         cfg.quarter_sample = qpel;
+        cfg.field_direct = field_direct;
+        cfg.b_field_prediction = !qpel;
+        if mpeg {
+            cfg.quantiser = mpeg4::Quantiser::mpeg_default();
+        }
         cfg.gop_size = 12;
         let (r, st) = run_interlaced(cfg, 13, 6.0);
-        let label = format!("interlaced, {b} B-VOPs, top field first {tff}, quarter-sample {qpel}");
+        let label = format!(
+            "interlaced, {b} B-VOPs, top field first {tff}, quarter-sample {qpel}, field direct {field_direct}, MPEG quantiser {mpeg}"
+        );
         check(&r, 30.0, &label);
-        println!("{label}: {} field direct macroblocks", st.field_direct_mbs);
+        println!(
+            "{label}: {} field direct, {} field-predicted B macroblocks",
+            st.field_direct_mbs, st.field_predicted_b_mbs
+        );
         if b > 0 {
+            // Field direct mode only when asked for (and then only where
+            // it beats field prediction); B-VOP field prediction (a
+            // predictor per field and direction) always.
             assert!(
-                st.field_direct_mbs > 0,
-                "field direct mode was not exercised"
+                field_direct || st.field_direct_mbs == 0,
+                "field direct mode"
+            );
+            assert_eq!(
+                st.field_predicted_b_mbs > 0,
+                !qpel,
+                "B-VOP field prediction"
             );
         }
     }

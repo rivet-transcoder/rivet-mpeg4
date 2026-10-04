@@ -31,12 +31,62 @@ fn fetch(src: Src, x: i32, y: i32, ww: usize, wh: usize, out: &mut [u8]) {
     }
 }
 
+/// Where a prediction reads its reference samples from: a plane
+/// ([`Src`]) or one field of one ([`Field`]).
+pub(crate) trait Window: Copy {
+    /// Copies the `ww` x `wh` window whose top-left sample is `(x, y)`
+    /// into `out` (stride `ww`), with the reference's padding outside it.
+    fn fetch(self, x: i32, y: i32, ww: usize, wh: usize, out: &mut [u8]);
+}
+
+impl Window for Src<'_> {
+    #[inline]
+    fn fetch(self, x: i32, y: i32, ww: usize, wh: usize, out: &mut [u8]) {
+        fetch(self, x, y, ww, wh, out)
+    }
+}
+
+/// One field of a frame plane (`parity` 0 the top field's lines, 1 the
+/// bottom's), for field prediction: row `r` of the field is line
+/// `2r + parity` of the frame.
+///
+/// The padding is the frame's (7.6.4): a field line above or below the
+/// reconstructed area takes the value of the frame's nearest line, so
+/// below the picture the top field reads the frame's last line (a bottom
+/// field line) and above it the bottom field reads the first (a top field
+/// line) — not each field's own edge line.
+#[derive(Clone, Copy)]
+pub(crate) struct Field<'a> {
+    pub frame: Src<'a>,
+    pub parity: usize,
+}
+
+impl Window for Field<'_> {
+    #[inline]
+    fn fetch(self, x: i32, y: i32, ww: usize, wh: usize, out: &mut [u8]) {
+        let (plane, stride, pw, ph) = self.frame;
+        let par = self.parity as i32;
+        for r in 0..wh {
+            let line = (2 * (y + r as i32) + par).clamp(0, ph - 1) as usize;
+            let row = &plane[line * stride..];
+            let o = &mut out[r * ww..r * ww + ww];
+            if x >= 0 && x + ww as i32 <= pw {
+                o.copy_from_slice(&row[x as usize..x as usize + ww]);
+            } else {
+                for (c, v) in o.iter_mut().enumerate() {
+                    *v = row[(x + c as i32).clamp(0, pw - 1) as usize];
+                }
+            }
+        }
+    }
+}
+
 /// Half-sample prediction of a `bw` x `bh` block at `(x, y)` displaced by
 /// `(mvx, mvy)` half samples, with `rounding_control` (`vop_rounding_type`
 /// in P- and S-VOPs, 0 in B-VOPs and the short video header).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn halfpel(
-    src: Src,
+    src: impl Window,
     x: i32,
     y: i32,
     mvx: i32,
@@ -52,7 +102,7 @@ pub(crate) fn halfpel(
     let (fx, fy) = (mvx & 1, mvy & 1);
     let mut win = [0u8; 17 * 17];
     let ww = bw + 1;
-    fetch(src, ix, iy, ww, bh + 1, &mut win);
+    src.fetch(ix, iy, ww, bh + 1, &mut win);
     let rc = rounding as u32;
     for r in 0..bh {
         let o = &mut out[r * out_stride..r * out_stride + bw];
@@ -130,7 +180,7 @@ fn filter8(p: &[u8], n: usize, rc: i32, out: &mut [u8]) {
 /// what Xvid decodes (docs/CONFORMANCE.md).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qpel(
-    src: Src,
+    src: impl Window,
     x: i32,
     y: i32,
     mvx: i32,
@@ -146,7 +196,7 @@ pub(crate) fn qpel(
     let iy = y + (mvy >> 2);
     let (nw, nh) = (bw + 1, bh + 1);
     let mut full = [0u8; 17 * 17];
-    fetch(src, ix, iy, nw, nh, &mut full);
+    src.fetch(ix, iy, nw, nh, &mut full);
     if fx == 0 && fy == 0 {
         for r in 0..bh {
             out[r * out_stride..r * out_stride + bw].copy_from_slice(&full[r * nw..r * nw + bw]);
@@ -387,5 +437,29 @@ mod tests {
         let src: Src = (&p, w, w as i32, w as i32);
         qpel(src, 8, 8, 8, -4, 8, 8, false, &mut o, 8);
         assert_eq!(o[0], p[7 * w + 10]);
+    }
+
+    /// Field prediction pads like the frame (7.6.4): below the picture the
+    /// top field reads the frame's last line, a bottom-field line; above
+    /// it the bottom field reads the frame's first, a top-field line.
+    #[test]
+    fn field_windows_take_the_frame_padding() {
+        // 4 x 8 frame, line r holding 10 * r + column.
+        let p: Vec<u8> = (0..8u8)
+            .flat_map(|r| (0..4u8).map(move |c| 10 * r + c))
+            .collect();
+        let frame: Src = (&p, 4, 4, 8);
+        let mut out = [0u8; 4 * 6];
+        // Top field rows 2..8: frame lines 4, 6, then 7 (the last) thrice.
+        Field { frame, parity: 0 }.fetch(0, 2, 4, 6, &mut out);
+        let lines: Vec<u8> = out.chunks(4).map(|r| r[0] / 10).collect();
+        assert_eq!(lines, [4, 6, 7, 7, 7, 7]);
+        // Bottom field rows -2..4: frame line 0 (the first) twice, then 1, 3, 5, 7.
+        Field { frame, parity: 1 }.fetch(0, -2, 4, 6, &mut out);
+        let lines: Vec<u8> = out.chunks(4).map(|r| r[0] / 10).collect();
+        assert_eq!(lines, [0, 0, 1, 3, 5, 7]);
+        // Columns clamp as in a frame.
+        Field { frame, parity: 0 }.fetch(-2, 0, 4, 1, &mut out);
+        assert_eq!(&out[..4], &[0, 0, 0, 1]);
     }
 }

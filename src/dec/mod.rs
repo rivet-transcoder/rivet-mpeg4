@@ -131,6 +131,10 @@ pub struct Decoder {
     /// Interlaced streams whose P-VOPs carry `dct_type` in every coded
     /// macroblock (see `VopDec::dct_type_always`).
     dct_type_always: bool,
+    /// The stream's user data names Xvid or libavcodec, whose field direct
+    /// mode takes the co-located field vectors as zero (see
+    /// `VopDec::zero_field_direct`).
+    zero_field_direct: bool,
     /// `Tframe` of field direct mode: the first B-VOP's distance from its
     /// past reference (7.7.2.3).
     tframe: Option<i64>,
@@ -160,6 +164,9 @@ pub struct DecoderStats {
     /// Interlaced B-VOP macroblocks predicted in field direct mode (direct
     /// mode over a field-predicted macroblock, 7.7.2.3).
     pub field_direct_mbs: u64,
+    /// Interlaced B-VOP macroblocks with field prediction (a vector per
+    /// field and direction).
+    pub field_predicted_b_mbs: u64,
 }
 
 impl Default for Decoder {
@@ -200,6 +207,7 @@ impl Decoder {
             time_bits: None,
             divx_version: None,
             dct_type_always: false,
+            zero_field_direct: false,
             tframe: None,
         }
     }
@@ -331,6 +339,11 @@ impl Decoder {
     }
 
     fn user_data(&mut self, body: &[u8]) {
+        // Xvid ("XviD0074") and libavcodec ("Lavc62.28.101"; "FFmpeg" in
+        // its first versions) name themselves.
+        if body.starts_with(b"XviD") || body.starts_with(b"Lavc") || body.starts_with(b"FFmpeg") {
+            self.zero_field_direct = true;
+        }
         // DivX writes "DivX<version>b<build>" (DivX 5.00: "DivX500Build413")
         // with a trailing 'p' when the stream packs B-VOPs with the
         // following P-VOP.
@@ -569,14 +582,16 @@ impl Decoder {
             slice: 0,
             qp: h.quant,
             first_coded: true,
-            pmv: [[0, 0]; 2],
+            pmv: [[[0, 0]; 2]; 2],
             error: None,
             tail_ok: false,
             dct_type_always: self.dct_type_always,
+            zero_field_direct: self.zero_field_direct,
             field_times,
             rvlc_backward_mbs: 0,
             rvlc_discarded_mbs: 0,
             field_direct_mbs: 0,
+            field_b_mbs: 0,
             obmc: obmc && matches!(h.vop_type, VopType::P | VopType::S),
             obmc_pending: Vec::new(),
             mcsel: Vec::new(),
@@ -592,7 +607,7 @@ impl Decoder {
             d.slice = 0;
             d.qp = h.quant;
             d.first_coded = true;
-            d.pmv = [[0, 0]; 2];
+            d.pmv = [[[0, 0]; 2]; 2];
             d.run(r);
             if d.error.is_none() && d.tail_ok {
                 self.dct_type_always = true;
@@ -602,6 +617,7 @@ impl Decoder {
         self.stats.rvlc_backward_mbs += d.rvlc_backward_mbs;
         self.stats.rvlc_discarded_mbs += d.rvlc_discarded_mbs;
         self.stats.field_direct_mbs += d.field_direct_mbs;
+        self.stats.field_predicted_b_mbs += d.field_b_mbs;
         let concealed = error.is_some();
         self.stats.vops += 1;
         if concealed {

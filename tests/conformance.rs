@@ -189,11 +189,12 @@ fn check_set(sub: &str, ext: &str, limits: &[(&str, u8, f64)]) {
             }
         }
         println!(
-            "{sub}/{name}: {} pictures (reference {}), {} concealed, {} misaligned, largest difference {}, worst luma PSNR {:.2} dB",
+            "{sub}/{name}: {} pictures (reference {}), {} concealed, {} misaligned, {} field direct macroblocks, largest difference {}, worst luma PSNR {:.2} dB",
             frames.len(),
             refs.len(),
             stats.concealed_vops,
             stats.misaligned_vops,
+            stats.field_direct_mbs,
             worst.0,
             worst.1
         );
@@ -267,6 +268,10 @@ fn rivet_encoder_in_xvid() {
             ("bitrate", 4, 52.0),
             ("qpel", 6, 48.0),
             ("qpel_4mv_b", 4, 52.0),
+            ("interlaced_p_bff_mpeg", 4, 52.0),
+            ("interlaced_p_tff", 4, 52.0),
+            ("interlaced_b_bff_mpeg", 4, 52.0),
+            ("interlaced_b_tff", 4, 52.0),
         ],
     );
 }

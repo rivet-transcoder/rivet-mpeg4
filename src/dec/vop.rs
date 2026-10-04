@@ -170,8 +170,10 @@ pub(crate) fn predict_fields(
     for f in 0..2 {
         let parity = refs[f] as usize;
         let [mx, my] = mvs[f];
-        let (p, stride, w, h) = src.ref_plane(0);
-        let field: mc::Src = (&p[parity * stride..], 2 * stride, w, h / 2);
+        let field = mc::Field {
+            frame: src.ref_plane(0),
+            parity,
+        };
         let (x, y) = (mbx as i32 * 16, mby as i32 * 8);
         let o = &mut out.y[f * 16..];
         if qpel {
@@ -182,8 +184,10 @@ pub(crate) fn predict_fields(
         let cx = chroma_mv_1(luma_to_halfpel(mx, qpel));
         let cy = chroma_mv_1(luma_to_halfpel(my, qpel));
         for (plane, dst) in [(1, &mut out.cb), (2, &mut out.cr)] {
-            let (p, stride, w, h) = src.ref_plane(plane);
-            let field: mc::Src = (&p[parity * stride..], 2 * stride, w, h / 2);
+            let field = mc::Field {
+                frame: src.ref_plane(plane),
+                parity,
+            };
             mc::halfpel(
                 field,
                 mbx as i32 * 8,
@@ -407,7 +411,11 @@ pub(crate) struct VopDec<'a> {
     pub slice: u32,
     pub qp: u32,
     pub first_coded: bool,
-    pub pmv: [[i32; 2]; 2],
+    /// B-VOP vector predictors, `[forward, backward][top field, bottom
+    /// field]` in frame units: a frame vector sets both of its direction's,
+    /// a field-predicted macroblock each field's (7.7.2.2), and frame
+    /// vectors are predicted from the top field's.
+    pub pmv: [[[i32; 2]; 2]; 2],
     /// Set when part of the VOP was concealed; the first error is kept.
     pub error: Option<Error>,
     /// Whether the macroblock data ended exactly where the VOP's stuffing
@@ -416,6 +424,13 @@ pub(crate) struct VopDec<'a> {
     /// Interlaced: read `dct_type` for every coded P/S-VOP macroblock, not
     /// only for intra ones and those with coded blocks (early Xvid).
     pub dct_type_always: bool,
+    /// Field direct mode as Xvid and libavcodec code and decode it: the
+    /// co-located macroblock's field vectors taken as zero, so each field
+    /// is predicted with `MVD` forward and backward from the reference
+    /// fields 7.7.2.2 names. 7.7.2.2 scales the field vectors by the field
+    /// distances (the default); both encoders write their streams for
+    /// their own reading (docs/CONFORMANCE.md).
+    pub zero_field_direct: bool,
     /// B-VOPs: the display times (ticks) of the past reference, this VOP
     /// and the future reference, and the frame period `Tframe` (7.7.2.3),
     /// for field direct mode.
@@ -426,6 +441,8 @@ pub(crate) struct VopDec<'a> {
     pub rvlc_discarded_mbs: u64,
     /// B-VOP macroblocks predicted in field direct mode.
     pub field_direct_mbs: u64,
+    /// B-VOP macroblocks with field prediction.
+    pub field_b_mbs: u64,
     /// Overlapped block motion compensation in this P- or S-VOP
     /// (`obmc_disable` 0, or H.263's Advanced Prediction mode).
     pub obmc: bool,
@@ -456,7 +473,7 @@ impl VopDec<'_> {
         self.slice = *self.slice_counter;
         self.qp = qp;
         self.first_coded = true;
-        self.pmv = [[0, 0]; 2];
+        self.pmv = [[[0, 0]; 2]; 2];
     }
 
     fn mb_xy(&self, mb: usize) -> (usize, usize) {
@@ -661,8 +678,18 @@ impl VopDec<'_> {
                     return Err(invalid("video packets out of order"));
                 }
                 if next > mb {
-                    self.record(invalid("macroblocks missing between video packets"));
-                    self.conceal(mb, next);
+                    if self.uncoded_b_run(mb, next) {
+                        // A B-VOP macroblock whose co-located macroblock
+                        // was not coded has no bits, so a packet that
+                        // starts after a run of them may have its marker
+                        // before them.
+                        for m in mb..next {
+                            self.mb(r, m)?;
+                        }
+                    } else {
+                        self.record(invalid("macroblocks missing between video packets"));
+                        self.conceal(mb, next);
+                    }
                 }
                 mb = next;
             }
@@ -676,13 +703,22 @@ impl VopDec<'_> {
         }
     }
 
+    /// Whether macroblocks `from..to` are all B-VOP macroblocks whose
+    /// co-located macroblock was not coded: macroblocks without any bits.
+    fn uncoded_b_run(&self, from: usize, to: usize) -> bool {
+        self.hdr.vop_type == VopType::B
+            && self
+                .col
+                .is_some_and(|c| (from..to).all(|m| c.kind.get(m) == Some(&MbKind::Skipped)))
+    }
+
     /// One macroblock, not data partitioned.
     /// Returns false when what was read was macroblock stuffing.
     fn mb(&mut self, r: &mut BitReader, mb: usize) -> Result<bool> {
         let (mbx, mby) = self.mb_xy(mb);
         if self.hdr.vop_type == VopType::B {
             if mbx == 0 {
-                self.pmv = [[0, 0]; 2];
+                self.pmv = [[[0, 0]; 2]; 2];
             }
             self.mb_b(r, mbx, mby)?;
             return Ok(true);
@@ -800,7 +836,8 @@ impl VopDec<'_> {
             h.mvs = [v; 4];
         } else if h.field_pred {
             let pred = self.st.mv_pred(mbx, mby, 0, self.slice);
-            let (mvs, frame) = read_field_mvs(r, pred, self.hdr.fcode_forward)?;
+            let mvs = read_field_mvs(r, [pred; 2], self.hdr.fcode_forward)?;
+            let frame = field_to_frame(mvs[0], mvs[1]);
             h.field_mvs = mvs;
             self.st.field_mv[mb] = mvs.map(|v| [v[0] as i16, v[1] as i16]);
             self.st.set_mb_mv(mbx, mby, frame);
@@ -1437,7 +1474,12 @@ impl VopDec<'_> {
                     self.hdr.top_field_first,
                     col.field_ref[mb],
                 );
-                let (mvf, mvb) = field_direct_vectors(col.field_mv[mb], mvd, trb, trd);
+                let colmv = if self.zero_field_direct {
+                    [[0; 2]; 2]
+                } else {
+                    col.field_mv[mb]
+                };
+                let (mvf, mvb) = field_direct_vectors(colmv, mvd, trb, trd);
                 field_direct_predict(
                     fwd,
                     bwd,
@@ -1458,6 +1500,7 @@ impl VopDec<'_> {
                 px.average(&pb);
             }
         } else if field_pred {
+            self.field_b_mbs += 1;
             let mut mvs = [[[0, 0]; 2]; 2];
             for (d, refd) in [(0, fwd), (1, bwd)] {
                 let used = if d == 0 {
@@ -1473,9 +1516,11 @@ impl VopDec<'_> {
                 } else {
                     self.hdr.fcode_backward
                 };
-                let (m, frame) = read_field_mvs(r, self.pmv[d], fcode)?;
+                let m = read_field_mvs(r, self.pmv[d], fcode)?;
                 mvs[d] = m;
-                self.pmv[d] = frame;
+                // Each field's predictor is its field vector in frame
+                // units.
+                self.pmv[d] = m.map(|v| [v[0], 2 * v[1]]);
                 let _ = refd;
             }
             let mut pb = MbPix::new();
@@ -1497,12 +1542,12 @@ impl VopDec<'_> {
             let mut mvf = [0, 0];
             let mut mvb = [0, 0];
             if t != BType::Backward {
-                mvf = read_mv(r, self.pmv[0], self.hdr.fcode_forward)?;
-                self.pmv[0] = mvf;
+                mvf = read_mv(r, self.pmv[0][0], self.hdr.fcode_forward)?;
+                self.pmv[0] = [mvf; 2];
             }
             if t != BType::Forward {
-                mvb = read_mv(r, self.pmv[1], self.hdr.fcode_backward)?;
-                self.pmv[1] = mvb;
+                mvb = read_mv(r, self.pmv[1][0], self.hdr.fcode_backward)?;
+                self.pmv[1] = [mvb; 2];
             }
             match t {
                 BType::Forward => predict_mb(fwd, mbx, mby, &[mvf; 4], false, false, qpel, &mut px),
@@ -1882,20 +1927,26 @@ fn tail_ok(r: &BitReader, sh: bool) -> bool {
     true
 }
 
+/// A field vector's predictor from a frame-unit predictor `pred`: its
+/// vertical component halved (field lines), the division truncating toward
+/// zero (`/`, clause 4).
+#[inline]
+pub(crate) fn field_pred(pred: [i32; 2]) -> [i32; 2] {
+    [pred[0], pred[1] / 2]
+}
+
 /// The two field vectors of a field-predicted macroblock (top field's,
-/// then bottom field's), each predicted from `pred` with its vertical
-/// component halved (field lines), and the frame vector the macroblock
-/// stands for in later prediction: the horizontal components averaged, the
-/// vertical ones summed (two field lines are one frame line).
+/// then bottom field's), each predicted from its predictor in `pred`
+/// (frame units; [`field_pred`]). A P-VOP gives both the macroblock's one
+/// predictor; a B-VOP keeps one per field (7.7.2.2).
 pub(crate) fn read_field_mvs(
     r: &mut BitReader,
-    pred: [i32; 2],
+    pred: [[i32; 2]; 2],
     fcode: u32,
-) -> Result<([[i32; 2]; 2], [i32; 2])> {
-    let fp = [pred[0], pred[1] >> 1];
-    let top = read_mv(r, fp, fcode)?;
-    let bot = read_mv(r, fp, fcode)?;
-    Ok(([top, bot], field_to_frame(top, bot)))
+) -> Result<[[i32; 2]; 2]> {
+    let top = read_mv(r, field_pred(pred[0]), fcode)?;
+    let bot = read_mv(r, field_pred(pred[1]), fcode)?;
+    Ok([top, bot])
 }
 
 /// The frame vector of a field-predicted macroblock.
@@ -2129,5 +2180,15 @@ mod tests {
         let (f, b) = field_direct_vectors([[10, -6], [4, 8]], [1, 0], [2, 2], [6, 6]);
         assert_eq!(f, [[4, -2], [2, 2]]);
         assert_eq!(b, [[-6, 4], [-2, -5]]);
+    }
+
+    /// A field vector's predictor halves the frame predictor's vertical
+    /// component toward zero (`/`), so -41 gives -20, not -21.
+    #[test]
+    fn field_predictor_truncates() {
+        assert_eq!(field_pred([10, -41]), [10, -20]);
+        assert_eq!(field_pred([6, -1]), [6, 0]);
+        assert_eq!(field_pred([-3, 7]), [-3, 3]);
+        assert_eq!(field_pred([0, -8]), [0, -4]);
     }
 }

@@ -15,7 +15,8 @@ use std::collections::VecDeque;
 use crate::bits::BitWriter;
 use crate::dec::vop::{
     MbPix, Motion, add_block, direct_vectors, field_direct_distances, field_direct_predict,
-    field_direct_vectors, field_to_frame, predict_fields, predict_mb, put_block, write_mb,
+    field_direct_vectors, field_pred, field_to_frame, predict_fields, predict_mb, put_block,
+    write_mb,
 };
 use crate::error::{Result, config};
 use crate::frame::{Frame, VopType};
@@ -110,12 +111,25 @@ pub struct EncoderConfig {
     /// than 14496-2's short-header subset.
     pub obmc: bool,
     /// Interlaced coding (an Advanced Simple tool): each macroblock picks
-    /// frame or field DCT, P-VOP macroblocks frame or field prediction (a
-    /// vector per field, from either reference field), and B-VOP direct
-    /// mode over a field-predicted macroblock uses field direct mode.
-    /// Not with data partitioning (which 14496-2's profiles exclude) or
-    /// the short video header.
+    /// frame or field DCT, and P-VOP macroblocks frame or field prediction
+    /// (a vector per field, from either reference field). Not with data
+    /// partitioning (which 14496-2's profiles exclude) or the short video
+    /// header.
     pub interlaced: bool,
+    /// Interlaced: B-VOP macroblocks may use field prediction too (a
+    /// vector per field and direction, each from either field of its
+    /// reference, predicted from its own field's predictor — 7.7.2.2).
+    /// Off by default: Xvid's decoder misreads it (its B-VOPs fall apart
+    /// and some are lost); libavcodec's reads it as this decoder does.
+    pub b_field_prediction: bool,
+    /// Interlaced: let B-VOP macroblocks over a field-predicted macroblock
+    /// use direct mode (field direct mode, 7.7.2.2). Off by default: Xvid's
+    /// and libavcodec's decoders do not scale the co-located macroblock's
+    /// field vectors there (they predict as though they were zero), so a
+    /// stream using it decodes differently in them; without it the
+    /// encoder codes those macroblocks in another mode, which every
+    /// decoder reads alike.
+    pub field_direct: bool,
     /// Interlaced: `top_field_first` (the top field is the earlier one).
     pub top_field_first: bool,
     /// Quarter-sample motion vectors (7.6.2.2's 8-tap interpolation), an
@@ -165,6 +179,8 @@ impl EncoderConfig {
             short_header: false,
             obmc: false,
             interlaced: false,
+            field_direct: false,
+            b_field_prediction: false,
             top_field_first: true,
             quarter_sample: false,
             quantiser: Quantiser::H263,
@@ -788,14 +804,16 @@ impl Encoder {
         let (mbw, mbh) = (self.st.mbw, self.st.mbh);
         self.new_slice();
         let mut packet_start = w.len_bits();
-        let mut pmv = [[0i32; 2]; 2];
+        // Vector predictors, [forward, backward][top field, bottom field]
+        // in frame units, as the decoder keeps them (7.7.2.2).
+        let mut pmv = [[[0i32; 2]; 2]; 2];
         for mb in 0..mbw * mbh {
             if self.maybe_packet(w, &mut packet_start, mb, &hdr) {
-                pmv = [[0, 0]; 2];
+                pmv = [[[0, 0]; 2]; 2];
             }
             let (mbx, mby) = (mb % mbw, mb / mbw);
             if mbx == 0 {
-                pmv = [[0, 0]; 2];
+                pmv = [[[0, 0]; 2]; 2];
             }
             self.code_b_mb(
                 w,
@@ -831,7 +849,7 @@ impl Encoder {
         qp: u32,
         (trb, trd): (i32, i32),
         field_times: [i64; 4],
-        pmv: &mut [[i32; 2]; 2],
+        pmv: &mut [[[i32; 2]; 2]; 2],
     ) {
         let mb = mby * self.st.mbw + mbx;
         let mut px = MbPix::new();
@@ -866,8 +884,8 @@ impl Encoder {
             &past.pic,
             mbx,
             mby,
-            pmv[0],
-            &[pmv[0], scale(trb)],
+            pmv[0][0],
+            &[pmv[0][0], scale(trb)],
             qp,
             false,
         );
@@ -876,8 +894,8 @@ impl Encoder {
             &future.pic,
             mbx,
             mby,
-            pmv[1],
-            &[pmv[1], scale(trb - trd)],
+            pmv[1][0],
+            &[pmv[1][0], scale(trb - trd)],
             qp,
             false,
         );
@@ -907,7 +925,8 @@ impl Encoder {
         mc::average(&mut pi.cr, &pb.cr);
         let fm = &future.motion;
         let mut pd = MbPix::new();
-        if fm.field[mb] && fm.kind[mb] == MbKind::Inter {
+        let field_col = fm.field[mb] && fm.kind[mb] == MbKind::Inter;
+        if field_col {
             // Field direct mode (7.7.2.3).
             let refs = fm.field_ref[mb];
             let (tb, td) = field_direct_distances(field_times, self.cfg.top_field_first, refs);
@@ -941,27 +960,104 @@ impl Encoder {
                 .sum()
         };
         let lambda = qp;
-        let costs = [
-            (BMode::Direct, sad(&pd.y)),
+        let field_bit = self.cfg.interlaced as u32;
+        let direct_cost = if field_col && !self.cfg.field_direct {
+            u32::MAX
+        } else {
+            sad(&pd.y)
+        };
+        let mut costs = vec![
+            (BMode::Direct, false, direct_cost),
             (
                 BMode::Forward,
-                sad(&pf.y) + lambda * (self.mv_bits(mvf, pmv[0]) + 4),
+                false,
+                sad(&pf.y) + lambda * (self.mv_bits(mvf, pmv[0][0]) + 4 + field_bit),
             ),
             (
                 BMode::Backward,
-                sad(&pb.y) + lambda * (self.mv_bits(mvb, pmv[1]) + 3),
+                false,
+                sad(&pb.y) + lambda * (self.mv_bits(mvb, pmv[1][0]) + 3 + field_bit),
             ),
             (
                 BMode::Interpolate,
-                sad(&pi.y) + lambda * (self.mv_bits(mvf, pmv[0]) + self.mv_bits(mvb, pmv[1]) + 2),
+                false,
+                sad(&pi.y)
+                    + lambda
+                        * (self.mv_bits(mvf, pmv[0][0])
+                            + self.mv_bits(mvb, pmv[1][0])
+                            + 2
+                            + field_bit),
             ),
         ];
-        let mode = costs.iter().min_by_key(|c| c.1).unwrap().0;
-        let px = match mode {
-            BMode::Direct => pd,
-            BMode::Forward => pf,
-            BMode::Backward => pb,
-            BMode::Interpolate => pi,
+        // Interlaced: field prediction, a vector per field and direction
+        // from either field of each reference, each field's vector
+        // predicted from its own predictor.
+        let mut fields = [([[0i32; 2]; 2], [false; 2]); 2];
+        let mut fpx = [MbPix::new(), MbPix::new(), MbPix::new()];
+        if self.cfg.interlaced && self.cfg.b_field_prediction {
+            for (d, (rf, start)) in [(&past.pic, mvf), (&future.pic, mvb)]
+                .into_iter()
+                .enumerate()
+            {
+                let start = [start[0], start[1] >> 1];
+                for (f, &p) in pmv[d].iter().enumerate() {
+                    let fp = field_pred(p);
+                    let mut best = (u32::MAX, [0, 0], false);
+                    for parity in [f == 1, f != 1] {
+                        let (v, sad) =
+                            self.search_field(src, rf, mbx, mby, f, parity, start, false);
+                        let c = sad + qp * self.mv_bits(v, fp);
+                        if c < best.0 {
+                            best = (c, v, parity);
+                        }
+                    }
+                    fields[d].0[f] = best.1;
+                    fields[d].1[f] = best.2;
+                }
+            }
+            let [(ffv, ffr), (fbv, fbr)] = fields;
+            let [f0, f1, f2] = &mut fpx;
+            predict_fields(&past.pic, mbx, mby, &ffv, ffr, false, qpel, f0);
+            predict_fields(&future.pic, mbx, mby, &fbv, fbr, false, qpel, f1);
+            *f2 = MbPix {
+                y: f0.y,
+                cb: f0.cb,
+                cr: f0.cr,
+            };
+            mc::average(&mut f2.y, &f1.y);
+            mc::average(&mut f2.cb, &f1.cb);
+            mc::average(&mut f2.cr, &f1.cr);
+            let bits = |d: usize| -> u32 {
+                (0..2)
+                    .map(|f| self.mv_bits(fields[d].0[f], field_pred(pmv[d][f])) + 1)
+                    .sum()
+            };
+            costs.push((
+                BMode::Forward,
+                true,
+                sad(&fpx[0].y) + lambda * (bits(0) + 5),
+            ));
+            costs.push((
+                BMode::Backward,
+                true,
+                sad(&fpx[1].y) + lambda * (bits(1) + 4),
+            ));
+            costs.push((
+                BMode::Interpolate,
+                true,
+                sad(&fpx[2].y) + lambda * (bits(0) + bits(1) + 3),
+            ));
+        }
+        let (mode, field_pred_mb, _) = *costs.iter().min_by_key(|c| c.2).unwrap();
+        let [fp0, fp1, fp2] = fpx;
+        let px = match (mode, field_pred_mb) {
+            (BMode::Direct, _) => pd,
+            (BMode::Forward, false) => pf,
+            (BMode::Backward, false) => pb,
+            (BMode::Interpolate, false) => pi,
+            (BMode::Forward, true) => fp0,
+            (BMode::Backward, true) => fp1,
+            (BMode::Interpolate, true) => fp2,
         };
         let field_dct = self.cfg.interlaced && prefer_field_dct(&luma_residual(src, mbx, mby, &px));
         let mut levels = [[0i16; 64]; 6];
@@ -995,22 +1091,41 @@ impl Encoder {
                     w.put(1, 0); // dbquant: no change
                 }
             }
+            let uses = [
+                matches!(mode, BMode::Forward | BMode::Interpolate),
+                matches!(mode, BMode::Backward | BMode::Interpolate),
+            ];
             if self.cfg.interlaced {
-                // interlaced_information(): frame prediction only.
+                // interlaced_information()
                 if cbp != 0 {
                     w.put(1, field_dct as u32);
                 }
                 if mode != BMode::Direct {
-                    w.put(1, 0); // field_prediction
+                    w.put(1, field_pred_mb as u32);
+                    if field_pred_mb {
+                        for d in 0..2 {
+                            if uses[d] {
+                                w.put(1, fields[d].1[0] as u32);
+                                w.put(1, fields[d].1[1] as u32);
+                            }
+                        }
+                    }
                 }
             }
-            if matches!(mode, BMode::Forward | BMode::Interpolate) {
-                self.put_mv(w, mvf, pmv[0]);
-                pmv[0] = mvf;
-            }
-            if matches!(mode, BMode::Backward | BMode::Interpolate) {
-                self.put_mv(w, mvb, pmv[1]);
-                pmv[1] = mvb;
+            for (d, mv) in [mvf, mvb].into_iter().enumerate() {
+                if !uses[d] {
+                    continue;
+                }
+                if field_pred_mb {
+                    for (v, p) in fields[d].0.into_iter().zip(pmv[d]) {
+                        self.put_mv(w, v, field_pred(p));
+                    }
+                    // Each field's predictor: its vector in frame units.
+                    pmv[d] = fields[d].0.map(|v| [v[0], 2 * v[1]]);
+                } else {
+                    self.put_mv(w, mv, pmv[d][0]);
+                    pmv[d] = [mv; 2];
+                }
             }
             if mode == BMode::Direct {
                 // MVDB (0, 0), f_code 1.
@@ -1239,7 +1354,7 @@ impl Encoder {
         // than the frame vector, rate included.
         let mut field: Option<([[i32; 2]; 2], [bool; 2])> = None;
         if self.cfg.interlaced && !four {
-            let fp = [pred0[0], pred0[1] >> 1];
+            let fp = field_pred(pred0);
             let start = [mv[0], mv[1] >> 1];
             let mut fsad = 0;
             let mut fmv = [[0; 2]; 2];
@@ -1358,7 +1473,7 @@ impl Encoder {
         syn.field_dct = field_dct && cbp != 0;
         let field_dct = syn.field_dct;
         if let Some((fmv, fref)) = field {
-            let fp = [pred0[0], pred0[1] >> 1];
+            let fp = field_pred(pred0);
             syn.field_pred = Some(fref);
             syn.mvd.push(self.mv_diff(fmv[0], fp));
             syn.mvd.push(self.mv_diff(fmv[1], fp));
@@ -1616,8 +1731,10 @@ impl Encoder {
         mv: [i32; 2],
         rounding: bool,
     ) -> u32 {
-        let (p, stride, w, h) = rf.ref_plane(0);
-        let fld: mc::Src = (&p[parity as usize * stride..], 2 * stride, w, h / 2);
+        let fld = mc::Field {
+            frame: rf.ref_plane(0),
+            parity: parity as usize,
+        };
         let (x, y) = (mbx as i32 * 16, mby as i32 * 8);
         let mut out = [0u8; 128];
         if self.cfg.quarter_sample {

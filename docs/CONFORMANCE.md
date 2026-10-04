@@ -46,8 +46,10 @@ against its SHA-256), builds the library and its two example programs,
 - **`rivet-enc/`**: this crate's encoder (`examples/m4venc.rs`: IPPP, four
   vectors, B-VOPs, video packets with and without B-VOPs and four vectors, a wide
   search with a larger `vop_fcode`, an odd size, quantisers 1 and 31,
-  bit-rate control) read by Xvid's decoder, against this crate's decode
-  (which equals the encoder's reconstruction byte for byte).
+  bit-rate control, interlaced coding with either field first and either
+  quantiser, with and without B-VOPs) read by Xvid's decoder, against
+  this crate's decode (which equals the encoder's reconstruction byte for
+  byte).
 
 Every stream must decode without error, concealment or misalignment, to as
 many pictures as Xvid's. The two inverse DCTs round differently within
@@ -72,6 +74,28 @@ pictures, worst picture's luma PSNR):
 | `oddsize` | 200x150, quarter-sample, B-VOPs | 3 | 56.4 dB | 4, 52 dB |
 
 What the comparison found:
+
+- **Interlaced coding** (`rivet-enc/interlaced_*`, added 2026-10-03, all
+  within 3 of Xvid, 59.1–64.9 dB). Xvid's own interlaced streams have no
+  field direct macroblocks and few vectors near the picture's edges, so
+  these are what check field prediction against another decoder. Xvid
+  agrees with field predictors halved toward zero and with the frame's
+  padding under each field (7.6.4); halving by an arithmetic shift, or
+  padding each field from its own edge lines, breaks the agreement in
+  every case. Three things Xvid's decoder does not read as this crate
+  does, which the encoder therefore leaves out by default:
+  - field direct mode: Xvid takes the co-located macroblock's field
+    vectors as zero (with that reading its pictures matched this crate's
+    to a sample); the decoder reads streams whose user data names Xvid
+    or libavcodec that way, and the encoder uses field direct mode only
+    with `EncoderConfig::field_direct`;
+  - field-predicted B-VOP macroblocks: Xvid's B-VOPs fall apart (16 dB)
+    and some are lost; `EncoderConfig::b_field_prediction` turns them on;
+  - vectors that reach well past the picture: a 352x288 top-field-first
+    stream of fast motion differs from the first P-VOP whose field vectors
+    point far below the picture, whichever padding this decoder uses —
+    a limit of the border Xvid pads its references with. The interlaced
+    cases move slowly enough not to reach it.
 
 - **Resync markers in B-VOPs.** 6.3.5.2 makes a B-VOP's marker
   16 + max(`vop_fcode_forward`, `vop_fcode_backward`) bits; with both codes
