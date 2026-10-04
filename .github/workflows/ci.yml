@@ -16,17 +16,29 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # The SIMD kernels (src/dsp) are checked bit-exact against the
+        # scalar ones on every host: SSE4.1 and AVX2 on x86-64, NEON on
+        # arm64. MPEG4_REQUIRE_SIMD makes a host without them fail rather
+        # than test the scalar kernels alone; the scalar step runs the
+        # whole suite again with MPEG4_FORCE_SCALAR=1.
         include:
-          - { name: linux x86-64,   os: ubuntu-latest }
-          - { name: linux arm64,    os: ubuntu-24.04-arm }
-          - { name: windows x86-64, os: windows-latest }
-          - { name: macos arm64,    os: macos-latest }
+          - { name: linux x86-64 (AVX2),   os: ubuntu-latest }
+          - { name: linux arm64 (NEON),    os: ubuntu-24.04-arm }
+          - { name: windows x86-64 (AVX2), os: windows-latest }
+          - { name: macos arm64 (NEON),    os: macos-latest }
+          - { name: macos 14 arm64 (NEON), os: macos-14 }
+    env:
+      MPEG4_REQUIRE_SIMD: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Tests
+      - name: Tests (SIMD kernels)
         run: cargo test --release
+      - name: Tests (scalar kernels)
+        run: cargo test --release
+        env:
+          MPEG4_FORCE_SCALAR: "1"
       - name: Property tests with overflow checks (debug)
         run: cargo test --test fuzz
       - name: Round-trip and RVLC damage figures
@@ -40,9 +52,19 @@ jobs:
   # and decodes those streams and this crate's encoder's with Xvid's
   # decoder. Without the sets the tests skip, so this job makes them and
   # requires them.
+  #
+  # Run on x86-64 and arm64, each with the SIMD kernels and with the scalar
+  # ones: every decoded picture of every stream must be the same both ways
+  # (MPEG4_DECODE_HASHES records a hash per stream).
   conformance:
-    name: conformance streams and Xvid
-    runs-on: ubuntu-latest
+    name: conformance streams and Xvid (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: x86-64, os: ubuntu-latest }
+          - { name: arm64,  os: ubuntu-24.04-arm }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -53,10 +75,22 @@ jobs:
           key: mpeg4-conformance-${{ hashFiles('tools/fetch-conformance.sh') }}
       - run: tools/fetch-conformance.sh
       - run: tools/xvid-vectors.sh
-      - name: Tests
+      - name: Tests (SIMD kernels)
         run: cargo test --release --test conformance -- --nocapture
         env:
           MPEG4_REQUIRE_CONFORMANCE: "1"
+          MPEG4_REQUIRE_SIMD: "1"
+          MPEG4_DECODE_HASHES: ${{ runner.temp }}/simd.txt
+      - name: Tests (scalar kernels)
+        run: cargo test --release --test conformance -- --nocapture
+        env:
+          MPEG4_REQUIRE_CONFORMANCE: "1"
+          MPEG4_FORCE_SCALAR: "1"
+          MPEG4_DECODE_HASHES: ${{ runner.temp }}/scalar.txt
+      - name: Every picture the same with either
+        run: |
+          sort "$RUNNER_TEMP/simd.txt" > "$RUNNER_TEMP/a" && sort "$RUNNER_TEMP/scalar.txt" > "$RUNNER_TEMP/b"
+          [ -s "$RUNNER_TEMP/a" ] && diff "$RUNNER_TEMP/a" "$RUNNER_TEMP/b" && wc -l < "$RUNNER_TEMP/a"
 
   msrv:
     name: MSRV (1.99)

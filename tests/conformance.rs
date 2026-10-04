@@ -42,6 +42,28 @@ fn dir(sub: &str) -> Option<PathBuf> {
     None
 }
 
+/// With `MPEG4_DECODE_HASHES=FILE`, appends `name hash` (FNV-1a of every
+/// decoded picture) to `FILE`: CI decodes the sets with the SIMD kernels
+/// and with `MPEG4_FORCE_SCALAR=1` and compares the two files.
+fn record(name: &str, frames: &[Frame]) {
+    let Some(path) = std::env::var_os("MPEG4_DECODE_HASHES") else {
+        return;
+    };
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for f in frames {
+        for &b in &f.data {
+            h = (h ^ b as u64).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("MPEG4_DECODE_HASHES");
+    writeln!(file, "{name} {} {h:016x}", frames.len()).expect("MPEG4_DECODE_HASHES");
+}
+
 /// Decodes every access unit of a stream; fails on any error.
 fn decode_all(name: &str, data: &[u8]) -> (Vec<Frame>, mpeg4::DecoderStats) {
     let s = media::load(data);
@@ -55,6 +77,7 @@ fn decode_all(name: &str, data: &[u8]) -> (Vec<Frame>, mpeg4::DecoderStats) {
         out.extend(d.decode(u).unwrap_or_else(|e| panic!("{name}: {e}")));
     }
     out.extend(d.flush());
+    record(name, &out);
     (out, d.stats().clone())
 }
 
@@ -178,7 +201,7 @@ fn check_set(sub: &str, ext: &str, limits: &[(&str, u8, f64)]) {
         let size = String::from_utf8(read("size")).unwrap();
         let mut wh = size.split_whitespace().map(|v| v.parse::<u32>().unwrap());
         let (w, h) = (wh.next().unwrap(), wh.next().unwrap());
-        let (frames, stats) = decode_all(name, &bits);
+        let (frames, stats) = decode_all(&format!("{sub}/{name}"), &bits);
         let refs = yuv_frames(&reference, w, h);
         let mut worst = (0u8, 99.0f64);
         for (i, (f, r)) in frames.iter().zip(&refs).enumerate() {

@@ -311,3 +311,110 @@ fn sad_matches_scalar() {
         }
     }
 }
+
+/// Kernel speed, each level against scalar (the code the kernels
+/// replaced): `cargo test --release --lib kernel_speed -- --ignored
+/// --nocapture`. Nanoseconds per call, the fastest of seven runs.
+#[test]
+#[ignore]
+fn kernel_speed() {
+    use std::hint::black_box;
+    use std::time::Instant;
+    fn time(mut f: impl FnMut()) -> f64 {
+        let n = 20_000;
+        let mut best = f64::MAX;
+        for _ in 0..7 {
+            let t = Instant::now();
+            for _ in 0..n {
+                f();
+            }
+            best = best.min(t.elapsed().as_nanos() as f64 / n as f64);
+        }
+        best
+    }
+    let mut rng = Rng(42);
+    let mut coefs = [0i16; 64];
+    for c in coefs.iter_mut().take(20) {
+        *c = rng.range(-300, 300) as i16;
+    }
+    let mut samples = [0i16; 64];
+    for c in samples.iter_mut() {
+        *c = rng.range(-255, 255) as i16;
+    }
+    let win = window(&mut rng, 0);
+    let mut out = [0u8; 16 * 16];
+    let levels = Isa::all();
+    let mut rows: Vec<(String, Vec<f64>)> = Vec::new();
+    let mut row = |name: &str, f: &mut dyn FnMut(Isa)| {
+        let t = levels.iter().map(|&isa| time(|| f(isa))).collect();
+        rows.push((name.to_string(), t));
+    };
+    row("idct 8x8", &mut |isa| {
+        let mut b = black_box(coefs);
+        idct_with(isa, &mut b);
+        black_box(b);
+    });
+    row("fdct 8x8", &mut |isa| {
+        let mut b = black_box(samples);
+        fdct_with(isa, &mut b);
+        black_box(b);
+    });
+    for (bw, bh) in [(16, 16), (8, 8)] {
+        for (fx, fy, what) in [
+            (0, 0, "full"),
+            (2, 0, "h half"),
+            (1, 3, "h+v quarter"),
+            (2, 2, "h+v half"),
+        ] {
+            row(&format!("qpel {bw}x{bh} {what}"), &mut |isa| {
+                let a = Interp {
+                    bw,
+                    bh,
+                    fx,
+                    fy,
+                    rounding: true,
+                };
+                qpel_block(isa, black_box(&win), 0, QPEL_READ, a, &mut out, 16);
+                black_box(&out);
+            });
+        }
+        for (fx, fy, what) in [(1, 0, "h"), (0, 1, "v"), (1, 1, "hv")] {
+            row(&format!("halfpel {bw}x{bh} {what}"), &mut |isa| {
+                let a = Interp {
+                    bw,
+                    bh,
+                    fx,
+                    fy,
+                    rounding: true,
+                };
+                halfpel_block(isa, black_box(&win), 0, QPEL_READ, a, &mut out, 16);
+                black_box(&out);
+            });
+        }
+        row(&format!("sad {bw}x{bh}"), &mut |isa| {
+            black_box(sad(
+                isa,
+                black_box(&win),
+                0,
+                QPEL_READ,
+                &win,
+                7,
+                QPEL_READ,
+                bw,
+                bh,
+            ));
+        });
+    }
+    print!("{:<24}", "kernel (ns/call)");
+    for isa in &levels {
+        print!("{:>10}", isa.name());
+    }
+    println!("{:>10}", "speed-up");
+    for (name, t) in rows {
+        print!("{name:<24}");
+        for v in &t {
+            print!("{v:>10.1}");
+        }
+        println!("{:>9.1}x", t[0] / t.last().unwrap());
+    }
+}
