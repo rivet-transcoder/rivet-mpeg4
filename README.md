@@ -360,6 +360,22 @@ from the standard alone, this is what the code does and what decided it:
 - *Four-point GMC*: chroma uses 7.8.5's chroma formula with `Ic = 4 ic +
   1`; a zero denominator (disallowed) falls back to no warp.
 
+### NEON on ARM hardware
+
+CI runs on x86-64 Linux only, so the NEON (aarch64) code paths are not tested
+there. They are verified by hand on ARM hardware (an aarch64 Linux machine,
+or Apple silicon) after a change to them and before a release:
+
+```sh
+MPEG4_REQUIRE_SIMD=1 cargo test --release
+MPEG4_FORCE_SCALAR=1 cargo test --release
+```
+
+The first run checks the NEON kernels bit-exact against the scalar ones; the
+second runs the whole suite on the scalar kernels. The conformance and Xvid
+streams can be run the same way, as the `conformance` job in
+`.github/workflows/ci.yml` does.
+
 ## Speed
 
 The sample-processing kernels (`src/dsp`) have SIMD versions chosen at
