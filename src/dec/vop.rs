@@ -262,9 +262,10 @@ pub(crate) fn put_block(
     field_dct: bool,
 ) {
     let (p, s, o) = block_pos(cur, mbx, mby, k, field_dct);
-    for r in 0..8 {
-        for c in 0..8 {
-            p[o + r * s + c] = blk[r * 8 + c].clamp(0, 255) as u8;
+    for (r, b) in blk.as_chunks::<8>().0.iter().enumerate() {
+        let row = &mut p[o + r * s..o + r * s + 8];
+        for (d, &v) in row.iter_mut().zip(b) {
+            *d = v.clamp(0, 255) as u8;
         }
     }
 }
@@ -279,10 +280,10 @@ pub(crate) fn add_block(
     field_dct: bool,
 ) {
     let (p, s, o) = block_pos(cur, mbx, mby, k, field_dct);
-    for r in 0..8 {
-        for c in 0..8 {
-            let d = &mut p[o + r * s + c];
-            *d = (*d as i32 + blk[r * 8 + c] as i32).clamp(0, 255) as u8;
+    for (r, b) in blk.as_chunks::<8>().0.iter().enumerate() {
+        let row = &mut p[o + r * s..o + r * s + 8];
+        for (d, &v) in row.iter_mut().zip(b) {
+            *d = (*d as i16 + v.clamp(-512, 512)).clamp(0, 255) as u8;
         }
     }
 }

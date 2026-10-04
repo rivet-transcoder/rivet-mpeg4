@@ -1,5 +1,7 @@
 //! The 8x8 inverse DCT of clause 7.4.4 (Annex A), in integer arithmetic,
-//! and the forward DCT the encoder uses.
+//! and the forward DCT the encoder uses. The transforms themselves are in
+//! `crate::dsp` (`scalar.rs` defines them; the SIMD versions compute the
+//! same integers).
 //!
 //! The standard defines the IDCT mathematically and requires an
 //! implementation to meet the accuracy of IEEE Std 1180-1990; the test that
@@ -10,100 +12,12 @@
 //! is integer throughout, so every platform reconstructs the same samples
 //! (which encoder and decoder rely on to stay in step).
 
-/// `BASIS[k][n] = round(65536 * c(k) * cos((2n + 1) k pi / 16))`, with
-/// `c(0) = sqrt(1/8)` and `c(k) = 1/2` otherwise: the orthonormal 8-point
-/// DCT-II basis.
-const BASIS: [[i64; 8]; 8] = [
-    [23170, 23170, 23170, 23170, 23170, 23170, 23170, 23170],
-    [32138, 27246, 18205, 6393, -6393, -18205, -27246, -32138],
-    [30274, 12540, -12540, -30274, -30274, -12540, 12540, 30274],
-    [27246, -6393, -32138, -18205, 18205, 32138, 6393, -27246],
-    [23170, -23170, -23170, 23170, 23170, -23170, -23170, 23170],
-    [18205, -32138, 6393, 27246, -27246, -6393, 32138, -18205],
-    [12540, -30274, 30274, -12540, -12540, 30274, -30274, 12540],
-    [6393, -18205, 27246, -32138, 32138, -27246, 18205, -6393],
-];
-
-/// One 8-point inverse transform: `out[n] = sum_k BASIS[k][n] * x[k]`, at
-/// 16 fractional bits.
-#[inline(always)]
-fn idct8(x: [i64; 8]) -> [i64; 8] {
-    let mut out = [0i64; 8];
-    for n in 0..4 {
-        let e = BASIS[0][n] * x[0] + BASIS[2][n] * x[2] + BASIS[4][n] * x[4] + BASIS[6][n] * x[6];
-        let o = BASIS[1][n] * x[1] + BASIS[3][n] * x[3] + BASIS[5][n] * x[5] + BASIS[7][n] * x[7];
-        out[n] = e + o;
-        out[7 - n] = e - o;
-    }
-    out
-}
-
-/// One 8-point forward transform: `out[k] = sum_n BASIS[k][n] * x[n]`.
-#[inline(always)]
-fn fdct8(x: [i64; 8]) -> [i64; 8] {
-    let s = [x[0] + x[7], x[1] + x[6], x[2] + x[5], x[3] + x[4]];
-    let d = [x[0] - x[7], x[1] - x[6], x[2] - x[5], x[3] - x[4]];
-    let mut out = [0i64; 8];
-    for k in 0..8 {
-        let v = if k & 1 == 0 { &s } else { &d };
-        out[k] = BASIS[k][0] * v[0] + BASIS[k][1] * v[1] + BASIS[k][2] * v[2] + BASIS[k][3] * v[3];
-    }
-    out
-}
-
-/// Inverse DCT of a raster-order coefficient block, in place. Coefficients
-/// are expected in [-2048, 2047] (the dequantiser saturates to that); the
-/// output is the unclipped residual or intra sample value.
-pub fn idct(block: &mut [i16; 64]) {
-    let mut tmp = [0i64; 64];
-    for r in 0..8 {
-        let row = &block[r * 8..r * 8 + 8];
-        if row[1..].iter().all(|&c| c == 0) {
-            // DC only: every output of the row is BASIS[0][n] * dc.
-            let v = (BASIS[0][0] * row[0] as i64 + 128) >> 8;
-            tmp[r * 8..r * 8 + 8].fill(v);
-            continue;
-        }
-        let x = std::array::from_fn(|k| row[k] as i64);
-        let y = idct8(x);
-        for n in 0..8 {
-            tmp[r * 8 + n] = (y[n] + 128) >> 8;
-        }
-    }
-    for c in 0..8 {
-        let x = std::array::from_fn(|k| tmp[k * 8 + c]);
-        let y = idct8(x);
-        for n in 0..8 {
-            let v = (y[n] + (1 << 23)) >> 24;
-            block[n * 8 + c] = v.clamp(i16::MIN as i64, i16::MAX as i64) as i16;
-        }
-    }
-}
-
-/// Forward DCT of a raster-order block of samples or residuals, in place,
-/// rounded to the nearest integer.
-pub fn fdct(block: &mut [i16; 64]) {
-    let mut tmp = [0i64; 64];
-    for r in 0..8 {
-        let x = std::array::from_fn(|n| block[r * 8 + n] as i64);
-        let y = fdct8(x);
-        for k in 0..8 {
-            tmp[r * 8 + k] = (y[k] + 128) >> 8;
-        }
-    }
-    for c in 0..8 {
-        let x = std::array::from_fn(|n| tmp[n * 8 + c]);
-        let y = fdct8(x);
-        for k in 0..8 {
-            let v = (y[k] + (1 << 23)) >> 24;
-            block[k * 8 + c] = v.clamp(-2048, 2047) as i16;
-        }
-    }
-}
+pub(crate) use crate::dsp::{fdct, idct};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dsp::Isa;
 
     /// The pseudo-random generator IEEE Std 1180-1990 specifies for its
     /// test data: integers uniformly in [-l, h].
@@ -171,7 +85,7 @@ mod tests {
 
     /// One IEEE 1180 run: `blocks` blocks of data in [-l, h] (negated when
     /// `sign` is -1), the tested IDCT against the double-precision one.
-    fn ieee1180_run(l: i64, h: i64, sign: i64, blocks: usize) -> Stats {
+    fn ieee1180_run(isa: Isa, l: i64, h: i64, sign: i64, blocks: usize) -> Stats {
         let c = cosines();
         let mut rng = Ieee1180Rand(1);
         let mut err = [0i64; 64];
@@ -191,7 +105,7 @@ mod tests {
                 blk[i] = q as i16;
             }
             let r = ref_idct(&fi, &c);
-            idct(&mut blk);
+            crate::dsp::idct_with(isa, &mut blk);
             for i in 0..64 {
                 let refv = (r[i].round() as i64).clamp(-256, 255);
                 let test = (blk[i] as i64).clamp(-256, 255);
@@ -218,6 +132,8 @@ mod tests {
     /// peak error <= 1, per-pixel mean square error <= 0.06, overall mean
     /// square error <= 0.02, per-pixel mean error <= 0.015, overall mean
     /// error <= 0.0015; and an all-zero block transforms to all zeros.
+    /// Every kernel level the CPU has is measured (they compute the same
+    /// integers, which `crate::dsp`'s tests check block for block).
     #[test]
     fn ieee_1180_accuracy() {
         let blocks = if cfg!(debug_assertions) {
@@ -225,19 +141,26 @@ mod tests {
         } else {
             10_000
         };
-        for (l, h) in [(256, 255), (5, 5), (300, 300)] {
-            for sign in [1, -1] {
-                let s = ieee1180_run(l, h, sign, blocks);
-                let msg = format!(
-                    "{blocks} blocks, L={l} H={h} sign={sign}: peak {} pmse {:.4} omse {:.4} pme {:.4} ome {:.5}",
-                    s.peak, s.pmse, s.omse, s.pme, s.ome
-                );
-                println!("{msg}");
-                assert!(s.peak <= 1, "{msg}");
-                assert!(s.pmse <= 0.06, "{msg}");
-                assert!(s.omse <= 0.02, "{msg}");
-                assert!(s.pme <= 0.015, "{msg}");
-                assert!(s.ome <= 0.0015, "{msg}");
+        for isa in Isa::all() {
+            for (l, h) in [(256, 255), (5, 5), (300, 300)] {
+                for sign in [1, -1] {
+                    let s = ieee1180_run(isa, l, h, sign, blocks);
+                    let msg = format!(
+                        "{} {blocks} blocks, L={l} H={h} sign={sign}: peak {} pmse {:.4} omse {:.4} pme {:.4} ome {:.5}",
+                        isa.name(),
+                        s.peak,
+                        s.pmse,
+                        s.omse,
+                        s.pme,
+                        s.ome
+                    );
+                    println!("{msg}");
+                    assert!(s.peak <= 1, "{msg}");
+                    assert!(s.pmse <= 0.06, "{msg}");
+                    assert!(s.omse <= 0.02, "{msg}");
+                    assert!(s.pme <= 0.015, "{msg}");
+                    assert!(s.ome <= 0.0015, "{msg}");
+                }
             }
         }
         let mut z = [0i16; 64];

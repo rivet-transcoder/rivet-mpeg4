@@ -5,20 +5,21 @@
 //! the value of the nearest sample on its boundary (the padding of 7.6.4;
 //! see `Pic::ref_plane` for which boundary).
 
+use crate::dsp::{self, Interp, Isa, QPEL_READ};
 use crate::tables::CHROMA_ROUND_16;
 
 /// A plane to predict from: `(samples, stride, valid width, valid height)`.
 pub(crate) type Src<'a> = (&'a [u8], usize, i32, i32);
 
 /// Copies the `ww` x `wh` window whose top-left sample is `(x, y)` into
-/// `out` (stride `ww`), clamping coordinates into the valid area.
+/// `out` (rows `os` apart), clamping coordinates into the valid area.
 #[inline]
-fn fetch(src: Src, x: i32, y: i32, ww: usize, wh: usize, out: &mut [u8]) {
+fn fetch(src: Src, x: i32, y: i32, ww: usize, wh: usize, out: &mut [u8], os: usize) {
     let (plane, stride, pw, ph) = src;
     if x >= 0 && y >= 0 && x + ww as i32 <= pw && y + wh as i32 <= ph {
         for r in 0..wh {
             let s = (y as usize + r) * stride + x as usize;
-            out[r * ww..r * ww + ww].copy_from_slice(&plane[s..s + ww]);
+            out[r * os..r * os + ww].copy_from_slice(&plane[s..s + ww]);
         }
         return;
     }
@@ -26,23 +27,49 @@ fn fetch(src: Src, x: i32, y: i32, ww: usize, wh: usize, out: &mut [u8]) {
         let sy = (y + r as i32).clamp(0, ph - 1) as usize * stride;
         for c in 0..ww {
             let sx = (x + c as i32).clamp(0, pw - 1) as usize;
-            out[r * ww + c] = plane[sy + sx];
+            out[r * os + c] = plane[sy + sx];
         }
     }
 }
 
-/// Where a prediction reads its reference samples from: a plane
-/// ([`Src`]) or one field of one ([`Field`]).
-pub(crate) trait Window: Copy {
-    /// Copies the `ww` x `wh` window whose top-left sample is `(x, y)`
-    /// into `out` (stride `ww`), with the reference's padding outside it.
-    fn fetch(self, x: i32, y: i32, ww: usize, wh: usize, out: &mut [u8]);
+/// `(samples, offset, stride)` of a window read in place.
+type View<'a> = Option<(&'a [u8], usize, usize)>;
+
+/// The window at `off` with rows `stride` apart, when its last row has
+/// `read` readable bytes.
+#[inline]
+fn view_of(plane: &[u8], off: usize, stride: usize, wh: usize, read: usize) -> View<'_> {
+    (off + (wh - 1) * stride + read <= plane.len()).then_some((plane, off, stride))
 }
 
-impl Window for Src<'_> {
+/// Where a prediction reads its reference samples from: a plane
+/// ([`Src`]) or one field of one ([`Field`]).
+pub(crate) trait Window<'a>: Copy {
+    /// Copies the `ww` x `wh` window whose top-left sample is `(x, y)`
+    /// into `out` (rows `os` apart), with the reference's padding outside
+    /// it.
+    fn fetch(self, x: i32, y: i32, ww: usize, wh: usize, out: &mut [u8], os: usize);
+
+    /// The window in place, when it lies inside the reconstructed area
+    /// (no padding needed) and its last row has `read` readable bytes
+    /// (`read >= ww`).
+    fn view(self, x: i32, y: i32, ww: usize, wh: usize, read: usize) -> View<'a>;
+}
+
+impl<'a> Window<'a> for Src<'a> {
     #[inline]
-    fn fetch(self, x: i32, y: i32, ww: usize, wh: usize, out: &mut [u8]) {
-        fetch(self, x, y, ww, wh, out)
+    fn fetch(self, x: i32, y: i32, ww: usize, wh: usize, out: &mut [u8], os: usize) {
+        fetch(self, x, y, ww, wh, out, os)
+    }
+
+    #[inline]
+    fn view(self, x: i32, y: i32, ww: usize, wh: usize, read: usize) -> View<'a> {
+        let (plane, stride, pw, ph) = self;
+        if x >= 0 && y >= 0 && x + ww as i32 <= pw && y + wh as i32 <= ph {
+            view_of(plane, y as usize * stride + x as usize, stride, wh, read)
+        } else {
+            None
+        }
     }
 }
 
@@ -61,15 +88,15 @@ pub(crate) struct Field<'a> {
     pub parity: usize,
 }
 
-impl Window for Field<'_> {
+impl<'a> Window<'a> for Field<'a> {
     #[inline]
-    fn fetch(self, x: i32, y: i32, ww: usize, wh: usize, out: &mut [u8]) {
+    fn fetch(self, x: i32, y: i32, ww: usize, wh: usize, out: &mut [u8], os: usize) {
         let (plane, stride, pw, ph) = self.frame;
         let par = self.parity as i32;
         for r in 0..wh {
             let line = (2 * (y + r as i32) + par).clamp(0, ph - 1) as usize;
             let row = &plane[line * stride..];
-            let o = &mut out[r * ww..r * ww + ww];
+            let o = &mut out[r * os..r * os + ww];
             if x >= 0 && x + ww as i32 <= pw {
                 o.copy_from_slice(&row[x as usize..x as usize + ww]);
             } else {
@@ -79,14 +106,31 @@ impl Window for Field<'_> {
             }
         }
     }
+
+    #[inline]
+    fn view(self, x: i32, y: i32, ww: usize, wh: usize, read: usize) -> View<'a> {
+        let (plane, stride, pw, ph) = self.frame;
+        let top = 2 * y + self.parity as i32;
+        if x >= 0 && x + ww as i32 <= pw && top >= 0 && top + 2 * (wh as i32 - 1) < ph {
+            view_of(
+                plane,
+                top as usize * stride + x as usize,
+                2 * stride,
+                wh,
+                read,
+            )
+        } else {
+            None
+        }
+    }
 }
 
 /// Half-sample prediction of a `bw` x `bh` block at `(x, y)` displaced by
 /// `(mvx, mvy)` half samples, with `rounding_control` (`vop_rounding_type`
 /// in P- and S-VOPs, 0 in B-VOPs and the short video header).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn halfpel(
-    src: impl Window,
+pub(crate) fn halfpel<'a>(
+    src: impl Window<'a>,
     x: i32,
     y: i32,
     mvx: i32,
@@ -99,60 +143,21 @@ pub(crate) fn halfpel(
 ) {
     let ix = x + (mvx >> 1);
     let iy = y + (mvy >> 1);
-    let (fx, fy) = (mvx & 1, mvy & 1);
-    let mut win = [0u8; 17 * 17];
-    let ww = bw + 1;
-    src.fetch(ix, iy, ww, bh + 1, &mut win);
-    let rc = rounding as u32;
-    for r in 0..bh {
-        let o = &mut out[r * out_stride..r * out_stride + bw];
-        let a = &win[r * ww..];
-        let b = &win[(r + 1) * ww..];
-        match (fx, fy) {
-            (0, 0) => o.copy_from_slice(&a[..bw]),
-            (1, 0) => {
-                for c in 0..bw {
-                    o[c] = ((a[c] as u32 + a[c + 1] as u32 + 1 - rc) >> 1) as u8;
-                }
-            }
-            (0, _) => {
-                for c in 0..bw {
-                    o[c] = ((a[c] as u32 + b[c] as u32 + 1 - rc) >> 1) as u8;
-                }
-            }
-            _ => {
-                for c in 0..bw {
-                    let s = a[c] as u32 + a[c + 1] as u32 + b[c] as u32 + b[c + 1] as u32;
-                    o[c] = ((s + 2 - rc) >> 2) as u8;
-                }
-            }
-        }
-    }
-}
-
-/// The 8-tap half-sample filter of 7.6.2.2 over the `n + 1` samples
-/// `p[0..=n]`, writing the `n` values between neighbours to `out`. Taps
-/// beyond the block's samples are mirrored back into it, the edge sample
-/// repeated (`p[-1] = p[0]`, `p[-2] = p[1]`, `p[n + 1] = p[n]`, ...).
-#[inline]
-fn filter8(p: &[u8], n: usize, rc: i32, out: &mut [u8]) {
-    // The row extended by three mirrored samples each side.
-    let mut e = [0i32; 17 + 6];
-    for (k, v) in e[..n + 7].iter_mut().enumerate() {
-        let i = k as isize - 3;
-        let m = if i < 0 {
-            -i - 1
-        } else if i > n as isize {
-            2 * n as isize + 1 - i
-        } else {
-            i
-        };
-        *v = p[m as usize] as i32;
-    }
-    for i in 0..n {
-        let e = &e[i..i + 8];
-        let v = 20 * (e[3] + e[4]) - 6 * (e[2] + e[5]) + 3 * (e[1] + e[6]) - (e[0] + e[7]);
-        out[i] = ((v + 16 - rc) >> 5).clamp(0, 255) as u8;
+    let a = Interp {
+        bw,
+        bh,
+        fx: (mvx & 1) as usize,
+        fy: (mvy & 1) as usize,
+        rounding,
+    };
+    let isa = Isa::best();
+    let (ww, wh) = (bw + 1, bh + 1);
+    if let Some((p, off, s)) = src.view(ix, iy, ww, wh, ww) {
+        dsp::halfpel_block(isa, p, off, s, a, out, out_stride);
+    } else {
+        let mut win = [0u8; 17 * 17];
+        src.fetch(ix, iy, ww, wh, &mut win, ww);
+        dsp::halfpel_block(isa, &win, 0, ww, a, out, out_stride);
     }
 }
 
@@ -179,8 +184,8 @@ fn filter8(p: &[u8], n: usize, rc: i32, out: &mut [u8]) {
 /// of those samples; the two-pass one is what the standard describes and
 /// what Xvid decodes (docs/CONFORMANCE.md).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn qpel(
-    src: impl Window,
+pub(crate) fn qpel<'a>(
+    src: impl Window<'a>,
     x: i32,
     y: i32,
     mvx: i32,
@@ -191,57 +196,23 @@ pub(crate) fn qpel(
     out: &mut [u8],
     out_stride: usize,
 ) {
-    let (fx, fy) = ((mvx & 3) as usize, (mvy & 3) as usize);
     let ix = x + (mvx >> 2);
     let iy = y + (mvy >> 2);
-    let (nw, nh) = (bw + 1, bh + 1);
-    let mut full = [0u8; 17 * 17];
-    src.fetch(ix, iy, nw, nh, &mut full);
-    if fx == 0 && fy == 0 {
-        for r in 0..bh {
-            out[r * out_stride..r * out_stride + bw].copy_from_slice(&full[r * nw..r * nw + bw]);
-        }
-        return;
-    }
-    let rc = rounding as i32;
-    let avg = |a: u8, b: u8| ((a as u32 + b as u32 + 1 - rc as u32) >> 1) as u8;
-    // Pass 1: every window row at the horizontal position, `bw` wide.
-    let mut hq = [0u8; 17 * 16];
-    let mut half = [0u8; 16];
-    for r in 0..nh {
-        let row = &full[r * nw..r * nw + nw];
-        let o = &mut hq[r * bw..r * bw + bw];
-        match fx {
-            0 => o.copy_from_slice(&row[..bw]),
-            _ => {
-                filter8(row, bw, rc, &mut half);
-                for c in 0..bw {
-                    o[c] = match fx {
-                        1 => avg(row[c], half[c]),
-                        2 => half[c],
-                        _ => avg(half[c], row[c + 1]),
-                    };
-                }
-            }
-        }
-    }
-    // Pass 2: every column of those at the vertical position.
-    let mut col = [0u8; 17];
-    for c in 0..bw {
-        for r in 0..nh {
-            col[r] = hq[r * bw + c];
-        }
-        if fy != 0 {
-            filter8(&col, bh, rc, &mut half);
-        }
-        for r in 0..bh {
-            out[r * out_stride + c] = match fy {
-                0 => col[r],
-                1 => avg(col[r], half[r]),
-                2 => half[r],
-                _ => avg(half[r], col[r + 1]),
-            };
-        }
+    let a = Interp {
+        bw,
+        bh,
+        fx: (mvx & 3) as usize,
+        fy: (mvy & 3) as usize,
+        rounding,
+    };
+    let isa = Isa::best();
+    let (ww, wh) = (bw + 1, bh + 1);
+    if let Some((p, off, s)) = src.view(ix, iy, ww, wh, QPEL_READ) {
+        dsp::qpel_block(isa, p, off, s, a, out, out_stride);
+    } else {
+        let mut win = [0u8; 17 * QPEL_READ];
+        src.fetch(ix, iy, ww, wh, &mut win, QPEL_READ);
+        dsp::qpel_block(isa, &win, 0, QPEL_READ, a, out, out_stride);
     }
 }
 
@@ -330,7 +301,7 @@ mod tests {
         let iy = y + (mvy >> 2);
         let (nw, nh) = (bw + 1, bh + 1);
         let mut full = [0u8; 17 * 17];
-        fetch(src, ix, iy, nw, nh, &mut full);
+        fetch(src, ix, iy, nw, nh, &mut full, nw);
         let rc = rounding as i32;
         let avg = |a: u8, b: u8| ((a as i32 + b as i32 + 1 - rc) >> 1) as u8;
         // One dimension: the value at fraction `f` (quarters) after sample
@@ -451,15 +422,15 @@ mod tests {
         let frame: Src = (&p, 4, 4, 8);
         let mut out = [0u8; 4 * 6];
         // Top field rows 2..8: frame lines 4, 6, then 7 (the last) thrice.
-        Field { frame, parity: 0 }.fetch(0, 2, 4, 6, &mut out);
+        Field { frame, parity: 0 }.fetch(0, 2, 4, 6, &mut out, 4);
         let lines: Vec<u8> = out.chunks(4).map(|r| r[0] / 10).collect();
         assert_eq!(lines, [4, 6, 7, 7, 7, 7]);
         // Bottom field rows -2..4: frame line 0 (the first) twice, then 1, 3, 5, 7.
-        Field { frame, parity: 1 }.fetch(0, -2, 4, 6, &mut out);
+        Field { frame, parity: 1 }.fetch(0, -2, 4, 6, &mut out, 4);
         let lines: Vec<u8> = out.chunks(4).map(|r| r[0] / 10).collect();
         assert_eq!(lines, [0, 0, 1, 3, 5, 7]);
         // Columns clamp as in a frame.
-        Field { frame, parity: 0 }.fetch(-2, 0, 4, 1, &mut out);
+        Field { frame, parity: 0 }.fetch(-2, 0, 4, 1, &mut out, 4);
         assert_eq!(&out[..4], &[0, 0, 0, 1]);
     }
 }

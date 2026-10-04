@@ -18,14 +18,15 @@ use crate::dec::vop::{
     field_direct_vectors, field_pred, field_to_frame, predict_fields, predict_mb, put_block,
     write_mb,
 };
+use crate::dsp::{self, Isa};
 use crate::error::{Result, config};
 use crate::frame::{Frame, VopType};
 use crate::headers::{self, VideoSignal, VolParams, VopHeader, time_increment_bits};
 use crate::idct::{fdct, idct};
 use crate::mbstate::{Dir, IntraPred, MbKind, MbState, ac_pred_value, round_div};
-use crate::mc;
+use crate::mc::{self, Window};
 use crate::picture::Pic;
-use crate::quant::{Quant, quantise_h263, quantise_mpeg};
+use crate::quant::{MpegRecips, Quant, quantise_h263, quantise_mpeg};
 use crate::tables::{ALT_HORIZONTAL, ALT_VERTICAL, ZIGZAG, code, dc_scaler};
 use syntax::{MbSyntax, write_partitioned};
 use write::*;
@@ -285,6 +286,8 @@ pub struct Encoder {
     prev_ref_sec: i64,
     rounding: bool,
     quant: Quant,
+    /// The MPEG quantiser's reciprocals (for the VOL's matrices).
+    recips: MpegRecips,
     rc: Option<Rc>,
     recons: Vec<Frame>,
     /// The next frame is to be an I-VOP.
@@ -448,6 +451,7 @@ impl Encoder {
             last_ref_sec: 0,
             prev_ref_sec: 0,
             rounding: false,
+            recips: MpegRecips::new(&intra_matrix, &inter_matrix),
             quant: Quant {
                 mpeg,
                 intra_matrix,
@@ -1516,12 +1520,7 @@ impl Encoder {
     /// Forward quantisation with the VOL's method.
     fn quantise(&self, b: &mut [i16; 64], qp: u32, intra: bool) {
         if self.quant.mpeg {
-            let m = if intra {
-                &self.quant.intra_matrix
-            } else {
-                &self.quant.inter_matrix
-            };
-            quantise_mpeg(b, qp, intra, m);
+            quantise_mpeg(b, qp, intra, &self.recips);
         } else {
             quantise_h263(b, qp, intra);
         }
@@ -1574,6 +1573,21 @@ impl Encoder {
         };
         let x = (mbx * 16 + bx) as i32;
         let y = (mby * 16 + by) as i32;
+        let isa = Isa::best();
+        let s = src.ystride();
+        let so = y as usize * s + x as usize;
+        let shift = if self.cfg.quarter_sample { 2 } else { 1 };
+        let frac = (1 << shift) - 1;
+        // A whole-sample vector to a block inside the reference: the
+        // prediction is the reference itself.
+        if mv[0] & frac == 0
+            && mv[1] & frac == 0
+            && let Some((p, off, rs)) =
+                rf.ref_plane(0)
+                    .view(x + (mv[0] >> shift), y + (mv[1] >> shift), n, n, n)
+        {
+            return dsp::sad(isa, &src.y, so, s, p, off, rs, n, n);
+        }
         let mut p = [0u8; 256];
         if self.cfg.quarter_sample {
             mc::qpel(
@@ -1602,15 +1616,7 @@ impl Encoder {
                 16,
             );
         }
-        let s = src.ystride();
-        let mut sum = 0;
-        for r in 0..n {
-            let row = &src.y[(y as usize + r) * s + x as usize..];
-            for c in 0..n {
-                sum += (row[c] as i32 - p[r * 16 + c] as i32).unsigned_abs();
-            }
-        }
-        sum
+        dsp::sad(isa, &src.y, so, s, &p, 0, 16, n, n)
     }
 
     /// Clamps a vector into the search window.
@@ -1736,21 +1742,25 @@ impl Encoder {
             parity: parity as usize,
         };
         let (x, y) = (mbx as i32 * 16, mby as i32 * 8);
+        let isa = Isa::best();
+        let s = src.ystride();
+        let so = (mby * 16 + f) * s + mbx * 16;
+        let shift = if self.cfg.quarter_sample { 2 } else { 1 };
+        let frac = (1 << shift) - 1;
+        if mv[0] & frac == 0
+            && mv[1] & frac == 0
+            && let Some((p, off, rs)) =
+                fld.view(x + (mv[0] >> shift), y + (mv[1] >> shift), 16, 8, 16)
+        {
+            return dsp::sad(isa, &src.y, so, 2 * s, p, off, rs, 16, 8);
+        }
         let mut out = [0u8; 128];
         if self.cfg.quarter_sample {
             mc::qpel(fld, x, y, mv[0], mv[1], 16, 8, rounding, &mut out, 16);
         } else {
             mc::halfpel(fld, x, y, mv[0], mv[1], 16, 8, rounding, &mut out, 16);
         }
-        let s = src.ystride();
-        let mut sum = 0;
-        for r in 0..8 {
-            let row = &src.y[(mby * 16 + f + 2 * r) * s + mbx * 16..];
-            for c in 0..16 {
-                sum += (row[c] as i32 - out[r * 16 + c] as i32).unsigned_abs();
-            }
-        }
-        sum
+        dsp::sad(isa, &src.y, so, 2 * s, &out, 0, 16, 16, 8)
     }
 
     /// A field vector for field `f` from reference field `parity`: a

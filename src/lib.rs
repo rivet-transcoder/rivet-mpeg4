@@ -45,6 +45,7 @@
 
 pub(crate) mod bits;
 mod dec;
+mod dsp;
 mod enc;
 mod error;
 mod frame;
@@ -60,6 +61,7 @@ pub(crate) mod tables;
 pub(crate) mod vlc;
 
 pub use dec::{Decoder, DecoderStats};
+pub use dsp::kernel_level;
 pub use enc::{Encoder, EncoderConfig, Quantiser, RateControl};
 pub use error::{Error, Result};
 pub use frame::{Frame, Plane, VopType};

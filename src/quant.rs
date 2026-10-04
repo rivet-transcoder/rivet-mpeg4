@@ -32,14 +32,13 @@ impl Quant {
         if self.mpeg {
             let mut sum = dc;
             b[0] = dc as i16;
+            // Branch-free (a zero QF gives zero), so it vectorises.
             for (v, &w) in b.iter_mut().zip(&self.intra_matrix).skip(1) {
                 let q = *v as i32;
-                if q != 0 {
-                    // F'' = (2 QF W QP) / 16, truncating.
-                    let f = (2 * q * w as i32 * qp / 16).clamp(MIN, MAX);
-                    *v = f as i16;
-                    sum += f;
-                }
+                // F'' = (2 QF W QP) / 16, truncating.
+                let f = (2 * q * w as i32 * qp / 16).clamp(MIN, MAX);
+                *v = f as i16;
+                sum += f;
             }
             mismatch(b, sum);
         } else {
@@ -55,12 +54,10 @@ impl Quant {
             let mut sum = 0;
             for (v, &w) in b.iter_mut().zip(&self.inter_matrix) {
                 let q = *v as i32;
-                if q != 0 {
-                    // F'' = ((2 QF + sign(QF)) W QP) / 16, truncating.
-                    let f = ((2 * q + q.signum()) * w as i32 * qp / 16).clamp(MIN, MAX);
-                    *v = f as i16;
-                    sum += f;
-                }
+                // F'' = ((2 QF + sign(QF)) W QP) / 16, truncating.
+                let f = ((2 * q + q.signum()) * w as i32 * qp / 16).clamp(MIN, MAX);
+                *v = f as i16;
+                sum += f;
             }
             mismatch(b, sum);
         } else {
@@ -74,12 +71,12 @@ impl Quant {
 #[inline]
 fn h263_ac(b: &mut [i16; 64], qp: i32, from: usize) {
     let odd_adj = if qp & 1 == 0 { 1 } else { 0 };
+    // A select rather than a branch for zero, so it vectorises.
     for v in &mut b[from..] {
         let q = *v as i32;
-        if q != 0 {
-            let m = qp * (2 * q.abs() + 1) - odd_adj;
-            *v = (if q < 0 { -m } else { m }).clamp(MIN, MAX) as i16;
-        }
+        let m = qp * (2 * q.abs() + 1) - odd_adj;
+        let f = (if q < 0 { -m } else { m }).clamp(MIN, MAX);
+        *v = if q == 0 { 0 } else { f as i16 };
     }
 }
 
@@ -92,12 +89,54 @@ fn mismatch(b: &mut [i16; 64], sum: i32) {
     }
 }
 
+/// `ceil(2^32 / d)`: with it, `a / d == (a * recip(d)) >> 32` for every
+/// `a < 2^32 / d` (see [`rdiv`]).
+pub(crate) const fn recip(d: u32) -> u64 {
+    (1u64 << 32).div_ceil(d as u64)
+}
+
+/// `a / d` as a multiplication by `m = recip(d)`, exact for `a * d < 2^32`:
+/// with `m = (2^32 + e) / d`, `0 <= e < d`, and `a = q d + r`,
+/// `a m / 2^32 = q + (r + a e / 2^32) / d`, and `r + a e / 2^32 < d`
+/// because `r <= d - 1` and `a e < a d < 2^32`.
+#[inline(always)]
+pub(crate) fn rdiv(a: u32, m: u64) -> u32 {
+    ((a as u64 * m) >> 32) as u32
+}
+
+/// `recip(2 QP)` for QP 0..=31 (0 unused).
+const H263_RECIP: [u64; 32] = {
+    let mut t = [0u64; 32];
+    let mut q = 1;
+    while q < 32 {
+        t[q] = recip(2 * q as u32);
+        q += 1;
+    }
+    t
+};
+
 /// Forward quantisation for the second method (the encoder): intra AC
 /// `|COF| / (2 QP)`, inter `(|COF| - QP / 2) / (2 QP)`, levels clipped to
 /// what escape mode 3 can code. The intra DC (index 0) is left to the
 /// caller.
 pub(crate) fn quantise_h263(b: &mut [i16; 64], qp: u32, intra: bool) {
-    let qp = qp as i32;
+    let from = if intra { 1 } else { 0 };
+    let Some(&m) = H263_RECIP.get(qp as usize).filter(|_| qp > 0) else {
+        return quantise_h263_div(b, qp, intra);
+    };
+    // |COF| <= 2^15 and 2 QP < 64: the multiplication is exact.
+    let dz = if intra { 0 } else { qp as i32 / 2 };
+    for v in &mut b[from..] {
+        let c = *v as i32;
+        let a = (c.abs() - dz).max(0) as u32;
+        let l = rdiv(a, m).min(2047) as i32;
+        *v = (if c < 0 { -l } else { l }) as i16;
+    }
+}
+
+/// [`quantise_h263`] by division (the definition), for any QP.
+pub(crate) fn quantise_h263_div(b: &mut [i16; 64], qp: u32, intra: bool) {
+    let qp = qp.max(1) as i32;
     let from = if intra { 1 } else { 0 };
     for v in &mut b[from..] {
         let c = *v as i32;
@@ -112,18 +151,67 @@ pub(crate) fn quantise_h263(b: &mut [i16; 64], qp: u32, intra: bool) {
     }
 }
 
+/// The reciprocals of the first method's steps `W QP` for one pair of
+/// weighting matrices, QP 1..=31: what [`quantise_mpeg`] multiplies by.
+pub(crate) struct MpegRecips {
+    /// `[qp][intra as usize][i]`.
+    t: Vec<[[u64; 64]; 2]>,
+    intra_matrix: [u8; 64],
+    inter_matrix: [u8; 64],
+}
+
+impl MpegRecips {
+    pub fn new(intra_matrix: &[u8; 64], inter_matrix: &[u8; 64]) -> MpegRecips {
+        let t = (0..32u32)
+            .map(|qp| {
+                [inter_matrix, intra_matrix]
+                    .map(|m| std::array::from_fn(|i| recip((m[i] as u32 * qp).max(1))))
+            })
+            .collect();
+        MpegRecips {
+            t,
+            intra_matrix: *intra_matrix,
+            inter_matrix: *inter_matrix,
+        }
+    }
+}
+
 /// Forward quantisation for the first (MPEG) method, the inverse of
 /// [`Quant::intra`] / [`Quant::inter`]: with `step = W QP / 8` per
 /// coefficient, intra AC levels are `|F| / step` rounded to the nearest,
 /// inter levels `|F| / step` truncated (the inverse puts them back at the
 /// middle of their interval), clipped to 2047. The intra DC is left to the
 /// caller.
-pub(crate) fn quantise_mpeg(b: &mut [i16; 64], qp: u32, intra: bool, matrix: &[u8; 64]) {
+pub(crate) fn quantise_mpeg(b: &mut [i16; 64], qp: u32, intra: bool, r: &MpegRecips) {
+    let matrix = if intra {
+        &r.intra_matrix
+    } else {
+        &r.inter_matrix
+    };
+    let from = if intra { 1 } else { 0 };
+    let Some(t) = r.t.get(qp as usize).filter(|_| qp > 0) else {
+        return quantise_mpeg_div(b, qp, intra, matrix);
+    };
+    let t = &t[intra as usize];
     let qp = qp as i32;
+    // 8 |F| + W QP / 2 < 2^19 and W QP < 2^13: the multiplications are
+    // exact.
+    for ((v, &w), &m) in b.iter_mut().zip(matrix).zip(t).skip(from) {
+        let c = *v as i32;
+        let d = w as i32 * qp;
+        let a = 8 * c.abs() + if intra { d / 2 } else { 0 };
+        let l = rdiv(a as u32, m).min(2047) as i32;
+        *v = (if c < 0 { -l } else { l }) as i16;
+    }
+}
+
+/// [`quantise_mpeg`] by division (the definition), for any QP.
+pub(crate) fn quantise_mpeg_div(b: &mut [i16; 64], qp: u32, intra: bool, matrix: &[u8; 64]) {
+    let qp = qp.max(1) as i32;
     let from = if intra { 1 } else { 0 };
     for (v, &w) in b.iter_mut().zip(matrix).skip(from) {
         let c = *v as i32;
-        let d = w as i32 * qp;
+        let d = (w as i32 * qp).max(1);
         let a = 8 * c.abs();
         let l = if intra { (a + d / 2) / d } else { a / d };
         let l = l.min(2047);
@@ -249,7 +337,12 @@ mod tests {
                     };
                     let mut b = [0i16; 64];
                     b[9] = f as i16;
-                    quantise_mpeg(&mut b, qp, intra, m);
+                    quantise_mpeg(
+                        &mut b,
+                        qp,
+                        intra,
+                        &MpegRecips::new(&q.intra_matrix, &q.inter_matrix),
+                    );
                     let mut r = b;
                     // Undo mismatch control's toggle of the last coefficient.
                     if intra {
@@ -266,6 +359,49 @@ mod tests {
                         "qp {qp} f {f} intra {intra}: {} err {err}",
                         r[9]
                     );
+                }
+            }
+        }
+    }
+
+    /// The multiplications compute the divisions they replace: every
+    /// QP and every coefficient for the second method; every QP and
+    /// weight, coefficients across the range, for the first.
+    #[test]
+    fn reciprocal_quantisers_divide_exactly() {
+        for qp in 1..=31u32 {
+            for c in i16::MIN..=i16::MAX {
+                for intra in [false, true] {
+                    let mut x = [c; 64];
+                    let mut y = [c; 64];
+                    quantise_h263(&mut x, qp, intra);
+                    quantise_h263_div(&mut y, qp, intra);
+                    assert_eq!(x[1], y[1], "h263 qp {qp} c {c} intra {intra}");
+                }
+            }
+        }
+        // Every weight 1..=255, in four matrices.
+        let mats: Vec<[u8; 64]> = (0..4)
+            .map(|k| std::array::from_fn(|i| (1 + (k * 64 + i) % 255) as u8))
+            .collect();
+        let mut seed = 1u32;
+        for m in &mats {
+            let r = MpegRecips::new(m, m);
+            for qp in 1..=31u32 {
+                for step in 0..2000 {
+                    seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                    let c = if step < 64 {
+                        [i16::MAX, i16::MIN, 2047, -2048, 1, -1, 0, 4095][step % 8]
+                    } else {
+                        (seed >> 16) as i16
+                    };
+                    for intra in [false, true] {
+                        let mut x = [c; 64];
+                        let mut y = [c; 64];
+                        quantise_mpeg(&mut x, qp, intra, &r);
+                        quantise_mpeg_div(&mut y, qp, intra, m);
+                        assert_eq!(x, y, "mpeg qp {qp} c {c} intra {intra}");
+                    }
                 }
             }
         }
