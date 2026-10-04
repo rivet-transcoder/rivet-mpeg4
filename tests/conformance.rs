@@ -61,7 +61,14 @@ fn record(name: &str, frames: &[Frame]) {
         .append(true)
         .open(path)
         .expect("MPEG4_DECODE_HASHES");
-    writeln!(file, "{name} {} {h:016x}", frames.len()).expect("MPEG4_DECODE_HASHES");
+    // One write per line: tests run on threads, appending to one file.
+    let line = format!(
+        "{name} {} {h:016x}
+",
+        frames.len()
+    );
+    file.write_all(line.as_bytes())
+        .expect("MPEG4_DECODE_HASHES");
 }
 
 /// Decodes every access unit of a stream; fails on any error.
